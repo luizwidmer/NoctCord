@@ -1,0 +1,78 @@
+import NoctCordCore
+@testable import NoctCordUI
+import XCTest
+
+@MainActor
+final class NoctCordAppModelTests: XCTestCase {
+    func testPreviewUsesRealProjectionAndDurableRealtimeRelayAssessment() {
+        let model = NoctCordAppModel(seedPreviewData: true)
+
+        XCTAssertEqual(model.selectedSpace?.relayAssessment.tier, .durableCommunity)
+        XCTAssertEqual(model.selectedSpace?.relayAssessment.deliveryProfile, .immediate)
+        XCTAssertFalse(model.selectedMessages.isEmpty)
+        XCTAssertFalse(model.selectedSpace?.projection.channels.isEmpty ?? true)
+    }
+
+    func testSendingMessageAppendsAnEventAndUpdatesVisibleProjection() {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let originalEventCount = model.selectedSpace?.events.count
+        let originalMessageCount = model.selectedMessages.count
+
+        model.composerText = "A message created by the UI model"
+        model.sendCurrentMessage()
+
+        XCTAssertEqual(model.selectedSpace?.events.count, (originalEventCount ?? 0) + 1)
+        XCTAssertEqual(model.selectedMessages.count, originalMessageCount + 1)
+        XCTAssertEqual(model.selectedMessages.last?.text, "A message created by the UI model")
+        XCTAssertTrue(model.composerText.isEmpty)
+    }
+
+    func testCreatingSpaceDefaultsToOneProjectedGeneralChannel() {
+        let model = NoctCordAppModel(seedPreviewData: false)
+
+        model.createSpace(name: "Quiet Circle", identityScope: .isolated)
+
+        XCTAssertEqual(model.spaces.count, 1)
+        XCTAssertEqual(model.selectedSpace?.name, "Quiet Circle")
+        XCTAssertEqual(model.selectedSpace?.identityScope, .isolated)
+        XCTAssertEqual(model.selectedSpace?.textChannels.map(\.name), ["general"])
+        XCTAssertEqual(model.selectedSpace?.relayAssessment.tier, .encryptedGroupFallback)
+    }
+
+    func testSelectingChannelClearsItsUnreadCount() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let unreadChannel = try XCTUnwrap(
+            model.selectedSpace?.unreadByChannel.first(where: { $0.value > 0 })?.key
+        )
+
+        model.selectChannel(unreadChannel)
+
+        XCTAssertEqual(model.selectedSpace?.unreadByChannel[unreadChannel], 0)
+    }
+
+    func testIdentityScopeCanChangePerCommunity() {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let firstSpaceID = model.spaces[0].id
+        let secondSpaceID = model.spaces[1].id
+        XCTAssertEqual(model.selectedSpace?.identityScope, .portable)
+
+        model.setIdentityScope(.isolated)
+        model.selectSpace(secondSpaceID)
+        model.setIdentityScope(.portable)
+
+        XCTAssertEqual(model.spaces.first { $0.id == firstSpaceID }?.identityScope, .isolated)
+        XCTAssertEqual(model.spaces.first { $0.id == secondSpaceID }?.identityScope, .portable)
+    }
+
+    func testMemberCannotCreateChannelWithoutPermission() {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let memberSpaceID = model.spaces[1].id
+        model.selectSpace(memberSpaceID)
+        let originalEventCount = model.selectedSpace?.events.count
+
+        model.createChannel(name: "not-authorized")
+
+        XCTAssertEqual(model.selectedSpace?.events.count, originalEventCount)
+        XCTAssertFalse(model.selectedSpace?.textChannels.contains { $0.name == "not-authorized" } ?? true)
+    }
+}

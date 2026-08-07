@@ -5,10 +5,23 @@ It targets a Discord-like experience—spaces, channels, roles, threaded text,
 attachments, and eventually voice—without turning relays into trusted
 plaintext application servers.
 
-> Status: initial application-core scaffold. The event model, deterministic
-> projection, canonical fallback codec, compact realtime binary codec, relay
-> capability assessment, demo, and tests are runnable. A production UI and
-> durable shared-log relay module are not implemented yet.
+> Status: pre-1.0 UI-ready prototype. The native macOS interface, event model,
+> deterministic projection, compact realtime codec, portable identity proofs,
+> relay capability assessment, demo, and tests are runnable. Relay-backed sync,
+> encrypted persistence, attachments, and the durable shared-log module remain
+> implementation work; the current app intentionally uses local preview state.
+
+![Noct Cord macOS interface](docs/assets/noct-cord-macos.jpeg)
+
+## What is working
+
+- Native community, channel, member, search, reaction, unread, and composer UX
+- Real event projection behind every visible preview message and channel
+- Portable ML-DSA identity proofs across communities, or isolated per-space identities
+- Fresh group-scoped transport handles regardless of social identity choice
+- Compact `nw.realtime-route@1` records and standard Noctweave fallback content
+- Relay readiness checks for realtime delivery, durable history, and attachments
+- Light, dark, and system appearances using the Noctweave ivory/coral/wine palette
 
 ## Why a dedicated application
 
@@ -48,7 +61,7 @@ isolated mode creates a fresh profile key and publishes no cross-community
 binding. Transport credentials remain fresh in both modes. See
 [identity design](docs/identity.md).
 
-## Run the scaffold
+## Run the app
 
 The package defaults to the public Noctweave repository. During local
 development, point it at a checkout:
@@ -56,12 +69,20 @@ development, point it at a checkout:
 ```sh
 export NOCTWEAVE_PACKAGE_PATH="/path/to/NoctweaveCore"
 swift test
-swift run NoctCordDemo
+swift run NoctCordApp
 ```
 
-The demo builds a two-member space, creates a channel, projects a message, and
-encodes the operation as both `org.noctcord/event:1.0` Noctweave content and a
-strict compact realtime record.
+To create a launchable macOS bundle:
+
+```sh
+export NOCTWEAVE_PACKAGE_PATH="/path/to/NoctweaveCore"
+Scripts/build-macos-app.sh release
+open "dist/Noct Cord.app"
+```
+
+The separate `swift run NoctCordDemo` command builds a two-member space,
+creates a channel, projects a message, and encodes the operation as both
+`org.noctcord/event:1.0` Noctweave content and a strict compact realtime record.
 
 ## Relay compatibility
 
@@ -90,8 +111,8 @@ traffic as metadata-equivalent.
 
 ## Milestones
 
-1. Connect the event codec to `HeadlessMessagingClient` group send/sync.
-2. Build dedicated macOS and iOS clients around an encrypted local event log.
+1. Connect the native app model to `HeadlessMessagingClient` group send/sync.
+2. Add encrypted local event persistence and package the responsive UI for iOS.
 3. Implement and test `nw.realtime-route@1` and `nw.shared-log@1` in both macOS
    and Linux relays.
 4. Add invites, moderation, encrypted attachments, unread projections, and

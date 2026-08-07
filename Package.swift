@@ -25,6 +25,8 @@ let package = Package(
     ],
     products: [
         .library(name: "NoctCordCore", targets: ["NoctCordCore"]),
+        .library(name: "NoctCordUI", targets: ["NoctCordUI"]),
+        .executable(name: "NoctCordApp", targets: ["NoctCordApp"]),
         .executable(name: "NoctCordDemo", targets: ["NoctCordDemo"]),
     ],
     dependencies: [noctweaveDependency],
@@ -32,6 +34,20 @@ let package = Package(
         .target(
             name: "NoctCordCore",
             dependencies: [
+                .product(
+                    name: "NoctweaveCore",
+                    package: noctweavePackageIdentity
+                )
+            ]
+        ),
+        .executableTarget(
+            name: "NoctCordApp",
+            dependencies: ["NoctCordUI"]
+        ),
+        .target(
+            name: "NoctCordUI",
+            dependencies: [
+                "NoctCordCore",
                 .product(
                     name: "NoctweaveCore",
                     package: noctweavePackageIdentity
@@ -51,6 +67,10 @@ let package = Package(
                 name: "NoctweaveCore",
                 package: noctweavePackageIdentity
             )]
+        ),
+        .testTarget(
+            name: "NoctCordUITests",
+            dependencies: ["NoctCordUI"]
         ),
     ]
 )
