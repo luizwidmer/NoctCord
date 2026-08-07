@@ -1,0 +1,7 @@
+.build/
+.build-caches/
+.swiftpm/
+.DS_Store
+Package.resolved
+*.xcuserstate
+xcuserdata/
