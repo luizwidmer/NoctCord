@@ -31,6 +31,9 @@ binary_dir="$(swift build \
 mkdir -p "$contents_path/MacOS" "$contents_path/Resources"
 cp "$binary_dir/NoctCordApp" "$contents_path/MacOS/NoctCordApp"
 cp "$repository_dir/Resources/NoctCordApp-Info.plist" "$contents_path/Info.plist"
+if [[ -f "$repository_dir/Resources/NoctCordIcon.icns" ]]; then
+    cp "$repository_dir/Resources/NoctCordIcon.icns" "$contents_path/Resources/NoctCordIcon.icns"
+fi
 chmod 755 "$contents_path/MacOS/NoctCordApp"
 touch "$bundle_path"
 

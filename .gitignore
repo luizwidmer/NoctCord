@@ -1,6 +1,7 @@
 .build/
 .build-caches/
 dist/
+Resources/NoctCordIcon.iconset/
 .swiftpm/
 .DS_Store
 Package.resolved

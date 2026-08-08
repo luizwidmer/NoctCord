@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/noct-cord-icon.png" width="104" alt="Noct Cord application icon">
+</p>
+
 # Noct Cord
 
 Noct Cord is a community chat application built above the Noctweave transport.
@@ -78,6 +82,15 @@ To create a launchable macOS bundle:
 export NOCTWEAVE_PACKAGE_PATH="/path/to/NoctweaveCore"
 Scripts/build-macos-app.sh release
 open "dist/Noct Cord.app"
+```
+
+The bundle includes the native Noct Cord icon. Regenerate its checked-in
+`.icns` asset from the code-native artwork with:
+
+```sh
+swift Scripts/render-app-icon.swift \
+  Resources/NoctCordIcon.iconset \
+  Resources/NoctCordIcon.icns
 ```
 
 The separate `swift run NoctCordDemo` command builds a two-member space,

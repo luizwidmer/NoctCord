@@ -10,6 +10,8 @@
     <string>NoctCordApp</string>
     <key>CFBundleIdentifier</key>
     <string>org.noctweave.noctcord</string>
+    <key>CFBundleIconFile</key>
+    <string>NoctCordIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

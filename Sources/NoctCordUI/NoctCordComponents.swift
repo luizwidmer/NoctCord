@@ -7,8 +7,8 @@ struct NoctCordSpaceRail: View {
     var body: some View {
         VStack(spacing: 12) {
             NoctCordMark()
-                .frame(width: 42, height: 42)
-                .padding(.bottom, 8)
+                .frame(width: 44, height: 44)
+                .padding(.bottom, 10)
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 10) {
@@ -65,9 +65,9 @@ struct NoctCordSpaceRail: View {
             .foregroundStyle(NoctCordTheme.secondaryText)
             .help("Appearance")
         }
-        .padding(.top, 42)
+        .padding(.top, 40)
         .padding(.bottom, 16)
-        .frame(width: 76)
+        .frame(width: 74)
         .background(NoctCordTheme.rail)
         .overlay(alignment: .trailing) {
             Rectangle()
@@ -162,16 +162,19 @@ struct NoctCordChannelSidebar: View {
                         .help("Space and identity settings")
                     }
 
-                    HStack(spacing: 6) {
-                        Image(systemName: space.identityScope == .portable ? "link" : "eye.slash")
-                        Text(space.identityScope == .portable ? "Portable identity" : "Isolated identity")
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(relayColor(space.relayAssessment))
+                            .frame(width: 7, height: 7)
+                        Text("\(space.relayName) · \(compactRelayLabel(space.relayAssessment))")
+                            .lineLimit(1)
                     }
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(NoctCordTheme.secondaryText)
                 }
                 .padding(.horizontal, 18)
-                .padding(.top, 44)
-                .padding(.bottom, 16)
+                .padding(.bottom, 15)
+                .frame(height: NoctCordTheme.headerHeight, alignment: .bottom)
 
                 Divider().overlay(NoctCordTheme.border)
 
@@ -186,7 +189,6 @@ struct NoctCordChannelSidebar: View {
 
                 VStack(spacing: 0) {
                     Divider().overlay(NoctCordTheme.border)
-                    relayStatus(space)
                     currentIdentityFooter(space)
                 }
             } else {
@@ -196,7 +198,7 @@ struct NoctCordChannelSidebar: View {
                 Spacer()
             }
         }
-        .frame(width: 252)
+        .frame(width: 248)
         .background(NoctCordTheme.navigation)
         .overlay(alignment: .trailing) {
             Rectangle().fill(NoctCordTheme.border).frame(width: 1)
@@ -265,29 +267,6 @@ struct NoctCordChannelSidebar: View {
         .padding(.horizontal, 7)
     }
 
-    private func relayStatus(_ space: NoctCordSpaceSession) -> some View {
-        HStack(spacing: 9) {
-            Circle()
-                .fill(relayColor(space.relayAssessment))
-                .frame(width: 8, height: 8)
-                .shadow(color: relayColor(space.relayAssessment).opacity(0.4), radius: 4)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(space.relayName)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(NoctCordTheme.primaryText)
-                Text(relayLabel(space.relayAssessment))
-                    .font(.system(size: 10))
-                    .foregroundStyle(NoctCordTheme.secondaryText)
-            }
-            Spacer()
-            Image(systemName: "bolt.horizontal.fill")
-                .font(.system(size: 10))
-                .foregroundStyle(relayColor(space.relayAssessment))
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 11)
-    }
-
     private func currentIdentityFooter(_ space: NoctCordSpaceSession) -> some View {
         Button {
             model.showsIdentity = true
@@ -307,15 +286,18 @@ struct NoctCordChannelSidebar: View {
                         .foregroundStyle(NoctCordTheme.secondaryText)
                 }
                 Spacer()
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(NoctCordTheme.secondaryText)
+                Image(systemName: space.identityScope == .portable ? "link" : "eye.slash")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(NoctCordTheme.mutedCoral)
+                    .frame(width: 28, height: 28)
+                    .background(NoctCordTheme.mutedCoral.opacity(0.10), in: Circle())
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 12)
+            .frame(height: NoctCordTheme.footerHeight)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help("Change the identity used in this space")
     }
 
     private func relayColor(_ assessment: NoctCordRelayAssessment) -> Color {
@@ -326,12 +308,12 @@ struct NoctCordChannelSidebar: View {
         }
     }
 
-    private func relayLabel(_ assessment: NoctCordRelayAssessment) -> String {
+    private func compactRelayLabel(_ assessment: NoctCordRelayAssessment) -> String {
         switch assessment.tier {
-        case .durableCommunity: "Realtime · durable history"
-        case .realtimeMVP: "Realtime delivery"
-        case .encryptedGroupFallback: "Compatibility transport"
-        case .incompatible: "Not Noct Cord ready"
+        case .durableCommunity: "Realtime"
+        case .realtimeMVP: "Realtime"
+        case .encryptedGroupFallback: "Compatible"
+        case .incompatible: "Unavailable"
         }
     }
 }
@@ -452,19 +434,21 @@ struct NoctCordConversationHeader: View {
                 .overlay { Capsule().stroke(NoctCordTheme.border, lineWidth: 1) }
             }
 
-            HeaderIconButton(
-                symbol: model.showsMemberInspector ? "person.2.fill" : "person.2",
-                help: "Toggle member list",
-                isActive: model.showsMemberInspector
-            ) {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    model.showsMemberInspector.toggle()
+            if !compact {
+                HeaderIconButton(
+                    symbol: model.showsMemberInspector ? "person.2.fill" : "person.2",
+                    help: "Toggle member list",
+                    isActive: model.showsMemberInspector
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        model.showsMemberInspector.toggle()
+                    }
                 }
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.top, 34)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 22)
+        .padding(.bottom, 13)
+        .frame(height: NoctCordTheme.headerHeight, alignment: .bottom)
         .background(NoctCordTheme.surface.opacity(0.88))
         .overlay(alignment: .bottom) {
             Rectangle().fill(NoctCordTheme.border).frame(height: 1)
@@ -602,7 +586,7 @@ private struct MessageRow: View {
                 }
 
                 Text(message.isRetracted ? "Message retracted" : message.text)
-                    .font(.system(size: 13.5))
+                    .font(.system(size: 14))
                     .italic(message.isRetracted)
                     .foregroundStyle(
                         message.isRetracted
@@ -680,20 +664,8 @@ struct NoctCordComposer: View {
     @FocusState private var isFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .bottom, spacing: 10) {
-                Button {} label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 13, weight: .bold))
-                        .frame(width: 32, height: 32)
-                        .background(NoctCordTheme.surface, in: Circle())
-                        .overlay { Circle().stroke(NoctCordTheme.border, lineWidth: 1) }
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(NoctCordTheme.secondaryText.opacity(0.45))
-                .disabled(true)
-                .help("Encrypted attachments are not connected yet")
-
                 TextField(
                     "Message #\(model.selectedChannel?.name ?? "channel")",
                     text: $model.composerText,
@@ -704,6 +676,12 @@ struct NoctCordComposer: View {
                 .lineLimit(1...4)
                 .focused($isFocused)
                 .onSubmit { model.sendCurrentMessage() }
+
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(NoctCordTheme.secondaryText.opacity(0.72))
+                    .frame(width: 24, height: 32)
+                    .help("Compact end-to-end encrypted delivery")
 
                 Button {
                     model.sendCurrentMessage()
@@ -730,20 +708,9 @@ struct NoctCordComposer: View {
                 RoundedRectangle(cornerRadius: 17, style: .continuous)
                     .stroke(isFocused ? NoctCordTheme.mutedCoral.opacity(0.42) : NoctCordTheme.border, lineWidth: 1)
             }
-
-            HStack(spacing: 5) {
-                Image(systemName: "lock.fill")
-                Text("Compact end-to-end encrypted delivery")
-                Text("·")
-                Text(model.selectedSpace?.identityScope == .portable ? "portable profile" : "isolated profile")
-            }
-            .font(.system(size: 9.5))
-            .foregroundStyle(NoctCordTheme.secondaryText.opacity(0.82))
-            .padding(.leading, 8)
         }
         .padding(.horizontal, 20)
-        .padding(.top, 10)
-        .padding(.bottom, 18)
+        .frame(height: NoctCordTheme.footerHeight)
         .background(NoctCordTheme.canvas)
     }
 }
@@ -778,8 +745,8 @@ struct NoctCordMemberInspector: View {
                     .foregroundStyle(NoctCordTheme.secondaryText)
                 }
                 .padding(.horizontal, 17)
-                .padding(.top, 43)
                 .padding(.bottom, 16)
+                .frame(height: NoctCordTheme.headerHeight, alignment: .bottom)
 
                 Divider().overlay(NoctCordTheme.border)
 
@@ -793,7 +760,7 @@ struct NoctCordMemberInspector: View {
                 }
             }
         }
-        .frame(width: 226)
+        .frame(width: 232)
         .background(NoctCordTheme.navigation)
         .overlay(alignment: .leading) {
             Rectangle().fill(NoctCordTheme.border).frame(width: 1)

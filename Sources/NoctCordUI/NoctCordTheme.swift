@@ -39,6 +39,9 @@ public enum NoctCordAppearance: String, CaseIterable, Identifiable, Sendable {
 }
 
 public enum NoctCordTheme {
+    public static let headerHeight: CGFloat = 100
+    public static let footerHeight: CGFloat = 78
+
     public static let warmIvory = Color(red: 250 / 255, green: 243 / 255, blue: 234 / 255)
     public static let paleSand = Color(red: 235 / 255, green: 199 / 255, blue: 175 / 255)
     public static let mutedCoral = Color(red: 201 / 255, green: 106 / 255, blue: 97 / 255)
@@ -135,7 +138,7 @@ public struct NoctCordMark: View {
                 RoundedRectangle(cornerRadius: side * 0.28, style: .continuous)
                     .fill(
                         LinearGradient(
-                            colors: [NoctCordTheme.deepWine, NoctCordTheme.mutedCoral],
+                            colors: [NoctCordTheme.plumBlack, NoctCordTheme.deepWine, NoctCordTheme.mutedCoral],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
@@ -144,19 +147,23 @@ public struct NoctCordMark: View {
                 ForEach(0..<3, id: \.self) { index in
                     RoundedRectangle(cornerRadius: side * 0.12, style: .continuous)
                         .stroke(
-                            index == 1 ? NoctCordTheme.warmIvory : NoctCordTheme.paleSand,
+                            index == 1 ? NoctCordTheme.warmIvory : NoctCordTheme.paleSand.opacity(0.92),
                             style: StrokeStyle(
-                                lineWidth: side * 0.075,
+                                lineWidth: side * 0.068,
                                 lineCap: .round,
                                 lineJoin: .round
                             )
                         )
-                        .frame(width: side * 0.49, height: side * 0.20)
+                        .frame(width: side * 0.48, height: side * 0.19)
                         .rotationEffect(.degrees(-18))
-                        .offset(x: CGFloat(index - 1) * side * 0.105)
+                        .offset(x: CGFloat(index - 1) * side * 0.115)
                 }
             }
-            .shadow(color: NoctCordTheme.deepWine.opacity(0.25), radius: side * 0.12, y: side * 0.06)
+            .overlay {
+                RoundedRectangle(cornerRadius: side * 0.28, style: .continuous)
+                    .stroke(NoctCordTheme.warmIvory.opacity(0.10), lineWidth: max(1, side * 0.012))
+            }
+            .shadow(color: NoctCordTheme.deepWine.opacity(0.22), radius: side * 0.10, y: side * 0.045)
         }
         .aspectRatio(1, contentMode: .fit)
         .accessibilityLabel("Noct Cord")

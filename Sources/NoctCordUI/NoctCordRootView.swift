@@ -36,6 +36,7 @@ public struct NoctCordRootView: View {
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .background(NoctCordTheme.canvas)
+        .ignoresSafeArea(.container, edges: .top)
         .foregroundStyle(NoctCordTheme.primaryText)
         .preferredColorScheme(model.appearance.colorScheme)
         .tint(NoctCordTheme.mutedCoral)
