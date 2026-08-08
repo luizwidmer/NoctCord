@@ -88,4 +88,56 @@ final class NoctCordAppModelTests: XCTestCase {
         XCTAssertEqual(model.selectedSpace?.events.count, originalEventCount)
         XCTAssertFalse(model.selectedSpace?.textChannels.contains { $0.name == "not-authorized" } ?? true)
     }
+
+    func testReadOnlyAndHiddenChannelPoliciesReachTheComposerAndSidebar() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let memberSpaceID = model.spaces[1].id
+        model.selectSpace(memberSpaceID)
+
+        XCTAssertEqual(model.selectedSpace?.textChannels.map(\.name), ["spec-review"])
+        XCTAssertFalse(model.canSendInSelectedChannel)
+
+        let originalEventCount = try XCTUnwrap(model.selectedSpace?.events.count)
+        model.composerText = "This must not publish"
+        model.sendCurrentMessage()
+
+        XCTAssertEqual(model.selectedSpace?.events.count, originalEventCount)
+        XCTAssertFalse(model.composerText.isEmpty)
+        XCTAssertNotNil(model.composerNotice)
+    }
+
+    func testSlashCommandPublishesAProjectedBotInvocation() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let originalEventCount = try XCTUnwrap(model.selectedSpace?.events.count)
+
+        model.composerText = "/status relay"
+        model.sendCurrentMessage()
+
+        XCTAssertEqual(model.selectedSpace?.events.count, originalEventCount + 1)
+        XCTAssertEqual(model.selectedSpace?.events.last?.operation.kind, .botCommandInvoked)
+        XCTAssertEqual(model.selectedMessages.last?.text, "/status relay")
+        XCTAssertTrue(model.composerText.isEmpty)
+    }
+
+    func testRoleManagementUpdatesPreviewProjection() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let roleID = UUID()
+        let member = try XCTUnwrap(
+            model.selectedSpace?.members.first { $0.displayName == "Mara" }
+        )
+
+        model.saveRole(
+            id: roleID,
+            name: "Reviewer",
+            position: 12,
+            permissions: [.manageMessages]
+        )
+        model.setRole(roleID, for: member.id, assigned: true)
+
+        XCTAssertEqual(model.selectedSpace?.projection.roles[roleID]?.name, "Reviewer")
+        XCTAssertTrue(
+            model.selectedSpace?.projection.roleAssignments[member.id, default: []]
+                .contains(roleID) == true
+        )
+    }
 }

@@ -9,24 +9,73 @@ public enum NoctCordPermission: String, Codable, CaseIterable, Hashable, Sendabl
     case manageRoles
     case inviteMembers
     case manageSpace
+    case attachFiles
+    case addReactions
+    case connectVoice
+    case speakVoice
+    case useApplicationCommands
+    case manageBots
+
+    public static let defaultMember: Set<Self> = [
+        .readMessages,
+        .sendMessages,
+        .attachFiles,
+        .addReactions,
+        .connectVoice,
+        .speakVoice,
+        .useApplicationCommands,
+    ]
+
+    public static let channelScoped: Set<Self> = [
+        .readMessages,
+        .sendMessages,
+        .manageMessages,
+        .attachFiles,
+        .addReactions,
+        .useApplicationCommands,
+    ]
 }
 
 public struct NoctCordRole: Codable, Equatable, Identifiable, Sendable {
     public let id: UUID
     public let name: String
+    public let position: UInt16
     public let permissions: [NoctCordPermission]
 
-    public init(id: UUID = UUID(), name: String, permissions: Set<NoctCordPermission>) {
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        position: UInt16 = 1,
+        permissions: Set<NoctCordPermission>
+    ) {
         self.id = id
         self.name = name
+        self.position = position
         self.permissions = permissions.sorted { $0.rawValue < $1.rawValue }
     }
 
     public var isStructurallyValid: Bool {
         NoctCordValidation.isName(name)
+            && position > 0
+            && position <= 1_000
             && permissions.count <= NoctCordPermission.allCases.count
             && Set(permissions).count == permissions.count
             && permissions == permissions.sorted { $0.rawValue < $1.rawValue }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case position
+        case permissions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        position = try container.decodeIfPresent(UInt16.self, forKey: .position) ?? 1
+        permissions = try container.decode([NoctCordPermission].self, forKey: .permissions)
     }
 }
 
@@ -40,6 +89,8 @@ public enum NoctCordEventKind: String, Codable, CaseIterable, Sendable {
     case roleDeleted
     case roleGranted
     case roleRevoked
+    case channelPermissionSet
+    case channelPermissionRemoved
     case messagePosted
     case messageEdited
     case messageRetracted
@@ -59,6 +110,10 @@ public enum NoctCordEventKind: String, Codable, CaseIterable, Sendable {
     case callSignalPosted
     case screenShareStarted
     case screenShareStopped
+    case botInstalled
+    case botUpdated
+    case botRemoved
+    case botCommandInvoked
 }
 
 /// A bounded, application-level operation. It is encoded inside a Noctweave
@@ -72,6 +127,8 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
     public let name: String?
     public let text: String?
     public let permissions: [NoctCordPermission]?
+    public let rolePosition: UInt16?
+    public let channelPermissionOverride: NoctCordChannelPermissionOverride?
     public let replyTo: UUID?
     public let reaction: String?
     public let attachmentID: UUID?
@@ -82,6 +139,9 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
     public let callSignal: NoctCordEncryptedCallSignalV1?
     public let screenShare: NoctCordScreenShareDescriptorV1?
     public let screenShareID: UUID?
+    public let botApplication: NoctCordBotApplication?
+    public let botID: UUID?
+    public let botInvocation: NoctCordBotCommandInvocation?
 
     public init(
         kind: NoctCordEventKind,
@@ -92,6 +152,8 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         name: String? = nil,
         text: String? = nil,
         permissions: Set<NoctCordPermission>? = nil,
+        rolePosition: UInt16? = nil,
+        channelPermissionOverride: NoctCordChannelPermissionOverride? = nil,
         replyTo: UUID? = nil,
         reaction: String? = nil,
         attachmentID: UUID? = nil,
@@ -101,7 +163,10 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         voiceParticipantState: NoctCordVoiceParticipantStateV1? = nil,
         callSignal: NoctCordEncryptedCallSignalV1? = nil,
         screenShare: NoctCordScreenShareDescriptorV1? = nil,
-        screenShareID: UUID? = nil
+        screenShareID: UUID? = nil,
+        botApplication: NoctCordBotApplication? = nil,
+        botID: UUID? = nil,
+        botInvocation: NoctCordBotCommandInvocation? = nil
     ) {
         self.kind = kind
         self.channelID = channelID
@@ -111,6 +176,8 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         self.name = name
         self.text = text
         self.permissions = permissions?.sorted { $0.rawValue < $1.rawValue }
+        self.rolePosition = rolePosition
+        self.channelPermissionOverride = channelPermissionOverride
         self.replyTo = replyTo
         self.reaction = reaction
         self.attachmentID = attachmentID
@@ -121,6 +188,9 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         self.callSignal = callSignal
         self.screenShare = screenShare
         self.screenShareID = screenShareID
+        self.botApplication = botApplication
+        self.botID = botID
+        self.botInvocation = botInvocation
     }
 
     public static func createSpace(name: String) -> Self {
@@ -148,7 +218,8 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
             kind: .roleDefined,
             roleID: role.id,
             name: role.name,
-            permissions: Set(role.permissions)
+            permissions: Set(role.permissions),
+            rolePosition: role.position
         )
     }
 
@@ -162,6 +233,38 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
 
     public static func revokeRole(id: UUID, from member: GroupScopedMemberHandleV2) -> Self {
         Self(kind: .roleRevoked, roleID: id, memberHandle: member)
+    }
+
+    public static func setChannelPermissions(
+        channelID: UUID,
+        roleID: UUID?,
+        allow: Set<NoctCordPermission>,
+        deny: Set<NoctCordPermission>
+    ) -> Self {
+        Self(
+            kind: .channelPermissionSet,
+            channelID: channelID,
+            channelPermissionOverride: NoctCordChannelPermissionOverride(
+                roleID: roleID,
+                allow: allow,
+                deny: deny
+            )
+        )
+    }
+
+    public static func removeChannelPermissions(
+        channelID: UUID,
+        roleID: UUID?
+    ) -> Self {
+        Self(
+            kind: .channelPermissionRemoved,
+            channelID: channelID,
+            channelPermissionOverride: NoctCordChannelPermissionOverride(
+                roleID: roleID,
+                allow: [],
+                deny: []
+            )
+        )
     }
 
     public static func postMessage(
@@ -290,6 +393,22 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         Self(kind: .screenShareStopped, voiceRoomID: roomID, screenShareID: shareID)
     }
 
+    public static func installBot(_ bot: NoctCordBotApplication) -> Self {
+        Self(kind: .botInstalled, botApplication: bot)
+    }
+
+    public static func updateBot(_ bot: NoctCordBotApplication) -> Self {
+        Self(kind: .botUpdated, botApplication: bot)
+    }
+
+    public static func removeBot(id: UUID) -> Self {
+        Self(kind: .botRemoved, botID: id)
+    }
+
+    public static func invokeBot(_ invocation: NoctCordBotCommandInvocation) -> Self {
+        Self(kind: .botCommandInvoked, botInvocation: invocation)
+    }
+
     public var isStructurallyValid: Bool {
         let permissionListIsValid = permissions.map {
             $0.count <= NoctCordPermission.allCases.count
@@ -298,11 +417,14 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         } ?? true
         guard permissionListIsValid,
               memberHandle?.isStructurallyValid ?? true,
+              channelPermissionOverride?.isStructurallyValid ?? true,
               attachmentManifest?.isStructurallyValid ?? true,
               voiceRoomSpec?.isStructurallyValid ?? true,
               voiceParticipantState?.isStructurallyValid ?? true,
               callSignal?.isStructurallyValid ?? true,
-              screenShare?.isStructurallyValid ?? true else {
+              screenShare?.isStructurallyValid ?? true,
+              botApplication?.isStructurallyValid ?? true,
+              botInvocation?.isStructurallyValid ?? true else {
             return false
         }
 
@@ -320,13 +442,28 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
             return roleID != nil
                 && NoctCordValidation.isName(name)
                 && permissions != nil
-                && only(role: true, name: true, permissions: true)
+                && rolePosition != nil
+                && rolePosition! > 0
+                && rolePosition! <= 1_000
+                && only(role: true, name: true, permissions: true, rolePosition: true)
         case .roleDeleted:
             return roleID != nil && only(role: true)
         case .roleGranted, .roleRevoked:
             return roleID != nil
                 && memberHandle != nil
                 && only(role: true, member: true)
+        case .channelPermissionSet:
+            return channelID != nil
+                && channelPermissionOverride != nil
+                && !(channelPermissionOverride?.allow.isEmpty == true
+                    && channelPermissionOverride?.deny.isEmpty == true)
+                && only(channel: true, channelPermissionOverride: true)
+        case .channelPermissionRemoved:
+            return channelID != nil
+                && channelPermissionOverride != nil
+                && channelPermissionOverride?.allow.isEmpty == true
+                && channelPermissionOverride?.deny.isEmpty == true
+                && only(channel: true, channelPermissionOverride: true)
         case .messagePosted:
             return channelID != nil
                 && messageID != nil
@@ -371,6 +508,12 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
             return voiceRoomID != nil
                 && screenShareID != nil
                 && only(voiceRoom: true, screenShareID: true)
+        case .botInstalled, .botUpdated:
+            return botApplication != nil && only(botApplication: true)
+        case .botRemoved:
+            return botID != nil && only(botID: true)
+        case .botCommandInvoked:
+            return botInvocation != nil && only(botInvocation: true)
         }
     }
 
@@ -382,6 +525,8 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         name: Bool = false,
         text: Bool = false,
         permissions: Bool = false,
+        rolePosition: Bool = false,
+        channelPermissionOverride: Bool = false,
         reply: Bool = false,
         reaction: Bool = false,
         attachment: Bool = false,
@@ -391,7 +536,10 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         participantState: Bool = false,
         callSignal: Bool = false,
         screenShare: Bool = false,
-        screenShareID: Bool = false
+        screenShareID: Bool = false,
+        botApplication: Bool = false,
+        botID: Bool = false,
+        botInvocation: Bool = false
     ) -> Bool {
         (channelID != nil) == channel
             && (messageID != nil) == message
@@ -400,6 +548,8 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
             && (self.name != nil) == name
             && (self.text != nil) == text
             && (self.permissions != nil) == permissions
+            && (self.rolePosition != nil) == rolePosition
+            && (self.channelPermissionOverride != nil) == channelPermissionOverride
             && (replyTo != nil) == reply
             && (self.reaction != nil) == reaction
             && (attachmentID != nil) == attachment
@@ -410,6 +560,9 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
             && (self.callSignal != nil) == callSignal
             && (self.screenShare != nil) == screenShare
             && (self.screenShareID != nil) == screenShareID
+            && (self.botApplication != nil) == botApplication
+            && (self.botID != nil) == botID
+            && (self.botInvocation != nil) == botInvocation
     }
 }
 
@@ -480,6 +633,28 @@ enum NoctCordValidation {
             && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
             && value.utf8.count <= 64
             && !containsUnsafeControl(value)
+    }
+
+    static func isCommandName(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.utf8.count <= 32
+            && value == value.lowercased()
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789_-").contains($0)
+            }
+    }
+
+    static func isCommandDescription(_ value: String) -> Bool {
+        !value.isEmpty
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= 100
+            && !containsUnsafeControl(value)
+    }
+
+    static func isCommandArguments(_ value: String) -> Bool {
+        value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= 2_048
+            && !containsUnsafeControl(value, allowingLineBreaks: true)
     }
 
     static func isSanitizedMediaType(_ value: String) -> Bool {

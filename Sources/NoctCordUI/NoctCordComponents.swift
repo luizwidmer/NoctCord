@@ -156,7 +156,7 @@ struct NoctCordChannelSidebar: View {
                             .lineLimit(1)
                         Spacer()
                         Button {
-                            model.showsIdentity = true
+                            model.showsCommunitySettings = true
                         } label: {
                             Image(systemName: "slider.horizontal.3")
                                 .font(.system(size: 13, weight: .semibold))
@@ -285,7 +285,7 @@ struct NoctCordChannelSidebar: View {
 
     private func currentIdentityFooter(_ space: NoctCordSpaceSession) -> some View {
         Button {
-            model.showsIdentity = true
+            model.showsCommunitySettings = true
         } label: {
             HStack(spacing: 10) {
                 MemberMonogram(
@@ -853,7 +853,41 @@ struct NoctCordComposer: View {
     @FocusState private var isFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 7) {
+            if shouldSuggestCommands {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 7) {
+                        ForEach(model.availableBotCommands, id: \.command.name) { item in
+                            Button {
+                                model.composerText = "/\(item.command.name) "
+                                model.clearComposerNotice()
+                                isFocused = true
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Text("/\(item.command.name)")
+                                        .fontWeight(.semibold)
+                                    Text(item.command.summary)
+                                        .foregroundStyle(NoctCordTheme.secondaryText)
+                                        .lineLimit(1)
+                                }
+                                .font(.system(size: 10.5))
+                                .padding(.horizontal, 10)
+                                .frame(height: 29)
+                                .background(NoctCordTheme.elevated, in: Capsule())
+                                .overlay { Capsule().stroke(NoctCordTheme.border) }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            if let notice = model.composerNotice {
+                Label(notice, systemImage: "exclamationmark.circle.fill")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(NoctCordTheme.warning)
+            }
+
             HStack(alignment: .bottom, spacing: 10) {
                 Button {
                     model.showsAttachmentImporter = true
@@ -866,10 +900,14 @@ struct NoctCordComposer: View {
                         .overlay { Circle().stroke(NoctCordTheme.border) }
                 }
                 .buttonStyle(.plain)
+                .disabled(!model.canAttachInSelectedChannel)
+                .opacity(model.canAttachInSelectedChannel ? 1 : 0.42)
                 .help("Upload a sanitized, encrypted attachment")
 
                 TextField(
-                    "Message #\(model.selectedChannel?.name ?? "channel")",
+                    model.canSendInSelectedChannel
+                        ? "Message #\(model.selectedChannel?.name ?? "channel")"
+                        : "Read-only channel",
                     text: $model.composerText,
                     axis: .vertical
                 )
@@ -877,7 +915,11 @@ struct NoctCordComposer: View {
                 .font(.system(size: 13))
                 .lineLimit(1...4)
                 .focused($isFocused)
+                .disabled(!model.canSendInSelectedChannel)
                 .onSubmit { model.sendCurrentMessage() }
+                .onChange(of: model.composerText) { _, _ in
+                    model.clearComposerNotice()
+                }
 
                 Image(systemName: "lock.fill")
                     .font(.system(size: 10, weight: .semibold))
@@ -900,7 +942,10 @@ struct NoctCordComposer: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .disabled(model.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(
+                    !model.canSendInSelectedChannel
+                        || model.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
                 .keyboardShortcut(.return, modifiers: [])
             }
             .padding(.horizontal, 12)
@@ -912,8 +957,15 @@ struct NoctCordComposer: View {
             }
         }
         .padding(.horizontal, 20)
-        .frame(height: NoctCordTheme.footerHeight)
+        .padding(.vertical, 10)
+        .frame(minHeight: NoctCordTheme.footerHeight)
         .background(NoctCordTheme.canvas)
+    }
+
+    private var shouldSuggestCommands: Bool {
+        model.composerText.hasPrefix("/")
+            && !model.availableBotCommands.isEmpty
+            && !model.composerText.contains(" ")
     }
 }
 
@@ -1184,6 +1236,15 @@ struct NoctCordMemberInspector: View {
                             Text(member.roleName)
                                 .font(.system(size: 9.5))
                                 .foregroundStyle(NoctCordTheme.secondaryText)
+                        }
+                        if member.isBot {
+                            Text("APP")
+                                .font(.system(size: 7.5, weight: .bold))
+                                .tracking(0.5)
+                                .foregroundStyle(NoctCordTheme.warmIvory)
+                                .padding(.horizontal, 6)
+                                .frame(height: 17)
+                                .background(NoctCordTheme.mutedCoral, in: Capsule())
                         }
                         Spacer()
                     }

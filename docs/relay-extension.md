@@ -1,5 +1,10 @@
 # Noct Cord relay extensions
 
+Role evaluation, channel permission overrides, and bot execution are not relay
+extensions. They remain encrypted Noct Cord application events. A bot is a
+dedicated group member operated by a client process; the relay stores its
+opaque records exactly as it stores human-authored records.
+
 Noct Cord uses the ordinary Noctweave group transport for durable encrypted
 space and channel events. The current Noctweave core and Linux relay also
 contain provisional application-neutral extensions for low-latency signaling,

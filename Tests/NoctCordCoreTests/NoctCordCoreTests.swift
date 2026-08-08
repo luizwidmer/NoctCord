@@ -174,6 +174,368 @@ final class NoctCordCoreTests: XCTestCase {
         XCTAssertEqual(result.projection.messages[messageID]?.text, "still works")
     }
 
+    func testEveryoneChannelDenyBlocksMembersButNeverTheOwner() {
+        let owner = handle(1)
+        let member = handle(2)
+        let memberMessage = UUID()
+        let ownerMessage = UUID()
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(
+                author: owner,
+                clock: 2,
+                operation: .createChannel(id: channelID, name: "announcements")
+            ),
+            makeEvent(
+                author: owner,
+                clock: 3,
+                operation: .setChannelPermissions(
+                    channelID: channelID,
+                    roleID: nil,
+                    allow: [],
+                    deny: [.sendMessages]
+                )
+            ),
+            makeEvent(
+                author: member,
+                clock: 4,
+                operation: .postMessage(
+                    id: memberMessage,
+                    channelID: channelID,
+                    text: "not authorized"
+                )
+            ),
+            makeEvent(
+                author: owner,
+                clock: 5,
+                operation: .postMessage(
+                    id: ownerMessage,
+                    channelID: channelID,
+                    text: "owner announcement"
+                )
+            ),
+        ]
+
+        let result = project(events, owner: owner, members: [owner, member])
+
+        XCTAssertEqual(result.rejectedEvents.count, 1)
+        XCTAssertNil(result.projection.messages[memberMessage])
+        XCTAssertEqual(result.projection.messages[ownerMessage]?.text, "owner announcement")
+        XCTAssertFalse(
+            result.projection.permissions(for: member, in: channelID).contains(.sendMessages)
+        )
+        XCTAssertTrue(
+            result.projection.permissions(for: owner, in: channelID).contains(.sendMessages)
+        )
+    }
+
+    func testRoleChannelAllowOverridesEveryoneDenyDeterministically() throws {
+        let owner = handle(1)
+        let member = handle(2)
+        let writer = NoctCordRole(
+            id: UUID(),
+            name: "Writer",
+            position: 10,
+            permissions: []
+        )
+        let messageID = UUID()
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(
+                author: owner,
+                clock: 2,
+                operation: .createChannel(id: channelID, name: "writers")
+            ),
+            makeEvent(author: owner, clock: 3, operation: .defineRole(writer)),
+            makeEvent(
+                author: owner,
+                clock: 4,
+                operation: .grantRole(id: writer.id, to: member)
+            ),
+            makeEvent(
+                author: owner,
+                clock: 5,
+                operation: .setChannelPermissions(
+                    channelID: channelID,
+                    roleID: nil,
+                    allow: [],
+                    deny: [.sendMessages]
+                )
+            ),
+            makeEvent(
+                author: owner,
+                clock: 6,
+                operation: .setChannelPermissions(
+                    channelID: channelID,
+                    roleID: writer.id,
+                    allow: [.sendMessages],
+                    deny: []
+                )
+            ),
+            makeEvent(
+                author: member,
+                clock: 7,
+                operation: .postMessage(id: messageID, channelID: channelID, text: "draft")
+            ),
+        ]
+
+        let ordered = project(events, owner: owner, members: [owner, member])
+        let shuffled = project(
+            [events[6], events[2], events[0], events[4], events[1], events[5], events[3]],
+            owner: owner,
+            members: [owner, member]
+        )
+
+        XCTAssertEqual(ordered, shuffled)
+        XCTAssertTrue(ordered.rejectedEvents.isEmpty)
+        XCTAssertEqual(ordered.projection.messages[messageID]?.text, "draft")
+        XCTAssertEqual(
+            try NoctCordCompactCodec.decode(
+                NoctCordCompactCodec.encode(events[5])
+            ),
+            events[5]
+        )
+    }
+
+    func testRoleHierarchyPreventsPrivilegeAndSelfEscalation() {
+        let owner = handle(1)
+        let manager = handle(2)
+        let moderator = NoctCordRole(
+            id: UUID(),
+            name: "Moderator",
+            position: 20,
+            permissions: [.manageRoles]
+        )
+        let forbidden = NoctCordRole(
+            id: UUID(),
+            name: "Administrator",
+            position: 21,
+            permissions: [.manageSpace]
+        )
+        let helper = NoctCordRole(
+            id: UUID(),
+            name: "Helper",
+            position: 10,
+            permissions: [.readMessages]
+        )
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(author: owner, clock: 2, operation: .defineRole(moderator)),
+            makeEvent(
+                author: owner,
+                clock: 3,
+                operation: .grantRole(id: moderator.id, to: manager)
+            ),
+            makeEvent(author: manager, clock: 4, operation: .defineRole(forbidden)),
+            makeEvent(author: manager, clock: 5, operation: .defineRole(helper)),
+            makeEvent(
+                author: manager,
+                clock: 6,
+                operation: .grantRole(id: helper.id, to: manager)
+            ),
+        ]
+
+        let result = project(events, owner: owner, members: [owner, manager])
+
+        XCTAssertEqual(result.rejectedEvents.count, 2)
+        XCTAssertNil(result.projection.roles[forbidden.id])
+        XCTAssertEqual(result.projection.roles[helper.id], helper)
+        XCTAssertFalse(
+            result.projection.roleAssignments[manager, default: []].contains(helper.id)
+        )
+    }
+
+    func testChannelAttachmentAndReactionPermissionsAreEnforced() {
+        let owner = handle(1)
+        let member = handle(2)
+        let messageID = UUID()
+        let attachmentID = UUID()
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(
+                author: owner,
+                clock: 2,
+                operation: .createChannel(id: channelID, name: "limited")
+            ),
+            makeEvent(
+                author: owner,
+                clock: 3,
+                operation: .setChannelPermissions(
+                    channelID: channelID,
+                    roleID: nil,
+                    allow: [],
+                    deny: [.attachFiles, .addReactions]
+                )
+            ),
+            makeEvent(
+                author: owner,
+                clock: 4,
+                operation: .postMessage(id: messageID, channelID: channelID, text: "policy")
+            ),
+            makeEvent(
+                author: member,
+                clock: 5,
+                operation: .addReaction("✓", to: messageID)
+            ),
+            makeEvent(
+                author: member,
+                clock: 6,
+                operation: .addAttachment(
+                    id: attachmentID,
+                    channelID: channelID,
+                    manifest: makeAttachmentManifest(
+                        expiresAt: timestamp.addingTimeInterval(3_600)
+                    )
+                )
+            ),
+        ]
+
+        let result = project(events, owner: owner, members: [owner, member])
+
+        XCTAssertEqual(result.rejectedEvents.count, 2)
+        XCTAssertTrue(result.projection.messages[messageID]?.reactions.isEmpty == true)
+        XCTAssertNil(result.projection.attachments[attachmentID])
+    }
+
+    func testBotInstallInvocationAndRuntimeResponseUseGroupScopedPrincipals() async throws {
+        let owner = handle(1)
+        let member = handle(2)
+        let botMember = handle(3)
+        let bot = NoctCordBotApplication(
+            id: UUID(),
+            memberHandle: botMember,
+            name: "Build Bot",
+            commands: [
+                NoctCordBotCommand(name: "status", summary: "Show build status"),
+            ]
+        )
+        let invocation = NoctCordBotCommandInvocation(
+            id: UUID(),
+            botID: bot.id,
+            channelID: channelID,
+            commandName: "status",
+            arguments: "main"
+        )
+        let invocationEvent = makeEvent(
+            author: member,
+            clock: 4,
+            operation: .invokeBot(invocation)
+        )
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(
+                author: owner,
+                clock: 2,
+                operation: .createChannel(id: channelID, name: "builds")
+            ),
+            makeEvent(author: owner, clock: 3, operation: .installBot(bot)),
+            invocationEvent,
+        ]
+
+        let result = project(
+            events,
+            owner: owner,
+            members: [owner, member, botMember]
+        )
+
+        XCTAssertTrue(result.rejectedEvents.isEmpty)
+        XCTAssertEqual(result.projection.botApplications[bot.id], bot)
+        XCTAssertEqual(result.projection.botInvocations[invocation.id], invocation)
+        XCTAssertEqual(result.projection.messages[invocation.id]?.text, "/status main")
+        XCTAssertEqual(
+            try NoctCordCompactCodec.decode(
+                NoctCordCompactCodec.encode(invocationEvent)
+            ),
+            invocationEvent
+        )
+
+        let invocationCounter = BotInvocationCounter()
+        let runtime = NoctCordBotRuntime(
+            botID: bot.id,
+            memberHandleRawValue: botMember.rawValue,
+            ledger: NoctCordInMemoryBotInvocationLedger()
+        ) { context in
+            await invocationCounter.increment()
+            return "Build \(context.invocation.arguments) is green."
+        }
+        let response = try await runtime.prepareResponse(
+            for: invocationEvent,
+            projection: result.projection
+        )
+        XCTAssertEqual(response?.requiredAuthorMemberHandle, botMember.rawValue)
+        XCTAssertEqual(response?.operation.kind, .messagePosted)
+        XCTAssertEqual(response?.operation.replyTo, invocation.id)
+        XCTAssertEqual(response?.operation.text, "Build main is green.")
+        let duplicateResponse = try await runtime.prepareResponse(
+            for: invocationEvent,
+            projection: result.projection
+        )
+        XCTAssertNil(duplicateResponse)
+        await runtime.release(invocation.id)
+        let retryResponse = try await runtime.prepareResponse(
+            for: invocationEvent,
+            projection: result.projection
+        )
+        XCTAssertEqual(retryResponse, response)
+        let handlerInvocationCount = await invocationCounter.value
+        XCTAssertEqual(handlerInvocationCount, 1)
+        try await runtime.markPublished(invocation.id)
+        let completedResponse = try await runtime.prepareResponse(
+            for: invocationEvent,
+            projection: result.projection
+        )
+        XCTAssertNil(completedResponse)
+    }
+
+    func testOrdinaryMemberCannotInstallBotAndChannelCanDenyCommands() {
+        let owner = handle(1)
+        let member = handle(2)
+        let botMember = handle(3)
+        let bot = NoctCordBotApplication(
+            memberHandle: botMember,
+            name: "Utility",
+            commands: [
+                NoctCordBotCommand(name: "ping", summary: "Check availability"),
+            ]
+        )
+        let invocation = NoctCordBotCommandInvocation(
+            botID: bot.id,
+            channelID: channelID,
+            commandName: "ping"
+        )
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(
+                author: owner,
+                clock: 2,
+                operation: .createChannel(id: channelID, name: "general")
+            ),
+            makeEvent(author: member, clock: 3, operation: .installBot(bot)),
+            makeEvent(author: owner, clock: 4, operation: .installBot(bot)),
+            makeEvent(
+                author: owner,
+                clock: 5,
+                operation: .setChannelPermissions(
+                    channelID: channelID,
+                    roleID: nil,
+                    allow: [],
+                    deny: [.useApplicationCommands]
+                )
+            ),
+            makeEvent(author: member, clock: 6, operation: .invokeBot(invocation)),
+        ]
+
+        let result = project(
+            events,
+            owner: owner,
+            members: [owner, member, botMember]
+        )
+
+        XCTAssertEqual(result.rejectedEvents.count, 2)
+        XCTAssertEqual(result.projection.botApplications[bot.id], bot)
+        XCTAssertNil(result.projection.botInvocations[invocation.id])
+    }
+
     func testInactiveMemberCannotSend() {
         let owner = handle(1)
         let departed = handle(2)
@@ -194,6 +556,108 @@ final class NoctCordCoreTests: XCTestCase {
         let result = project(events, owner: owner, members: [owner])
         XCTAssertEqual(result.rejectedEvents.count, 1)
         XCTAssertTrue(result.projection.messages.isEmpty)
+    }
+
+    func testVerifiedHistoricalMemberMessageSurvivesDeparture() {
+        let owner = handle(1)
+        let departed = handle(2)
+        let messageID = UUID()
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(
+                author: owner,
+                clock: 2,
+                operation: .createChannel(id: channelID, name: "general")
+            ),
+            makeEvent(
+                author: departed,
+                clock: 3,
+                operation: .postMessage(id: messageID, channelID: channelID, text: "preserved")
+            ),
+        ]
+
+        let result = NoctCordSpaceProjection.project(
+            spaceID: spaceID,
+            owner: owner,
+            activeMembers: [owner],
+            historicalMembers: [departed],
+            events: events
+        )
+
+        XCTAssertTrue(result.rejectedEvents.isEmpty)
+        XCTAssertEqual(result.projection.messages[messageID]?.text, "preserved")
+        var projection = result.projection
+        XCTAssertThrowsError(
+            try projection.apply(
+                makeEvent(
+                    author: departed,
+                    clock: 4,
+                    operation: .postMessage(id: UUID(), channelID: channelID, text: "blocked")
+                )
+            )
+        )
+    }
+
+    func testDeletingRoleRemovesAssignmentsAndChannelOverrides() {
+        let owner = handle(1)
+        let member = handle(2)
+        let role = NoctCordRole(name: "Writer", position: 10, permissions: [])
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(
+                author: owner,
+                clock: 2,
+                operation: .createChannel(id: channelID, name: "general")
+            ),
+            makeEvent(author: owner, clock: 3, operation: .defineRole(role)),
+            makeEvent(author: owner, clock: 4, operation: .grantRole(id: role.id, to: member)),
+            makeEvent(
+                author: owner,
+                clock: 5,
+                operation: .setChannelPermissions(
+                    channelID: channelID,
+                    roleID: role.id,
+                    allow: [.sendMessages],
+                    deny: []
+                )
+            ),
+            makeEvent(author: owner, clock: 6, operation: .deleteRole(id: role.id)),
+        ]
+
+        let result = project(events, owner: owner, members: [owner, member])
+
+        XCTAssertTrue(result.rejectedEvents.isEmpty)
+        XCTAssertNil(result.projection.roles[role.id])
+        XCTAssertFalse(result.projection.roleAssignments[member, default: []].contains(role.id))
+        XCTAssertNil(
+            result.projection.channels[channelID]?
+                .permissionOverrides[.role(role.id)]
+        )
+    }
+
+    func testBotCommandNamesAreUniqueWithinACommunity() {
+        let owner = handle(1)
+        let firstBot = NoctCordBotApplication(
+            memberHandle: handle(2),
+            name: "Build Bot",
+            commands: [NoctCordBotCommand(name: "status", summary: "Build status")]
+        )
+        let secondBot = NoctCordBotApplication(
+            memberHandle: handle(3),
+            name: "Relay Bot",
+            commands: [NoctCordBotCommand(name: "status", summary: "Relay status")]
+        )
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(author: owner, clock: 2, operation: .installBot(firstBot)),
+            makeEvent(author: owner, clock: 3, operation: .installBot(secondBot)),
+        ]
+
+        let result = project(events, owner: owner, members: [owner, handle(2), handle(3)])
+
+        XCTAssertEqual(result.rejectedEvents.count, 1)
+        XCTAssertEqual(result.projection.botApplications[firstBot.id], firstBot)
+        XCTAssertNil(result.projection.botApplications[secondBot.id])
     }
 
     func testRelayAssessmentSeparatesMVPFromDurableCommunity() {
@@ -600,5 +1064,13 @@ final class NoctCordCoreTests: XCTestCase {
                 nonce: Data(repeating: 0x24, count: 12)
             )
         )
+    }
+}
+
+private actor BotInvocationCounter {
+    private(set) var value = 0
+
+    func increment() {
+        value += 1
     }
 }

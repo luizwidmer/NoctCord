@@ -246,6 +246,29 @@ public actor NoctCordTransportCoordinator {
         guard snapshot.localCredential.memberHandle == event.author else {
             throw NoctCordTransportError.eventRejected
         }
+        let decodedEvents = snapshot.events.compactMap { try? NoctCordCodec.unwrap($0) }
+        let activeMembers = Set(
+            snapshot.signedState.members
+                .filter { $0.isActive(at: snapshot.signedState.epoch) }
+                .map(\.id)
+        )
+        guard let owner = snapshot.signedState.members.first(where: {
+            $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
+        })?.id else {
+            throw NoctCordTransportError.eventRejected
+        }
+        var authorizationProjection = NoctCordSpaceProjection.project(
+            spaceID: event.spaceID,
+            owner: owner,
+            activeMembers: activeMembers,
+            historicalMembers: Set(decodedEvents.map(\.author)),
+            events: decodedEvents
+        ).projection
+        do {
+            try authorizationProjection.apply(event)
+        } catch {
+            throw NoctCordTransportError.eventRejected
+        }
         let groupEvent = try NoctCordCodec.wrap(
             event,
             credential: snapshot.localCredential.credentialHandle
@@ -598,6 +621,7 @@ public actor NoctCordTransportCoordinator {
             spaceID: snapshot.groupId,
             owner: owner,
             activeMembers: members,
+            historicalMembers: Set(events.map(\.author)),
             events: events
         ).projection
         guard let room = projection.voiceRooms[roomID], !room.isArchived else {

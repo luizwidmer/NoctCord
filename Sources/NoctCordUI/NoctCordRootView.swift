@@ -61,8 +61,8 @@ public struct NoctCordRootView: View {
         .sheet(isPresented: $model.showsCreateVoiceRoom) {
             CreateVoiceRoomSheet(model: model)
         }
-        .sheet(isPresented: $model.showsIdentity) {
-            IdentitySettingsSheet(model: model)
+        .sheet(isPresented: $model.showsCommunitySettings) {
+            NoctCordCommunitySettingsSheet(model: model)
         }
         .sheet(
             isPresented: Binding(
@@ -597,96 +597,6 @@ private struct CreateVoiceRoomSheet: View {
                 }
             }
         }
-    }
-}
-
-private struct IdentitySettingsSheet: View {
-    @ObservedObject var model: NoctCordAppModel
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NoctCordSheetShell(
-            symbol: "person.text.rectangle.fill",
-            title: "Community identity",
-            subtitle: "Transport credentials remain fresh either way. This controls what other members can correlate."
-        ) {
-            VStack(spacing: 10) {
-                identityCard(
-                    .portable,
-                    title: "Portable identity",
-                    description: "Present the same ML-DSA profile in multiple spaces. This is convenient and intentionally linkable.",
-                    symbol: "link"
-                )
-                identityCard(
-                    .isolated,
-                    title: "Isolated identity",
-                    description: "Use a profile unique to this space. No portable identity proof is published.",
-                    symbol: "eye.slash.fill"
-                )
-
-                HStack(alignment: .top, spacing: 9) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(NoctCordTheme.warning)
-                    Text("Changing to isolated mode cannot erase portable bindings that community members have already observed.")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(NoctCordTheme.secondaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                }
-                .padding(12)
-                .background(NoctCordTheme.warning.opacity(0.09), in: RoundedRectangle(cornerRadius: 13))
-
-                HStack {
-                    Spacer()
-                    Button("Done") { dismiss() }
-                        .buttonStyle(NoctCordPrimaryButtonStyle())
-                }
-                .padding(.top, 7)
-            }
-        }
-    }
-
-    private func identityCard(
-        _ scope: NoctCordIdentityScope,
-        title: String,
-        description: String,
-        symbol: String
-    ) -> some View {
-        let isSelected = model.selectedSpace?.identityScope == scope
-        return Button {
-            model.setIdentityScope(scope)
-        } label: {
-            HStack(alignment: .top, spacing: 13) {
-                Image(systemName: symbol)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(isSelected ? NoctCordTheme.mutedCoral : NoctCordTheme.secondaryText)
-                    .frame(width: 38, height: 38)
-                    .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 11))
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(title)
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(description)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(NoctCordTheme.secondaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer()
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(isSelected ? NoctCordTheme.mutedCoral : NoctCordTheme.secondaryText)
-            }
-            .foregroundStyle(NoctCordTheme.primaryText)
-            .padding(14)
-            .background(
-                isSelected ? NoctCordTheme.mutedCoral.opacity(0.10) : NoctCordTheme.surface,
-                in: RoundedRectangle(cornerRadius: 15)
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: 15)
-                    .stroke(isSelected ? NoctCordTheme.mutedCoral.opacity(0.45) : NoctCordTheme.border)
-            }
-            .contentShape(RoundedRectangle(cornerRadius: 15))
-        }
-        .buttonStyle(.plain)
     }
 }
 

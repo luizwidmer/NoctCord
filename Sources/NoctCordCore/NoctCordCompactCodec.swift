@@ -214,16 +214,24 @@ private extension NoctCordEventKind {
         case .callSignalPosted: 25
         case .screenShareStarted: 26
         case .screenShareStopped: 27
+        case .channelPermissionSet: 28
+        case .channelPermissionRemoved: 29
+        case .botInstalled: 30
+        case .botUpdated: 31
+        case .botRemoved: 32
+        case .botCommandInvoked: 33
         }
     }
 
     var usesExtendedCompactPayload: Bool {
         switch self {
-        case .attachmentAdded, .voiceRoomCreated, .voiceRoomUpdated,
+        case .roleDefined, .channelPermissionSet, .channelPermissionRemoved,
+             .attachmentAdded, .voiceRoomCreated, .voiceRoomUpdated,
              .voiceRoomArchived, .voiceParticipantJoined, .voiceParticipantLeft,
              .voiceParticipantMuted, .voiceParticipantDeafened,
              .voiceParticipantSpeaking, .callSignalPosted, .screenShareStarted,
-             .screenShareStopped:
+             .screenShareStopped, .botInstalled, .botUpdated, .botRemoved,
+             .botCommandInvoked:
             return true
         default:
             return false
@@ -260,6 +268,12 @@ private extension NoctCordEventKind {
         case 25: self = .callSignalPosted
         case 26: self = .screenShareStarted
         case 27: self = .screenShareStopped
+        case 28: self = .channelPermissionSet
+        case 29: self = .channelPermissionRemoved
+        case 30: self = .botInstalled
+        case 31: self = .botUpdated
+        case 32: self = .botRemoved
+        case 33: self = .botCommandInvoked
         default: throw NoctCordCompactCodecError.invalidRecord
         }
     }

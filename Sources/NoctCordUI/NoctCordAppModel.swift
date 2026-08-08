@@ -24,6 +24,21 @@ public struct NoctCordMemberViewState: Identifiable, Equatable {
     public let displayName: String
     public let roleName: String
     public let presence: NoctCordPresence
+    public let isBot: Bool
+
+    public init(
+        id: GroupScopedMemberHandleV2,
+        displayName: String,
+        roleName: String,
+        presence: NoctCordPresence,
+        isBot: Bool = false
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.roleName = roleName
+        self.presence = presence
+        self.isBot = isBot
+    }
 
     public var initials: String {
         displayName
@@ -96,7 +111,11 @@ public struct NoctCordSpaceSession: Identifiable, Equatable {
 
     public var textChannels: [NoctCordChannel] {
         projection.channels.values
-            .filter { !$0.isArchived }
+            .filter {
+                !$0.isArchived
+                    && projection.permissions(for: currentMember, in: $0.id)
+                        .contains(.readMessages)
+            }
             .sorted { lhs, rhs in
                 if lhs.name == "general" { return rhs.name != "general" }
                 if rhs.name == "general" { return false }
@@ -106,6 +125,14 @@ public struct NoctCordSpaceSession: Identifiable, Equatable {
 
     public var canManageChannels: Bool {
         projection.permissions(for: currentMember).contains(.manageChannels)
+    }
+
+    public var canManageRoles: Bool {
+        projection.permissions(for: currentMember).contains(.manageRoles)
+    }
+
+    public var canManageBots: Bool {
+        projection.permissions(for: currentMember).contains(.manageBots)
     }
 }
 
@@ -119,7 +146,7 @@ public final class NoctCordAppModel: ObservableObject {
     @Published public var showsMemberInspector = true
     @Published public var showsCreateSpace = false
     @Published public var showsCreateChannel = false
-    @Published public var showsIdentity = false
+    @Published public var showsCommunitySettings = false
     @Published public var appearance: NoctCordAppearance = .system
     @Published public private(set) var connectionState: NoctCordConnectionState
     @Published public private(set) var activityMessage: String?
@@ -128,6 +155,7 @@ public final class NoctCordAppModel: ObservableObject {
     @Published public var selectedAttachmentID: UUID?
     @Published public var showsCreateVoiceRoom = false
     @Published public private(set) var callSnapshot: NoctCordMediaRoomSnapshot?
+    @Published public private(set) var composerNotice: String?
 
     private let previewMode: Bool
     private var transport: NoctCordTransportCoordinator?
@@ -157,8 +185,11 @@ public final class NoctCordAppModel: ObservableObject {
     }
 
     public var selectedChannel: NoctCordChannel? {
-        guard let selectedChannelID else { return nil }
-        return selectedSpace?.projection.channels[selectedChannelID]
+        guard let selectedChannelID,
+              let space = selectedSpace,
+              space.projection.permissions(for: space.currentMember, in: selectedChannelID)
+                .contains(.readMessages) else { return nil }
+        return space.projection.channels[selectedChannelID]
     }
 
     public var selectedMessages: [NoctCordMessagePresentation] {
@@ -200,6 +231,33 @@ public final class NoctCordAppModel: ObservableObject {
     public var currentMember: NoctCordMemberViewState? {
         guard let space = selectedSpace else { return nil }
         return space.members.first { $0.id == space.currentMember }
+    }
+
+    public var selectedChannelPermissions: Set<NoctCordPermission> {
+        guard let space = selectedSpace,
+              let channelID = selectedChannelID else { return [] }
+        return space.projection.permissions(for: space.currentMember, in: channelID)
+    }
+
+    public var canSendInSelectedChannel: Bool {
+        selectedChannelPermissions.contains(.sendMessages)
+    }
+
+    public var canAttachInSelectedChannel: Bool {
+        canSendInSelectedChannel && selectedChannelPermissions.contains(.attachFiles)
+    }
+
+    public var availableBotCommands: [(bot: NoctCordBotApplication, command: NoctCordBotCommand)] {
+        guard selectedChannelPermissions.contains(.useApplicationCommands),
+              let space = selectedSpace else { return [] }
+        return space.projection.botApplications.values
+            .flatMap { bot in bot.commands.map { (bot: bot, command: $0) } }
+            .sorted {
+                if $0.command.name != $1.command.name {
+                    return $0.command.name < $1.command.name
+                }
+                return $0.bot.name < $1.bot.name
+            }
     }
 
     public var selectedAttachments: [NoctCordAttachmentPresentation] {
@@ -273,11 +331,19 @@ public final class NoctCordAppModel: ObservableObject {
     }
 
     public func selectChannel(_ id: UUID) {
+        guard selectedSpace?.textChannels.contains(where: { $0.id == id }) == true else {
+            return
+        }
         selectedChannelID = id
         searchQuery = ""
+        composerNotice = nil
         updateSelectedSpace { space in
             space.unreadByChannel[id] = 0
         }
+    }
+
+    public func clearComposerNotice() {
+        composerNotice = nil
     }
 
     public func sendCurrentMessage() {
@@ -285,32 +351,51 @@ public final class NoctCordAppModel: ObservableObject {
         guard !text.isEmpty,
               let channelID = selectedChannelID,
               let spaceID = selectedSpaceID else { return }
-        if !previewMode {
-            composerText = ""
-            Task {
-                await publishAndRefresh(
-                    .postMessage(id: UUID(), channelID: channelID, text: text),
-                    spaceID: spaceID,
-                    activity: "Sending message…"
-                )
-            }
+        guard canSendInSelectedChannel else {
+            composerNotice = "You can read this channel, but your roles cannot send here."
             return
         }
-        updateSelectedSpace { space in
-            let event = NoctCordEvent(
-                spaceID: space.id,
-                author: space.currentMember,
-                logicalClock: Self.nextClock(in: space.events),
-                operation: .postMessage(
-                    id: UUID(),
+
+        let operation: NoctCordOperation
+        if text.hasPrefix("/") {
+            guard selectedChannelPermissions.contains(.useApplicationCommands) else {
+                composerNotice = "Application commands are disabled in this channel."
+                return
+            }
+            let commandLine = String(text.dropFirst())
+            let parts = commandLine.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+            guard let commandName = parts.first.map(String.init), !commandName.isEmpty else {
+                composerNotice = "Enter a command after the slash."
+                return
+            }
+            let matches = availableBotCommands.filter { $0.command.name == commandName.lowercased() }
+            guard matches.count == 1, let match = matches.first else {
+                composerNotice = matches.isEmpty
+                    ? "No installed app exposes /\(commandName)."
+                    : "More than one app exposes /\(commandName); remove the duplicate command."
+                return
+            }
+            operation = .invokeBot(
+                NoctCordBotCommandInvocation(
+                    botID: match.bot.id,
                     channelID: channelID,
-                    text: text
+                    commandName: match.command.name,
+                    arguments: parts.count > 1 ? String(parts[1]) : ""
                 )
             )
-            space.events.append(event)
-            Self.rebuild(&space)
+        } else {
+            operation = .postMessage(id: UUID(), channelID: channelID, text: text)
         }
+
         composerText = ""
+        composerNotice = nil
+        perform(
+            operation,
+            spaceID: spaceID,
+            activity: operation.kind == .botCommandInvoked
+                ? "Invoking application…"
+                : "Sending message…"
+        )
     }
 
     public func toggleReaction(_ value: String, messageID: UUID) {
@@ -676,6 +761,83 @@ public final class NoctCordAppModel: ObservableObject {
         }
     }
 
+    public func saveRole(
+        id: UUID = UUID(),
+        name: String,
+        position: UInt16,
+        permissions: Set<NoctCordPermission>
+    ) {
+        guard let spaceID = selectedSpaceID else { return }
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let role = NoctCordRole(
+            id: id,
+            name: cleanName,
+            position: position,
+            permissions: permissions
+        )
+        perform(.defineRole(role), spaceID: spaceID, activity: "Saving role…")
+    }
+
+    public func deleteRole(_ roleID: UUID) {
+        guard let spaceID = selectedSpaceID else { return }
+        perform(.deleteRole(id: roleID), spaceID: spaceID, activity: "Deleting role…")
+    }
+
+    public func setRole(_ roleID: UUID, for member: GroupScopedMemberHandleV2, assigned: Bool) {
+        guard let spaceID = selectedSpaceID else { return }
+        let operation: NoctCordOperation = assigned
+            ? .grantRole(id: roleID, to: member)
+            : .revokeRole(id: roleID, from: member)
+        perform(operation, spaceID: spaceID, activity: "Updating member roles…")
+    }
+
+    public func setChannelPermissions(
+        channelID: UUID,
+        roleID: UUID?,
+        allow: Set<NoctCordPermission>,
+        deny: Set<NoctCordPermission>
+    ) {
+        guard let spaceID = selectedSpaceID, !allow.isEmpty || !deny.isEmpty else { return }
+        perform(
+            .setChannelPermissions(
+                channelID: channelID,
+                roleID: roleID,
+                allow: allow,
+                deny: deny
+            ),
+            spaceID: spaceID,
+            activity: "Updating channel access…"
+        )
+    }
+
+    public func clearChannelPermissions(channelID: UUID, roleID: UUID?) {
+        guard let spaceID = selectedSpaceID else { return }
+        perform(
+            .removeChannelPermissions(channelID: channelID, roleID: roleID),
+            spaceID: spaceID,
+            activity: "Clearing channel override…"
+        )
+    }
+
+    public func installBot(
+        name: String,
+        member: GroupScopedMemberHandleV2,
+        commands: Set<NoctCordBotCommand>
+    ) {
+        guard let spaceID = selectedSpaceID else { return }
+        let bot = NoctCordBotApplication(
+            memberHandle: member,
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            commands: commands
+        )
+        perform(.installBot(bot), spaceID: spaceID, activity: "Installing application…")
+    }
+
+    public func removeBot(_ botID: UUID) {
+        guard let spaceID = selectedSpaceID else { return }
+        perform(.removeBot(id: botID), spaceID: spaceID, activity: "Removing application…")
+    }
+
     public func sendAttachment(at url: URL) {
         guard !previewMode,
               let transport,
@@ -988,6 +1150,37 @@ public final class NoctCordAppModel: ObservableObject {
         }
     }
 
+    private func perform(
+        _ operation: NoctCordOperation,
+        spaceID: UUID,
+        activity: String? = nil
+    ) {
+        if !previewMode {
+            Task {
+                await publishAndRefresh(operation, spaceID: spaceID, activity: activity)
+            }
+            return
+        }
+
+        guard let index = spaces.firstIndex(where: { $0.id == spaceID }) else { return }
+        var space = spaces[index]
+        let event = NoctCordEvent(
+            spaceID: space.id,
+            author: space.currentMember,
+            logicalClock: Self.nextClock(in: space.events),
+            operation: operation
+        )
+        do {
+            try space.projection.apply(event)
+            space.events.append(event)
+            Self.refreshMemberPresentation(in: &space)
+            spaces[index] = space
+            connectionState = .preview
+        } catch {
+            connectionState = .failed(error.localizedDescription)
+        }
+    }
+
     private func beginAutomaticRefresh() {
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
@@ -1026,7 +1219,7 @@ public final class NoctCordAppModel: ObservableObject {
             selectedSpaceID = spaces.first?.id
         }
         if let previousChannelID,
-           selectedSpace?.projection.channels[previousChannelID] != nil {
+           selectedSpace?.textChannels.contains(where: { $0.id == previousChannelID }) == true {
             selectedChannelID = previousChannelID
         } else {
             selectedChannelID = selectedSpace?.textChannels.first?.id
@@ -1045,7 +1238,9 @@ public final class NoctCordAppModel: ObservableObject {
             spaces.append(session)
         }
         if selectedSpaceID == spaceID,
-           selectedChannelID.flatMap({ session.projection.channels[$0] }) == nil {
+           selectedChannelID.map({ selected in
+               session.textChannels.contains(where: { $0.id == selected })
+           }) != true {
             selectedChannelID = session.textChannels.first?.id
         }
     }
@@ -1060,16 +1255,27 @@ public final class NoctCordAppModel: ObservableObject {
             spaceID: spaceID,
             owner: snapshot.owner,
             activeMembers: activeMembers,
+            historicalMembers: Set(snapshot.events.map(\.author)),
             events: snapshot.events
         ).projection
+        let botMembers = Set(projection.botApplications.values.map(\.memberHandle))
         let members = snapshot.members.map { member in
-            NoctCordMemberViewState(
+            let projectedRoleName: String
+            if member.handle == projection.owner {
+                projectedRoleName = "Owner"
+            } else if botMembers.contains(member.handle) {
+                projectedRoleName = "App"
+            } else {
+                projectedRoleName = projection.roles(for: member.handle).first?.name ?? "Member"
+            }
+            return NoctCordMemberViewState(
                 id: member.handle,
                 displayName: member.isCurrentMember
                     ? "You"
                     : "Member \(Self.compactHandle(member.handle))",
-                roleName: member.roleName,
-                presence: member.isCurrentMember ? .active : .offline
+                roleName: projectedRoleName,
+                presence: member.isCurrentMember ? .active : .offline,
+                isBot: botMembers.contains(member.handle)
             )
         }
         let voiceRooms = projection.voiceRooms.values
@@ -1118,8 +1324,31 @@ public final class NoctCordAppModel: ObservableObject {
             spaceID: space.id,
             owner: space.projection.owner,
             activeMembers: Set(space.members.map(\.id)),
+            historicalMembers: Set(space.events.map(\.author)),
             events: space.events
         ).projection
+        refreshMemberPresentation(in: &space)
+    }
+
+    private static func refreshMemberPresentation(in space: inout NoctCordSpaceSession) {
+        let botMembers = Set(space.projection.botApplications.values.map(\.memberHandle))
+        space.members = space.members.map { member in
+            let roleName: String
+            if member.id == space.projection.owner {
+                roleName = "Owner"
+            } else if botMembers.contains(member.id) {
+                roleName = "App"
+            } else {
+                roleName = space.projection.roles(for: member.id).first?.name ?? "Member"
+            }
+            return NoctCordMemberViewState(
+                id: member.id,
+                displayName: member.displayName,
+                roleName: roleName,
+                presence: member.presence,
+                isBot: botMembers.contains(member.id)
+            )
+        }
     }
 
     private static func nextClock(in events: [NoctCordEvent]) -> UInt64 {
@@ -1150,6 +1379,29 @@ private extension NoctCordAppModel {
         let aster = handle(2)
         let mara = handle(3)
         let ivo = handle(4)
+        let botMember = handle(7)
+        let maintainerRole = NoctCordRole(
+            id: UUID(uuidString: "30000000-0000-0000-0000-000000000001")!,
+            name: "Maintainer",
+            position: 50,
+            permissions: [
+                .manageChannels,
+                .manageMessages,
+                .manageRoles,
+                .manageBots,
+            ]
+        )
+        let relayGuide = NoctCordBotApplication(
+            id: UUID(uuidString: "40000000-0000-0000-0000-000000000001")!,
+            memberHandle: botMember,
+            name: "Relay Guide",
+            commands: [
+                NoctCordBotCommand(
+                    name: "status",
+                    summary: "Summarize relay and channel health"
+                ),
+            ]
+        )
         let now = Date()
         let messages: [(GroupScopedMemberHandleV2, UUID, String, TimeInterval)] = [
             (owner, general, "Welcome to Night Shift. This space is running on compact realtime delivery.", -3_900),
@@ -1177,6 +1429,9 @@ private extension NoctCordAppModel {
         append(owner, .createChannel(id: general, name: "general"), now.addingTimeInterval(-4_700))
         append(owner, .createChannel(id: buildRoom, name: "build-room"), now.addingTimeInterval(-4_600))
         append(owner, .createChannel(id: fieldNotes, name: "field-notes"), now.addingTimeInterval(-4_500))
+        append(owner, .defineRole(maintainerRole), now.addingTimeInterval(-4_450))
+        append(owner, .grantRole(id: maintainerRole.id, to: aster), now.addingTimeInterval(-4_440))
+        append(owner, .installBot(relayGuide), now.addingTimeInterval(-4_430))
         for (author, channel, text, offset) in messages {
             append(
                 author,
@@ -1195,6 +1450,13 @@ private extension NoctCordAppModel {
             NoctCordMemberViewState(id: aster, displayName: "Aster", roleName: "Maintainer", presence: .active),
             NoctCordMemberViewState(id: mara, displayName: "Mara", roleName: "Member", presence: .away),
             NoctCordMemberViewState(id: ivo, displayName: "Ivo", roleName: "Member", presence: .offline),
+            NoctCordMemberViewState(
+                id: botMember,
+                displayName: "Relay Guide",
+                roleName: "App",
+                presence: .active,
+                isBot: true
+            ),
         ]
         let projection = NoctCordSpaceProjection.project(
             spaceID: spaceID,
@@ -1224,6 +1486,7 @@ private extension NoctCordAppModel {
     static func makeProtocolGuild() -> NoctCordSpaceSession {
         let spaceID = UUID(uuidString: "10000000-0000-0000-0000-000000000002")!
         let channelID = UUID(uuidString: "21000000-0000-0000-0000-000000000001")!
+        let staffChannelID = UUID(uuidString: "21000000-0000-0000-0000-000000000002")!
         let owner = handle(5)
         let current = handle(6)
         let now = Date()
@@ -1255,6 +1518,37 @@ private extension NoctCordAppModel {
                     id: UUID(),
                     channelID: channelID,
                     text: "Review the realtime-route threat model before the next relay implementation pass."
+                )
+            ),
+            NoctCordEvent(
+                spaceID: spaceID,
+                author: owner,
+                logicalClock: 4,
+                createdAt: now.addingTimeInterval(-1_700),
+                operation: .setChannelPermissions(
+                    channelID: channelID,
+                    roleID: nil,
+                    allow: [],
+                    deny: [.sendMessages]
+                )
+            ),
+            NoctCordEvent(
+                spaceID: spaceID,
+                author: owner,
+                logicalClock: 5,
+                createdAt: now.addingTimeInterval(-1_600),
+                operation: .createChannel(id: staffChannelID, name: "staff")
+            ),
+            NoctCordEvent(
+                spaceID: spaceID,
+                author: owner,
+                logicalClock: 6,
+                createdAt: now.addingTimeInterval(-1_500),
+                operation: .setChannelPermissions(
+                    channelID: staffChannelID,
+                    roleID: nil,
+                    allow: [],
+                    deny: [.readMessages]
                 )
             ),
         ]

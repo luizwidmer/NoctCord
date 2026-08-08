@@ -24,6 +24,15 @@ relay plaintext application authority.
   Channel creation, messages, edits, reactions, pins, roles, and voice-room
   state are versioned Noct Cord events. The coordinator publishes through
   `HeadlessMessagingClient` and reloads events with the group sync API.
+- **Roles and channel access.** Ordered roles provide bounded community
+  capabilities, while per-channel everyone/role overrides control viewing,
+  sending, attachments, reactions, moderation, and application commands.
+  Clients preflight authorization before upload and deterministically reject
+  unauthorized received events.
+- **Encrypted applications and bots.** An installed app is a dedicated
+  Noctweave group member with declared slash commands. Bot code runs in its
+  own client process with replay-safe invocation handling; the relay never
+  receives a bot token or command plaintext and never executes plugins.
 - **Durable state.** The relay stores opaque Noctweave group transport records;
   the client opens an encrypted local `ClientStateStore` and rebuilds a
   deterministic channel projection after relaunch. `nw.shared-log@1` is
@@ -158,6 +167,7 @@ match the feature being enabled.
   still require signed-device validation.
 
 See [identity design](docs/identity.md),
+[roles, channel access, and applications](docs/roles-channels-and-bots.md),
 [relay extensions](docs/relay-extension.md),
 [media and calls](docs/media-and-calls.md), and
 [ADR 0001](docs/adr/0001-application-boundary.md) for the detailed boundaries.
