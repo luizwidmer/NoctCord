@@ -4,6 +4,8 @@
 
 # Noct Cord
 
+[![License: AGPL v3 or later](https://img.shields.io/badge/license-AGPL--3.0--or--later-6757d9.svg)](LICENSE)
+
 Noct Cord is a native macOS/iOS community-chat client built on the Noctweave
 transport. It provides encrypted spaces, channels, roles, durable message
 history, sanitized attachments, and multi-member voice rooms without giving a
@@ -159,3 +161,13 @@ See [identity design](docs/identity.md),
 [relay extensions](docs/relay-extension.md),
 [media and calls](docs/media-and-calls.md), and
 [ADR 0001](docs/adr/0001-application-boundary.md) for the detailed boundaries.
+
+## Contributing and security
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. Report
+vulnerabilities privately using [SECURITY.md](SECURITY.md).
+
+## License
+
+Copyright (C) 2026 Luiz Widmer. Noct Cord is free software licensed under the
+[GNU Affero General Public License v3.0 or later](LICENSE).

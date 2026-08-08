@@ -4,7 +4,6 @@ dist/
 Resources/NoctCordIcon.iconset/
 .swiftpm/
 .DS_Store
-Package.resolved
 *.xcuserstate
 xcuserdata/
 *.profraw
