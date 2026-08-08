@@ -6,10 +6,11 @@
 ## Context
 
 A community chat product needs spaces, channels, application roles,
-moderation, durable local projections, attachments, presence, and eventually
-group voice. Noctweave provides post-quantum relationship and group transport,
-opaque relay routing, encrypted attachments, and federation. It deliberately
-does not define global accounts or let relays interpret application plaintext.
+moderation, durable local projections, sanitized attachments, optional
+presence, and multi-member voice. Noctweave provides post-quantum relationship
+and group transport, opaque relay routing, capability-scoped media blobs, and
+federation. It deliberately does not define global accounts or let relays
+interpret application plaintext.
 
 Noctweb Browser is a verified static publication renderer. Its current policy
 blocks external requests, native bridges, WebRTC, and media capture. The
@@ -26,15 +27,21 @@ Noct Cord will be a standalone application and repository.
   versioned encrypted application events.
 - Clients persist the immutable encrypted event log and build deterministic
   local projections.
-- Existing opaque-route group fanout supplies the first end-to-end MVP.
-- Noct Cord traffic uses an explicit immediate-delivery profile with temporal
-  bucketing disabled and compact variable-length ciphertext records. This
+- Existing Noctweave group transport supplies durable encrypted application
+  events and deterministic channel projections.
+- Noct Cord voice signaling uses `nw.realtime-route@1` with compact,
+  variable-length ciphertext records and temporal bucketing disabled. This
   deliberately reveals more timing and approximate-size metadata.
-- A generic encrypted shared-log relay module will support long history and
-  efficient large-space synchronization later.
+- Encrypted attachments use `nw.media-blobs@1`; sanitization and content-key
+  handling remain client-side.
+- A generic encrypted shared-log relay module is present as a provisional
+  capability, but is not yet the Noct Cord channel-history backend.
 - Presence is optional and visibly metadata-increasing.
-- Voice signaling may use authenticated group events, but media transport is a
-  separate plane and is never disguised as ordinary relay messaging.
+- Voice signaling uses signed, room-key-encrypted records on the bounded
+  realtime route. SDP and ICE are not copied into permanent group history;
+  durable events carry room and participant state only. WebRTC audio and
+  screen-share media remain a separate plane and are never disguised as
+  ordinary relay messaging.
 
 ## Rejected alternatives
 

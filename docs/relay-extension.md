@@ -1,87 +1,109 @@
-# Realtime route and encrypted shared-log relay extensions
+# Noct Cord relay extensions
 
-Noct Cord can ship a small encrypted-group fallback on current standard relays.
-Its intended delivery path has two application-neutral relay modules:
+Noct Cord uses the ordinary Noctweave group transport for durable encrypted
+space and channel events. The current Noctweave core and Linux relay also
+contain provisional application-neutral extensions for low-latency signaling,
+cursor-based logs, optional presence, and encrypted media blobs. A client must
+read the relay's capability manifest; it must never infer support from a relay
+version or hostname.
 
-- `nw.realtime-route@1` for compact immediate event delivery; and
-- `nw.shared-log@1` for durable encrypted history and cursor synchronization.
+## Capability profile
 
-Large communities, long offline periods, and channel-history pagination need
-these more efficient primitives instead of padded per-member packet fanout.
+For the current Noct Cord path, a standard relay must advertise:
 
-Noct Cord uses immediate dispatch. Temporal bucketing and multi-bucket delivery
-schedules are disabled for Noct Cord routes and shared logs. Realtime records
-are compact and variable length with a strict maximum rather than a mandatory
-padding bucket. This is a deliberate latency-and-bandwidth-over-metadata
-tradeoff.
+| Module | Purpose | Noct Cord use |
+| --- | --- | --- |
+| `nw.core@2` | Health and relay information | Required |
+| `nw.opaque-route@2` or `nw.realtime-route@1` | Encrypted group delivery | Required fallback/route |
+| `nw.media-blobs@1` | Capability-scoped encrypted chunks | Required for attachments |
+| `nw.federation@1` | Optional cross-relay routing | Optional |
+| `nw.shared-log@1` | Bounded opaque cursor history | Assessed, not channel backend yet |
+| `nw.ephemeral-presence@1` | Short-lived opaque leases | Optional and unused by default |
 
-## Realtime route
+Noct Cord requires an immediate delivery profile: `temporalBucketSeconds` must
+be zero and `temporalBucketScheduleSeconds` must be absent or empty. A relay
+that only offers temporal bucketing is reported as incompatible for the
+realtime community path. This is an explicit latency and metadata tradeoff;
+Noct Cord records are variable length and do not receive the standard padded
+Noctweave bucket treatment.
 
-`nw.realtime-route@1` provides a long-lived WebSocket subscription plus bounded
-HTTP append/sync fallbacks. Records are encrypted before submission and expose
-only a random route, ciphertext length, sequence/cursor material, expiry, and
-capability proof. A relay forwards a stored record immediately to active
-subscribers and retains it according to the selected short offline window.
+## `nw.realtime-route@1`
 
-The module must preserve authenticated encryption, group credential binding,
-idempotency, replay rejection, capability rotation, and request ceilings. It
-does not compress attacker-controlled and secret material together. Large
-payloads never enter this path; attachments remain encrypted blobs referenced
-from a small event.
+The current protocol types are:
 
-## Relay-visible model
+- `createRealtimeRouteV1` — creates a bounded route with distinct route,
+  append, and read capabilities and an expiry;
+- `appendRealtimeRouteV1` — appends one opaque record with a record ID;
+- `subscribeRealtimeRouteV1` — derives a short-lived subscription capability;
+- `syncRealtimeRouteV1` — returns bounded records after a cursor; and
+- `unsubscribeRealtimeRouteV1` — releases the subscription.
 
-The relay may observe only:
+Noct Cord uses this route for call signaling. It appends a sealed record and
+then performs subscription/cursor sync while a room is active. The current
+client refresh loop is polling-based; documentation must not describe this
+path as a persistent WebSocket session until an actual WebSocket transport is
+implemented and tested.
 
-- a random stream identifier;
-- digests of independently generated read, append, rotate, and delete
-  capabilities;
-- a bounded policy bucket for record size, quota, and retention;
-- opaque encrypted records and authenticated cursors; and
-- federation routing information required to reach the stream's home relay.
+The relay stores record IDs, sequence numbers, payload bytes, capability
+digests, expiry, and quota state. It does not parse the payload. The relay
+enforces capability authorization, one route home, bounded record size,
+retention, replay/idempotency rules, and cursor validity. Current advertised
+limits are 512 KiB per record, 256 records per page, 4,096 realtime records,
+and a 24-hour route lifetime.
 
-It must not receive space or channel names, Noctweave group keys, member
-handles, role assignments, attachment plaintext, or message content.
+## `nw.media-blobs@1`
 
-## Operations
+The media blob operations are:
 
-1. `create`: register a random stream and bucketed policy using capability
-   digests supplied by the creator.
-2. `append`: authenticate an append capability, store one bounded opaque
-   record with an idempotency digest, and make it available immediately.
-3. `sync`: authenticate a read capability and return a cursor-bounded page.
-4. `checkpoint`: append an encrypted application snapshot so a new member need
-   not replay unlimited history.
-5. `rotate`: replace capability digests after membership changes. Old read
-   capabilities cannot read new records.
-6. `delete`: tombstone the stream and schedule its records for bounded erasure.
+- `createMediaBlobV1` — reserves an object with a capability, chunk count, and
+  TTL;
+- `uploadMediaBlobV1` — stores one bounded opaque chunk with an idempotency key;
+- `fetchMediaBlobV1` — returns one chunk after capability validation; and
+- `releaseMediaBlobV1` — releases an object when the client no longer needs it.
 
-All mutating operations need replay protection, request ceilings, rate limits,
-constant-time capability comparison, and crash-safe transactional persistence.
+The relay does not know whether a blob is an image, audio, video, or document.
+It sees object/chunk identifiers, capability-authenticated requests, chunk
+sizes, chunk count, TTL, and request/network metadata. The client sanitizes
+and encrypts before these operations. The current protocol ceiling is 512 KiB
+per chunk, 256 chunks, and 32 MiB per blob; Noct Cord applies a lower 8 MiB
+post-sanitization client ceiling.
 
-## Federation
+## `nw.shared-log@1` and presence
 
-The stream has one authenticated home relay at a time. Other relays may perform
-one signed federation-forward hop without changing the opaque record. Relay
-identity, destination binding, expiry, and hop count are authenticated.
-Federation must not create a shared bearer token or silently mix solo, manual,
-curated, and open trust domains.
+`nw.shared-log@1` supplies `create`, `append`, and cursor-bounded `sync` for
+opaque records, with bounded record count and retention. The Noctweave relay
+implementation contains this provisional module, but Noct Cord's channel
+projection still reads the durable Noctweave group event stream. Do not claim
+that Noct Cord history is backed by `nw.shared-log@1` until the coordinator is
+explicitly changed and interoperability-tested.
 
-## Presence and calls
+`nw.ephemeral-presence@1` is a best-effort lease service with bounded payload
+and lease durations. It is intentionally optional because activity presence
+adds timing and relationship metadata. Voice-room membership and mute/deafen
+state currently travel as encrypted Noct Cord signals/events instead.
 
-Best-effort presence belongs in a separate optional `nw.ephemeral-presence@1`
-lease service because it leaks activity timing. It is never required to read or
-send messages.
+## Federation and transport
 
-Group call invitations and negotiation can be encrypted Noct Cord events. The
-media plane is separate: small calls may begin peer-to-peer; larger calls need
-a separately operated, end-to-end-encrypted forwarding design. A media server
-is not a Noctweave relay role.
+Federation may forward an unchanged encrypted append when the destination
+relay is authenticated and the configured federation mode permits it. A
+forwarding relay must not decrypt, rewrap, or inspect Noct Cord records. Relay
+identity, destination binding, expiry, and hop limits remain separate from
+the Noct Cord room key.
 
-## Implementation gate
+The extensions are available through the same Noctweave operation envelope over
+the transports supported by the selected relay. TLS or WSS protects the link
+and its transport metadata; it does not replace the end-to-end encryption in
+group events, attachment chunks, or call signaling.
 
-Relays must not advertise `nw.realtime-route@1` or `nw.shared-log@1` until macOS
-and Linux implementations pass the same interoperability suite for
-authorization, immediate subscription delivery, cursor replay, capability
-rotation, crash recovery, quota enforcement, federation forwarding, and
-removal of a member's future access.
+## Implementation status and gate
+
+The current Noctweave core and Linux relay implement provisional route,
+shared-log, presence, and media-blob types, store methods, operation dispatch,
+capability advertisement, persistence, and focused tests. Noct Cord has local
+real-relay coverage for encrypted group state, attachment round trips,
+three-member room admission, and realtime signal recovery. Before release,
+repeat the suite against deployed macOS and Linux relays for capability gating,
+immediate delivery, cursor recovery, attachment expiry, capability rotation,
+replay rejection, crash recovery, quota limits, and federation forwarding. Do
+not advertise a module from a deployed relay until its handler, persistence
+path, and tests all pass for that build.

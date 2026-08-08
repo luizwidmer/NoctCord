@@ -47,11 +47,23 @@ public enum NoctCordEventKind: String, Codable, CaseIterable, Sendable {
     case reactionRemoved
     case messagePinned
     case messageUnpinned
+    case attachmentAdded
+    case voiceRoomCreated
+    case voiceRoomUpdated
+    case voiceRoomArchived
+    case voiceParticipantJoined
+    case voiceParticipantLeft
+    case voiceParticipantMuted
+    case voiceParticipantDeafened
+    case voiceParticipantSpeaking
+    case callSignalPosted
+    case screenShareStarted
+    case screenShareStopped
 }
 
 /// A bounded, application-level operation. It is encoded inside a Noctweave
 /// group application event and is never interpreted by a relay.
-public struct NoctCordOperation: Codable, Equatable {
+public struct NoctCordOperation: Codable, Equatable, Sendable {
     public let kind: NoctCordEventKind
     public let channelID: UUID?
     public let messageID: UUID?
@@ -62,6 +74,14 @@ public struct NoctCordOperation: Codable, Equatable {
     public let permissions: [NoctCordPermission]?
     public let replyTo: UUID?
     public let reaction: String?
+    public let attachmentID: UUID?
+    public let attachmentManifest: NoctCordAttachmentManifestV1?
+    public let voiceRoomID: UUID?
+    public let voiceRoomSpec: NoctCordVoiceRoomSpecV1?
+    public let voiceParticipantState: NoctCordVoiceParticipantStateV1?
+    public let callSignal: NoctCordEncryptedCallSignalV1?
+    public let screenShare: NoctCordScreenShareDescriptorV1?
+    public let screenShareID: UUID?
 
     public init(
         kind: NoctCordEventKind,
@@ -73,7 +93,15 @@ public struct NoctCordOperation: Codable, Equatable {
         text: String? = nil,
         permissions: Set<NoctCordPermission>? = nil,
         replyTo: UUID? = nil,
-        reaction: String? = nil
+        reaction: String? = nil,
+        attachmentID: UUID? = nil,
+        attachmentManifest: NoctCordAttachmentManifestV1? = nil,
+        voiceRoomID: UUID? = nil,
+        voiceRoomSpec: NoctCordVoiceRoomSpecV1? = nil,
+        voiceParticipantState: NoctCordVoiceParticipantStateV1? = nil,
+        callSignal: NoctCordEncryptedCallSignalV1? = nil,
+        screenShare: NoctCordScreenShareDescriptorV1? = nil,
+        screenShareID: UUID? = nil
     ) {
         self.kind = kind
         self.channelID = channelID
@@ -85,6 +113,14 @@ public struct NoctCordOperation: Codable, Equatable {
         self.permissions = permissions?.sorted { $0.rawValue < $1.rawValue }
         self.replyTo = replyTo
         self.reaction = reaction
+        self.attachmentID = attachmentID
+        self.attachmentManifest = attachmentManifest
+        self.voiceRoomID = voiceRoomID
+        self.voiceRoomSpec = voiceRoomSpec
+        self.voiceParticipantState = voiceParticipantState
+        self.callSignal = callSignal
+        self.screenShare = screenShare
+        self.screenShareID = screenShareID
     }
 
     public static func createSpace(name: String) -> Self {
@@ -167,6 +203,93 @@ public struct NoctCordOperation: Codable, Equatable {
         Self(kind: .messageUnpinned, messageID: id)
     }
 
+    public static func addAttachment(
+        id: UUID,
+        channelID: UUID,
+        manifest: NoctCordAttachmentManifestV1
+    ) -> Self {
+        Self(
+            kind: .attachmentAdded,
+            channelID: channelID,
+            attachmentID: id,
+            attachmentManifest: manifest
+        )
+    }
+
+    public static func createVoiceRoom(
+        id: UUID,
+        spec: NoctCordVoiceRoomSpecV1
+    ) -> Self {
+        Self(kind: .voiceRoomCreated, voiceRoomID: id, voiceRoomSpec: spec)
+    }
+
+    public static func updateVoiceRoom(
+        id: UUID,
+        spec: NoctCordVoiceRoomSpecV1
+    ) -> Self {
+        Self(kind: .voiceRoomUpdated, voiceRoomID: id, voiceRoomSpec: spec)
+    }
+
+    public static func archiveVoiceRoom(id: UUID) -> Self {
+        Self(kind: .voiceRoomArchived, voiceRoomID: id)
+    }
+
+    public static func joinVoiceRoom(
+        id: UUID,
+        state: NoctCordVoiceParticipantStateV1
+    ) -> Self {
+        Self(kind: .voiceParticipantJoined, voiceRoomID: id, voiceParticipantState: state)
+    }
+
+    public static func leaveVoiceRoom(
+        id: UUID,
+        state: NoctCordVoiceParticipantStateV1
+    ) -> Self {
+        Self(kind: .voiceParticipantLeft, voiceRoomID: id, voiceParticipantState: state)
+    }
+
+    public static func setVoiceMute(
+        roomID: UUID,
+        state: NoctCordVoiceParticipantStateV1
+    ) -> Self {
+        Self(kind: .voiceParticipantMuted, voiceRoomID: roomID, voiceParticipantState: state)
+    }
+
+    public static func setVoiceDeafened(
+        roomID: UUID,
+        state: NoctCordVoiceParticipantStateV1
+    ) -> Self {
+        Self(kind: .voiceParticipantDeafened, voiceRoomID: roomID, voiceParticipantState: state)
+    }
+
+    public static func setVoiceSpeaking(
+        roomID: UUID,
+        state: NoctCordVoiceParticipantStateV1
+    ) -> Self {
+        Self(kind: .voiceParticipantSpeaking, voiceRoomID: roomID, voiceParticipantState: state)
+    }
+
+    public static func postCallSignal(
+        roomID: UUID,
+        signal: NoctCordEncryptedCallSignalV1
+    ) -> Self {
+        Self(kind: .callSignalPosted, voiceRoomID: roomID, callSignal: signal)
+    }
+
+    public static func startScreenShare(
+        roomID: UUID,
+        descriptor: NoctCordScreenShareDescriptorV1
+    ) -> Self {
+        Self(kind: .screenShareStarted, voiceRoomID: roomID, screenShare: descriptor)
+    }
+
+    public static func stopScreenShare(
+        roomID: UUID,
+        shareID: UUID
+    ) -> Self {
+        Self(kind: .screenShareStopped, voiceRoomID: roomID, screenShareID: shareID)
+    }
+
     public var isStructurallyValid: Bool {
         let permissionListIsValid = permissions.map {
             $0.count <= NoctCordPermission.allCases.count
@@ -174,7 +297,12 @@ public struct NoctCordOperation: Codable, Equatable {
                 && $0 == $0.sorted { lhs, rhs in lhs.rawValue < rhs.rawValue }
         } ?? true
         guard permissionListIsValid,
-              memberHandle?.isStructurallyValid ?? true else {
+              memberHandle?.isStructurallyValid ?? true,
+              attachmentManifest?.isStructurallyValid ?? true,
+              voiceRoomSpec?.isStructurallyValid ?? true,
+              voiceParticipantState?.isStructurallyValid ?? true,
+              callSignal?.isStructurallyValid ?? true,
+              screenShare?.isStructurallyValid ?? true else {
             return false
         }
 
@@ -214,6 +342,35 @@ public struct NoctCordOperation: Codable, Equatable {
             return messageID != nil
                 && NoctCordValidation.isReaction(reaction)
                 && only(message: true, reaction: true)
+        case .attachmentAdded:
+            return channelID != nil
+                && attachmentID != nil
+                && attachmentManifest != nil
+                && only(channel: true, attachment: true, attachmentManifest: true)
+        case .voiceRoomCreated, .voiceRoomUpdated:
+            return voiceRoomID != nil
+                && voiceRoomSpec != nil
+                && only(voiceRoom: true, voiceRoomSpec: true)
+        case .voiceRoomArchived:
+            return voiceRoomID != nil && only(voiceRoom: true)
+        case .voiceParticipantJoined, .voiceParticipantLeft,
+             .voiceParticipantMuted, .voiceParticipantDeafened,
+             .voiceParticipantSpeaking:
+            return voiceRoomID != nil
+                && voiceParticipantState != nil
+                && only(voiceRoom: true, participantState: true)
+        case .callSignalPosted:
+            return voiceRoomID != nil
+                && callSignal != nil
+                && only(voiceRoom: true, callSignal: true)
+        case .screenShareStarted:
+            return voiceRoomID != nil
+                && screenShare != nil
+                && only(voiceRoom: true, screenShare: true)
+        case .screenShareStopped:
+            return voiceRoomID != nil
+                && screenShareID != nil
+                && only(voiceRoom: true, screenShareID: true)
         }
     }
 
@@ -226,7 +383,15 @@ public struct NoctCordOperation: Codable, Equatable {
         text: Bool = false,
         permissions: Bool = false,
         reply: Bool = false,
-        reaction: Bool = false
+        reaction: Bool = false,
+        attachment: Bool = false,
+        attachmentManifest: Bool = false,
+        voiceRoom: Bool = false,
+        voiceRoomSpec: Bool = false,
+        participantState: Bool = false,
+        callSignal: Bool = false,
+        screenShare: Bool = false,
+        screenShareID: Bool = false
     ) -> Bool {
         (channelID != nil) == channel
             && (messageID != nil) == message
@@ -237,10 +402,18 @@ public struct NoctCordOperation: Codable, Equatable {
             && (self.permissions != nil) == permissions
             && (replyTo != nil) == reply
             && (self.reaction != nil) == reaction
+            && (attachmentID != nil) == attachment
+            && (self.attachmentManifest != nil) == attachmentManifest
+            && (voiceRoomID != nil) == voiceRoom
+            && (self.voiceRoomSpec != nil) == voiceRoomSpec
+            && (self.voiceParticipantState != nil) == participantState
+            && (self.callSignal != nil) == callSignal
+            && (self.screenShare != nil) == screenShare
+            && (self.screenShareID != nil) == screenShareID
     }
 }
 
-public struct NoctCordEvent: Codable, Equatable, Identifiable {
+public struct NoctCordEvent: Codable, Equatable, Identifiable, Sendable {
     public static let version = 1
 
     public let version: Int
@@ -265,7 +438,11 @@ public struct NoctCordEvent: Codable, Equatable, Identifiable {
         self.spaceID = spaceID
         self.author = author
         self.logicalClock = logicalClock
-        self.createdAt = createdAt
+        // Noctweave's canonical JSON date profile is second-granular. Keep
+        // the application event and its enclosing signed group event on that
+        // same timestamp before either is encoded so local publications can
+        // be decoded and projected identically to received publications.
+        self.createdAt = NoctweaveRendezvousV2.canonicalTimestamp(createdAt)
         self.operation = operation
     }
 
@@ -303,6 +480,19 @@ enum NoctCordValidation {
             && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
             && value.utf8.count <= 64
             && !containsUnsafeControl(value)
+    }
+
+    static func isSanitizedMediaType(_ value: String) -> Bool {
+        guard value == value.lowercased(), value.utf8.count <= 128 else { return false }
+        let parts = value.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return false }
+        return parts.allSatisfy { token in
+            token.unicodeScalars.allSatisfy { scalar in
+                CharacterSet(
+                    charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789!#$&^_.+-"
+                ).contains(scalar)
+            }
+        }
     }
 
     private static func containsUnsafeControl(

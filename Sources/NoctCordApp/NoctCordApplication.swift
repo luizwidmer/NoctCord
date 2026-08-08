@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import NoctCordUI
 
@@ -19,12 +20,20 @@ struct NoctCordApplication: App {
 
     var body: some Scene {
         WindowGroup("Noct Cord") {
-            NoctCordRootView()
+            NoctCordRootView(seedPreviewData: previewDataEnabled)
                 .frame(minWidth: 980, minHeight: 680)
         }
         #if os(macOS)
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1_330, height: 820)
+        #endif
+    }
+
+    private var previewDataEnabled: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["NOCTCORD_PREVIEW_DATA"] == "1"
+        #else
+        false
         #endif
     }
 }

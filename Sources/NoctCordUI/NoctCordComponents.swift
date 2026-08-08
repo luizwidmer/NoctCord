@@ -1,5 +1,11 @@
 import SwiftUI
 import NoctCordCore
+import NoctCordMedia
+#if os(macOS)
+import AppKit
+#elseif os(iOS)
+import UIKit
+#endif
 
 struct NoctCordSpaceRail: View {
     @ObservedObject var model: NoctCordAppModel
@@ -188,6 +194,11 @@ struct NoctCordChannelSidebar: View {
                 }
 
                 VStack(spacing: 0) {
+                    if let activeRoomID = space.activeVoiceRoomID,
+                       let room = space.voiceRooms.first(where: { $0.id == activeRoomID }) {
+                        Divider().overlay(NoctCordTheme.border)
+                        ActiveVoiceDock(model: model, room: room)
+                    }
                     Divider().overlay(NoctCordTheme.border)
                     currentIdentityFooter(space)
                 }
@@ -227,7 +238,12 @@ struct NoctCordChannelSidebar: View {
 
     private func voiceSection(_ space: NoctCordSpaceSession) -> some View {
         VStack(alignment: .leading, spacing: 7) {
-            sectionHeader("Voice rooms", action: nil)
+            sectionHeader(
+                "Voice rooms",
+                action: space.canManageChannels
+                    ? { model.showsCreateVoiceRoom = true }
+                    : nil
+            )
             if space.voiceRooms.isEmpty {
                 Text("No rooms yet")
                     .font(.system(size: 12))
@@ -360,6 +376,96 @@ private struct ChannelRow: View {
     }
 }
 
+private struct ActiveVoiceDock: View {
+    @ObservedObject var model: NoctCordAppModel
+    let room: NoctCordVoiceRoom
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "waveform.circle.fill")
+                    .foregroundStyle(NoctCordTheme.success)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(room.name)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .lineLimit(1)
+                    Text(connectionLabel)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(NoctCordTheme.secondaryText)
+                }
+                Spacer()
+                Button {
+                    model.joinVoiceRoom(room.id)
+                } label: {
+                    Image(systemName: "phone.down.fill")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 30, height: 30)
+                        .background(NoctCordTheme.mutedCoral, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .help("Leave voice room")
+            }
+
+            HStack(spacing: 8) {
+                callButton(
+                    model.callSnapshot?.microphoneMuted == true ? "mic.slash.fill" : "mic.fill",
+                    active: model.callSnapshot?.microphoneMuted == true,
+                    help: "Mute microphone"
+                ) {
+                    model.setCallMuted(!(model.callSnapshot?.microphoneMuted ?? false))
+                }
+                callButton(
+                    model.callSnapshot?.deafened == true ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                    active: model.callSnapshot?.deafened == true,
+                    help: "Deafen"
+                ) {
+                    model.setCallDeafened(!(model.callSnapshot?.deafened ?? false))
+                }
+                callButton(
+                    "rectangle.on.rectangle",
+                    active: model.callSnapshot?.localScreenShare != nil,
+                    help: "Share screen"
+                ) {
+                    if model.callSnapshot?.localScreenShare == nil {
+                        model.startScreenShare()
+                    } else {
+                        model.stopScreenShare()
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(NoctCordTheme.success.opacity(0.055))
+    }
+
+    private var connectionLabel: String {
+        let peers = max(0, (model.callSnapshot?.participants.count ?? 1) - 1)
+        return peers == 1 ? "1 peer connected" : "\(peers) peers connected"
+    }
+
+    private func callButton(
+        _ symbol: String,
+        active: Bool,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(active ? .white : NoctCordTheme.secondaryText)
+                .frame(maxWidth: .infinity)
+                .frame(height: 30)
+                .background(
+                    active ? NoctCordTheme.mutedCoral : NoctCordTheme.input,
+                    in: RoundedRectangle(cornerRadius: 9)
+                )
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
 private struct VoiceRoomRow: View {
     let room: NoctCordVoiceRoom
     let isActive: Bool
@@ -456,6 +562,76 @@ struct NoctCordConversationHeader: View {
     }
 }
 
+struct NoctCordRemoteScreenShareStage: View {
+    @ObservedObject var model: NoctCordAppModel
+
+    private var tracks: [(NoctCordMediaParticipantID, NoctCordMediaRemoteVideoTrack)] {
+        (model.callSnapshot?.remoteVideoTracks ?? [:])
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.on.rectangle.angled")
+                    .foregroundStyle(NoctCordTheme.mutedCoral)
+                Text(tracks.count == 1 ? "Screen share" : "Screen shares")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text("End-to-end call media")
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(NoctCordTheme.secondaryText)
+            }
+
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 260), spacing: 10)],
+                spacing: 10
+            ) {
+                ForEach(tracks, id: \.0) { participant, track in
+                    ZStack(alignment: .bottomLeading) {
+                        NoctCordMediaRemoteVideoView(
+                            track: track,
+                            contentMode: .aspectFit
+                        )
+                        .aspectRatio(16 / 9, contentMode: .fit)
+
+                        Text(displayName(for: participant))
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 9)
+                            .frame(height: 25)
+                            .background(.black.opacity(0.62), in: Capsule())
+                            .padding(9)
+                    }
+                    .background(.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 13, style: .continuous)
+                            .stroke(NoctCordTheme.border, lineWidth: 1)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(NoctCordTheme.surface.opacity(0.94))
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(NoctCordTheme.border).frame(height: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Remote screen sharing")
+    }
+
+    private func displayName(for participant: NoctCordMediaParticipantID) -> String {
+        if let member = model.selectedSpace?.members.first(where: {
+            $0.id.rawValue == participant.rawValue
+        }) {
+            return member.displayName
+        }
+        return "Participant \(participant.rawValue.prefix(8))"
+    }
+}
+
 private struct HeaderIconButton: View {
     let symbol: String
     let help: String
@@ -498,6 +674,19 @@ struct NoctCordMessageTimeline: View {
                             model.toggleReaction(reaction, messageID: message.id)
                         }
                         .id(message.id)
+                    }
+                    ForEach(model.selectedAttachments) { attachment in
+                        AttachmentRow(
+                            attachment: attachment,
+                            cached: model.cachedAttachments[attachment.id]
+                        ) {
+                            if attachment.isAvailableLocally {
+                                model.selectedAttachmentID = attachment.id
+                            } else {
+                                model.downloadAttachment(attachment.id)
+                            }
+                        }
+                        .id(attachment.id)
                     }
                 }
                 .padding(.horizontal, 24)
@@ -666,6 +855,19 @@ struct NoctCordComposer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .bottom, spacing: 10) {
+                Button {
+                    model.showsAttachmentImporter = true
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(NoctCordTheme.secondaryText)
+                        .frame(width: 32, height: 32)
+                        .background(NoctCordTheme.surface, in: Circle())
+                        .overlay { Circle().stroke(NoctCordTheme.border) }
+                }
+                .buttonStyle(.plain)
+                .help("Upload a sanitized, encrypted attachment")
+
                 TextField(
                     "Message #\(model.selectedChannel?.name ?? "channel")",
                     text: $model.composerText,
@@ -712,6 +914,194 @@ struct NoctCordComposer: View {
         .padding(.horizontal, 20)
         .frame(height: NoctCordTheme.footerHeight)
         .background(NoctCordTheme.canvas)
+    }
+}
+
+private struct AttachmentRow: View {
+    let attachment: NoctCordAttachmentPresentation
+    let cached: NoctCordDownloadedAttachment?
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                preview
+                    .frame(width: 64, height: 52)
+                    .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 11))
+                    .clipShape(RoundedRectangle(cornerRadius: 11))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(typeLabel)
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Text("\(ByteCountFormatter.string(fromByteCount: Int64(attachment.byteCount), countStyle: .file)) · encrypted")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(NoctCordTheme.secondaryText)
+                    Text(attachment.isExpired ? "Relay copy expired" : "Available until \(attachment.expiresAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(attachment.isExpired ? NoctCordTheme.warning : NoctCordTheme.secondaryText)
+                }
+                Spacer()
+                Image(systemName: attachment.isAvailableLocally ? "eye" : "arrow.down.circle")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(NoctCordTheme.mutedCoral)
+                    .frame(width: 34, height: 34)
+                    .background(NoctCordTheme.mutedCoral.opacity(0.10), in: Circle())
+            }
+            .foregroundStyle(NoctCordTheme.primaryText)
+            .padding(10)
+            .frame(maxWidth: 430)
+            .background(
+                isHovered ? NoctCordTheme.elevated : NoctCordTheme.surface,
+                in: RoundedRectangle(cornerRadius: 15)
+            )
+            .overlay { RoundedRectangle(cornerRadius: 15).stroke(NoctCordTheme.border) }
+            .contentShape(RoundedRectangle(cornerRadius: 15))
+        }
+        .buttonStyle(.plain)
+        .disabled(attachment.isExpired && !attachment.isAvailableLocally)
+        .noctCordOnHover { isHovered = $0 }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private var preview: some View {
+        if let cached, cached.mediaType.hasPrefix("image/") {
+            #if os(macOS)
+            if let image = NSImage(data: cached.bytes) {
+                Image(nsImage: image).resizable().scaledToFill()
+            } else {
+                fallbackIcon
+            }
+            #elseif os(iOS)
+            if let image = UIImage(data: cached.bytes) {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else {
+                fallbackIcon
+            }
+            #endif
+        } else {
+            fallbackIcon
+        }
+    }
+
+    private var fallbackIcon: some View {
+        Image(systemName: symbol)
+            .font(.system(size: 20, weight: .medium))
+            .foregroundStyle(NoctCordTheme.mutedCoral)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var typeLabel: String {
+        if attachment.mediaType.hasPrefix("image/") { return "Image" }
+        if attachment.mediaType.hasPrefix("video/") { return "Video" }
+        if attachment.mediaType.hasPrefix("audio/") { return "Audio" }
+        if attachment.mediaType == "application/pdf" { return "PDF document" }
+        return "Document"
+    }
+
+    private var symbol: String {
+        if attachment.mediaType.hasPrefix("image/") { return "photo" }
+        if attachment.mediaType.hasPrefix("video/") { return "film" }
+        if attachment.mediaType.hasPrefix("audio/") { return "waveform" }
+        if attachment.mediaType == "application/pdf" { return "doc.richtext" }
+        return "doc"
+    }
+}
+
+struct NoctCordAttachmentViewer: View {
+    let attachment: NoctCordDownloadedAttachment?
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Encrypted attachment")
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                    Text(attachment?.mediaType ?? "Unavailable")
+                        .font(.system(size: 10))
+                        .foregroundStyle(NoctCordTheme.secondaryText)
+                }
+                Spacer()
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .frame(width: 30, height: 30)
+                        .background(NoctCordTheme.input, in: Circle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(18)
+            Divider().overlay(NoctCordTheme.border)
+
+            Group {
+                if let attachment {
+                    attachmentContent(attachment)
+                } else {
+                    ContentUnavailableView(
+                        "Attachment unavailable",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text("Download the encrypted relay copy before opening it.")
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(18)
+        }
+        .frame(minWidth: 560, minHeight: 430)
+        .background(NoctCordTheme.canvas)
+        .foregroundStyle(NoctCordTheme.primaryText)
+    }
+
+    @ViewBuilder
+    private func attachmentContent(_ attachment: NoctCordDownloadedAttachment) -> some View {
+        if attachment.mediaType.hasPrefix("image/") {
+            #if os(macOS)
+            if let image = NSImage(data: attachment.bytes) {
+                Image(nsImage: image).resizable().scaledToFit()
+            } else {
+                invalidContent
+            }
+            #elseif os(iOS)
+            if let image = UIImage(data: attachment.bytes) {
+                Image(uiImage: image).resizable().scaledToFit()
+            } else {
+                invalidContent
+            }
+            #endif
+        } else if attachment.mediaType.hasPrefix("text/"),
+                  let text = String(data: attachment.bytes, encoding: .utf8) {
+            ScrollView {
+                Text(text)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+            }
+            .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 14))
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "doc.fill")
+                    .font(.system(size: 42))
+                    .foregroundStyle(NoctCordTheme.mutedCoral)
+                Text("The file is authenticated and available in memory.")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(ByteCountFormatter.string(
+                    fromByteCount: Int64(attachment.bytes.count),
+                    countStyle: .file
+                ))
+                .font(.system(size: 10.5))
+                .foregroundStyle(NoctCordTheme.secondaryText)
+            }
+        }
+    }
+
+    private var invalidContent: some View {
+        ContentUnavailableView(
+            "Cannot render attachment",
+            systemImage: "doc.badge.ellipsis",
+            description: Text("The authenticated bytes could not be rendered by this platform.")
+        )
     }
 }
 

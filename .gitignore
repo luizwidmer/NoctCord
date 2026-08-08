@@ -7,3 +7,4 @@ Resources/NoctCordIcon.iconset/
 Package.resolved
 *.xcuserstate
 xcuserdata/
+*.profraw

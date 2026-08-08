@@ -4,133 +4,158 @@
 
 # Noct Cord
 
-Noct Cord is a community chat application built above the Noctweave transport.
-It targets a Discord-like experience—spaces, channels, roles, threaded text,
-attachments, and eventually voice—without turning relays into trusted
-plaintext application servers.
+Noct Cord is a native macOS/iOS community-chat client built on the Noctweave
+transport. It provides encrypted spaces, channels, roles, durable message
+history, sanitized attachments, and multi-member voice rooms without giving a
+relay plaintext application authority.
 
-> Status: pre-1.0 UI-ready prototype. The native macOS interface, event model,
-> deterministic projection, compact realtime codec, portable identity proofs,
-> relay capability assessment, demo, and tests are runnable. Relay-backed sync,
-> encrypted persistence, attachments, and the durable shared-log module remain
-> implementation work; the current app intentionally uses local preview state.
+> Status: pre-1.0. The relay, attachment, signaling, and native media paths
+> described below are implemented and covered by local interoperability tests,
+> but this is not a security-audited or production-certified release. Signed
+> device, hostile-network, and deployment validation remain release gates.
 
 ![Noct Cord macOS interface](docs/assets/noct-cord-macos.jpeg)
 
-## What is working
+## Current capabilities
 
-- Native community, channel, member, search, reaction, unread, and composer UX
-- Real event projection behind every visible preview message and channel
-- Portable ML-DSA identity proofs across communities, or isolated per-space identities
-- Fresh group-scoped transport handles regardless of social identity choice
-- Compact `nw.realtime-route@1` records and standard Noctweave fallback content
-- Relay readiness checks for realtime delivery, durable history, and attachments
-- Light, dark, and system appearances using the Noctweave ivory/coral/wine palette
+- **Encrypted spaces and channels.** One space maps to one Noctweave group.
+  Channel creation, messages, edits, reactions, pins, roles, and voice-room
+  state are versioned Noct Cord events. The coordinator publishes through
+  `HeadlessMessagingClient` and reloads events with the group sync API.
+- **Durable state.** The relay stores opaque Noctweave group transport records;
+  the client opens an encrypted local `ClientStateStore` and rebuilds a
+  deterministic channel projection after relaunch. `nw.shared-log@1` is
+  capability-assessed by the client but is not yet the channel-history backend.
+- **Sanitized encrypted media.** Images are re-encoded, audio/video are
+  freshly exported, PDFs are flattened, and text is normalized before a fresh
+  AES-256-GCM attachment key encrypts 64 KiB chunks. The filename and source
+  path are never published. Chunks use `nw.media-blobs@1`, a 32-byte opaque
+  blob capability, a digest, and a bounded expiry. The current client limit is
+  8 MiB after sanitization; the relay module permits up to 32 MiB in total.
+- **Voice rooms.** A permitted member can join a room created by a member with
+  channel-management permission. The native media layer uses raw WebRTC from
+  `stasel/WebRTC` 150.0.0 and creates a peer mesh for audio and renegotiation.
+  The current client caps rooms at eight participants so uplink and CPU use do
+  not grow without an explicit media-forwarding design.
+- **Authenticated custom signaling.** SDP, ICE candidates, join/leave state,
+  mute/deafen state, and screen-share control are encoded as media signals,
+  encrypted with the room signaling key, authenticated with the member's
+  ML-DSA group credential, and carried through the bounded,
+  expiry-controlled `nw.realtime-route@1` path.
+- **Screen sharing.** macOS uses ScreenCaptureKit for a display capture. iOS
+  uses the foreground ReplayKit path. Received tracks are attached to native
+  WebRTC Metal renderers in the channel surface, with deterministic
+  renegotiation to prevent simultaneous-share offer glare.
 
-## Why a dedicated application
-
-Noct Cord should be a separate app, not another screen inside Noctweave
-Messaging and not privileged JavaScript inside Noctweb Browser.
-
-- Noctweave Messaging is optimized for contacts and compact conversations.
-- Noctweb Browser intentionally blocks native bridges, external network access,
-  WebRTC, and media capture for rendered publications.
-- Noct Cord needs its own navigation, local event store, channel projections,
-  moderation UX, notification policy, and future voice media plane.
-
-The native client can reuse `NoctweaveCore`. A web companion can follow later
-through `NoctweaveJS` or a narrow, origin-bound Browser capability; neither
-route should expose keys or opaque receive capabilities to page code.
-
-## Architecture
+## Architecture and relay visibility
 
 ```mermaid
 flowchart LR
-    A["Noct Cord client"] --> B["Noct Cord encrypted app events"]
-    B --> C["Noctweave group runtime"]
-    C --> D["Opaque relay routes"]
-    D <--> E["Federated relay"]
-    C --> F["Other Noct Cord clients"]
-    A --> G["Local channel and role projection"]
+    A["Noct Cord client"] --> B["Encrypted Noctweave group event"]
+    A --> C["Sanitize + encrypt attachment"]
+    C --> D["nw.media-blobs@1"]
+    A --> E["Encrypt + ML-DSA-sign call signal"]
+    E --> F["nw.realtime-route@1"]
+    B --> R["Noctweave relay"]
+    D --> R
+    F --> R
+    R --> G["Other clients"]
 ```
 
-One Noct Cord space maps to one Noctweave group. Members use fresh
-group-scoped handles. Channels, roles, permissions, messages, edits, reactions,
-and pins are encrypted application events. The relay sees opaque packets, not
-space names, channel names, membership identities, or message plaintext.
+The relay can see transport metadata: the connecting endpoint, request timing,
+route/blob identifiers, capability-authenticated operation type, sequence or
+cursor values, record/chunk sizes, expiry, quotas, and connection health. A
+reverse proxy, TURN server, or federation peer may see its own network metadata.
 
-Social identity is selectable per community. A portable client-owned ML-DSA
-profile can prove the same identity across many communities and relays, while
-isolated mode creates a fresh profile key and publishes no cross-community
-binding. Transport credentials remain fresh in both modes. See
-[identity design](docs/identity.md).
+The relay does **not** receive space/channel names, member display names,
+group keys, message plaintext, attachment filenames, source paths, attachment
+content keys, sanitized media bytes, SDP, or ICE candidates. The media relay
+path is signaling storage only; audio/video is exchanged through WebRTC after
+negotiation. A TURN operator can observe traffic metadata, but this repository
+does not claim an independently audited application-level E2EE layer over the
+WebRTC media plane.
 
-## Run the app
+## ICE, permissions, and privacy choices
 
-The package defaults to the public Noctweave repository. During local
-development, point it at a checkout:
+`NoctCordMediaICEServer` accepts only explicit `stun:`, `stuns:`, `turn:`, or
+`turns:` URLs. An empty ICE list is intentional LAN-only operation. No silent
+third-party STUN or TURN default is inserted. Operators or users must provide
+their own ICE service and short-lived TURN credentials when NAT traversal is
+needed; credentials must not be embedded in the URL.
+
+Joining a microphone room requests microphone permission through the host OS.
+Starting screen share requests the platform-specific capture permission. macOS
+requires Screen Recording approval. iOS's current implementation is an
+in-app ReplayKit capture and requires user action; it does not include a
+Broadcast Upload Extension and does not promise background screen capture.
+The application host must add the appropriate usage descriptions and
+entitlements to its platform bundle.
+
+## Build and run locally
+
+Requirements: Swift 6, macOS 14 or later for the desktop app, iOS 17 or later
+for the package's iOS surface, and the Swift package dependency
+`stasel/WebRTC` 150.0.0. By default, Noct Cord resolves Noctweave from its
+public package URL. For local protocol development, point it at a checkout:
 
 ```sh
 export NOCTWEAVE_PACKAGE_PATH="/path/to/NoctweaveCore"
+swift build
 swift test
+swift run NoctCordDemo
 swift run NoctCordApp
 ```
 
-To create a launchable macOS bundle:
+`NoctCordDemo` is deterministic projection/codec smoke coverage. `NoctCordApp`
+starts with setup enabled: enter a display name and a reachable relay URL,
+then use **Test relay and continue**. It does not create a local relay.
+
+To build a launchable macOS bundle:
 
 ```sh
 export NOCTWEAVE_PACKAGE_PATH="/path/to/NoctweaveCore"
-Scripts/build-macos-app.sh release
+Scripts/build-macos-app.sh debug
 open "dist/Noct Cord.app"
 ```
 
-The bundle includes the native Noct Cord icon. Regenerate its checked-in
-`.icns` asset from the code-native artwork with:
+For local UI inspection, a debug bundle can start with deterministic sample
+spaces by launching its executable with `NOCTCORD_PREVIEW_DATA=1`. Release
+builds always ignore this environment variable.
 
-```sh
-swift Scripts/render-app-icon.swift \
-  Resources/NoctCordIcon.iconset \
-  Resources/NoctCordIcon.icns
-```
+The package exposes `NoctCordCore`, `NoctCordMedia`, and `NoctCordUI` libraries.
+An iOS host application must embed the UI/media libraries, configure signing
+and permission declarations, and supply the same relay configuration.
 
-The separate `swift run NoctCordDemo` command builds a two-member space,
-creates a channel, projects a message, and encodes the operation as both
-`org.noctcord/event:1.0` Noctweave content and a strict compact realtime record.
+## Relay requirements
 
-## Relay compatibility
+For text and ordinary group sync, the client requires Noctweave core plus
+`nw.opaque-route@2` or `nw.realtime-route@1`, with temporal bucketing disabled.
+For current attachment uploads, the relay must advertise
+`nw.media-blobs@1`. Voice-room signaling requires a standard relay advertising
+`nw.realtime-route@1`; it is not supported by passthrough or host-only relay
+roles. The client reads the relay capability manifest and reports missing
+modules instead of silently assuming support.
 
-Current standard relays already support the encrypted-group MVP through
-`nw.opaque-route@2`; `nw.blobs@1` supplies encrypted attachments and
-`nw.federation@1` supplies cross-relay routing. Noct Cord additionally requires
-an immediate-delivery profile: the relay's temporal bucket and multi-bucket
-schedule must both be off.
+`nw.shared-log@1` and `nw.ephemeral-presence@1` are provisional relay modules.
+Noct Cord does not yet require presence, and channel history currently remains on
+the encrypted group event path. Do not describe a relay as Noct Cord-ready
+unless its advertised capabilities and the relevant interoperability tests
+match the feature being enabled.
 
-That existing path is a compatibility fallback. The intended realtime path is
-`nw.realtime-route@1`: compact variable-length ciphertext records, persistent
-WebSocket delivery, strict size ceilings, and no mandatory 4–64 KiB padding.
-This spends packet-size privacy to reduce bandwidth, allocations, and latency.
-End-to-end encryption, group authentication, replay rejection, and attachment
-separation remain mandatory.
+## Known limitations
 
-Large communities and long history should add a generic `nw.shared-log@1`
-module. It stores bounded encrypted records behind opaque capabilities and
-cursor sync. It must not know that a log belongs to Noct Cord or interpret
-channels, roles, members, or content. See [the relay contract](docs/relay-extension.md).
+- Pre-1.0 code has no external cryptographic audit or formal proof of the full
+  application protocol.
+- A compromised operating system, malicious host process, or screen-capture
+  observer is outside the protection claim.
+- Voice currently uses a native peer mesh; large rooms need a separately
+  reviewed media-forwarding design.
+- ICE configuration is exposed under advanced setup and never silently
+  populates a third-party STUN/TURN service. TURN credentials are session-only.
+- Final iOS host packaging, ReplayKit behavior, and platform permission flows
+  still require signed-device validation.
 
-Immediate, compact delivery exposes more timing and approximate-size
-correlation than temporally bucketed, padded Noctweave messaging. Clients and
-operators must present that tradeoff clearly rather than describing Noct Cord
-traffic as metadata-equivalent.
-
-## Milestones
-
-1. Connect the native app model to `HeadlessMessagingClient` group send/sync.
-2. Add encrypted local event persistence and package the responsive UI for iOS.
-3. Implement and test `nw.realtime-route@1` and `nw.shared-log@1` in both macOS
-   and Linux relays.
-4. Add invites, moderation, encrypted attachments, unread projections, and
-   optional metadata-explicit presence.
-5. Design group call signaling and a separately reviewed media plane.
-
-Security boundaries and rejected embedding alternatives are recorded in
-[ADR 0001](docs/adr/0001-application-boundary.md).
+See [identity design](docs/identity.md),
+[relay extensions](docs/relay-extension.md),
+[media and calls](docs/media-and-calls.md), and
+[ADR 0001](docs/adr/0001-application-boundary.md) for the detailed boundaries.

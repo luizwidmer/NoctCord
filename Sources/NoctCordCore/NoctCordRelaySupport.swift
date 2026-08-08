@@ -28,7 +28,7 @@ public struct NoctCordRelayAssessment: Equatable, Sendable {
 public enum NoctCordRelaySupport {
     public static let opaqueRouteModule = "nw.opaque-route"
     public static let realtimeRouteModule = "nw.realtime-route"
-    public static let blobModule = "nw.blobs"
+    public static let blobModule = "nw.media-blobs"
     public static let federationModule = "nw.federation"
 
     /// Proposed application-neutral extension for durable, cursor-based,

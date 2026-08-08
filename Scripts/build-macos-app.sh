@@ -28,13 +28,22 @@ binary_dir="$(swift build \
     --configuration "$configuration" \
     --show-bin-path)"
 
-mkdir -p "$contents_path/MacOS" "$contents_path/Resources"
+mkdir -p "$contents_path/MacOS" "$contents_path/Resources" "$contents_path/Frameworks"
 cp "$binary_dir/NoctCordApp" "$contents_path/MacOS/NoctCordApp"
 cp "$repository_dir/Resources/NoctCordApp-Info.plist" "$contents_path/Info.plist"
+if [[ ! -d "$binary_dir/WebRTC.framework" ]]; then
+    echo "missing WebRTC.framework beside the built executable" >&2
+    exit 1
+fi
+cp -R "$binary_dir/WebRTC.framework" "$contents_path/Frameworks/"
+install_name_tool \
+    -add_rpath "@executable_path/../Frameworks" \
+    "$contents_path/MacOS/NoctCordApp"
 if [[ -f "$repository_dir/Resources/NoctCordIcon.icns" ]]; then
     cp "$repository_dir/Resources/NoctCordIcon.icns" "$contents_path/Resources/NoctCordIcon.icns"
 fi
 chmod 755 "$contents_path/MacOS/NoctCordApp"
+codesign --force --deep --sign - "$bundle_path"
 touch "$bundle_path"
 
 echo "$bundle_path"

@@ -27,16 +27,29 @@ final class NoctCordAppModelTests: XCTestCase {
         XCTAssertTrue(model.composerText.isEmpty)
     }
 
-    func testCreatingSpaceDefaultsToOneProjectedGeneralChannel() {
-        let model = NoctCordAppModel(seedPreviewData: false)
+    func testPreviewSpaceCreationDefaultsToOneProjectedGeneralChannel() {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let originalSpaceCount = model.spaces.count
 
         model.createSpace(name: "Quiet Circle", identityScope: .isolated)
 
-        XCTAssertEqual(model.spaces.count, 1)
+        XCTAssertEqual(model.spaces.count, originalSpaceCount + 1)
         XCTAssertEqual(model.selectedSpace?.name, "Quiet Circle")
         XCTAssertEqual(model.selectedSpace?.identityScope, .isolated)
         XCTAssertEqual(model.selectedSpace?.textChannels.map(\.name), ["general"])
         XCTAssertEqual(model.selectedSpace?.relayAssessment.tier, .encryptedGroupFallback)
+    }
+
+    func testProductionSpaceCreationRequiresAConnectedRelay() {
+        let model = NoctCordAppModel(seedPreviewData: false)
+
+        model.createSpace(name: "Quiet Circle", identityScope: .isolated)
+
+        XCTAssertTrue(model.spaces.isEmpty)
+        XCTAssertEqual(
+            model.connectionState,
+            .failed("Connect a relay before creating a space.")
+        )
     }
 
     func testSelectingChannelClearsItsUnreadCount() throws {

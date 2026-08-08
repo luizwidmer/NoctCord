@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @preconcurrency import NoctweaveCore
 
@@ -30,6 +31,20 @@ public struct NoctCordChannel: Equatable, Identifiable, Sendable {
     public var name: String
     public var isArchived: Bool
     public var messageIDs: [UUID]
+    public var attachmentIDs: [UUID]
+}
+
+public struct NoctCordVoiceRoom: Equatable, Identifiable, Sendable {
+    public let id: UUID
+    public var name: String
+    public var maxParticipants: UInt16
+    public var signalingKey: Data
+    public var realtimeRoute: NoctCordRealtimeRouteV1
+    public var isArchived: Bool
+
+    public var signalingKeyID: Data {
+        Data(SHA256.hash(data: Data("NoctCord/voice-signaling-key/v1".utf8) + signalingKey))
+    }
 }
 
 public struct NoctCordMessage: Equatable, Identifiable {
@@ -66,6 +81,11 @@ public struct NoctCordSpaceProjection: Equatable {
     public private(set) var roles: [UUID: NoctCordRole]
     public private(set) var roleAssignments: [GroupScopedMemberHandleV2: Set<UUID>]
     public private(set) var messages: [UUID: NoctCordMessage]
+    public private(set) var attachments: [UUID: NoctCordAttachmentManifestV1]
+    public private(set) var voiceRooms: [UUID: NoctCordVoiceRoom]
+    public private(set) var voiceParticipants: [UUID: [GroupScopedMemberHandleV2: NoctCordVoiceParticipantStateV1]]
+    public private(set) var callSignals: [UUID: [UUID: NoctCordEncryptedCallSignalV1]]
+    public private(set) var activeScreenShares: [UUID: NoctCordActiveScreenShare]
     public private(set) var appliedEventIDs: Set<UUID>
 
     private var lastOrder: EventOrder?
@@ -83,6 +103,11 @@ public struct NoctCordSpaceProjection: Equatable {
         roles = [:]
         roleAssignments = [:]
         messages = [:]
+        attachments = [:]
+        voiceRooms = [:]
+        voiceParticipants = [:]
+        callSignals = [:]
+        activeScreenShares = [:]
         appliedEventIDs = []
         lastOrder = nil
     }
@@ -162,7 +187,8 @@ public struct NoctCordSpaceProjection: Equatable {
                 id: channelID,
                 name: channelName,
                 isArchived: false,
-                messageIDs: []
+                messageIDs: [],
+                attachmentIDs: []
             )
 
         case .channelRenamed:
@@ -306,6 +332,163 @@ public struct NoctCordSpaceProjection: Equatable {
             }
             message.isPinned = event.operation.kind == .messagePinned
             messages[messageID] = message
+
+        case .attachmentAdded:
+            try require(.sendMessages, for: event.author)
+            guard let channelID = event.operation.channelID,
+                  let attachmentID = event.operation.attachmentID,
+                  let manifest = event.operation.attachmentManifest,
+                  var channel = channels[channelID] else {
+                throw NoctCordProjectionError.missingDependency
+            }
+            guard !channel.isArchived else {
+                throw NoctCordProjectionError.archivedChannel
+            }
+            guard manifest.expiresAt > event.createdAt else {
+                throw NoctCordProjectionError.invalidEvent
+            }
+            guard attachments[attachmentID] == nil else {
+                throw NoctCordProjectionError.alreadyExists
+            }
+            attachments[attachmentID] = manifest
+            channel.attachmentIDs.append(attachmentID)
+            channels[channelID] = channel
+
+        case .voiceRoomCreated:
+            try require(.manageChannels, for: event.author)
+            guard let roomID = event.operation.voiceRoomID,
+                  let spec = event.operation.voiceRoomSpec else {
+                throw NoctCordProjectionError.invalidEvent
+            }
+            guard voiceRooms[roomID] == nil else {
+                throw NoctCordProjectionError.alreadyExists
+            }
+            voiceRooms[roomID] = NoctCordVoiceRoom(
+                id: roomID,
+                name: spec.name,
+                maxParticipants: spec.maxParticipants,
+                signalingKey: spec.signalingKey,
+                realtimeRoute: spec.realtimeRoute,
+                isArchived: false
+            )
+
+        case .voiceRoomUpdated:
+            try require(.manageChannels, for: event.author)
+            guard let roomID = event.operation.voiceRoomID,
+                  let spec = event.operation.voiceRoomSpec,
+                  var room = voiceRooms[roomID] else {
+                throw NoctCordProjectionError.missingDependency
+            }
+            guard !room.isArchived else { throw NoctCordProjectionError.archivedChannel }
+            let joinedCount = voiceParticipants[roomID, default: [:]].values.filter(\.isJoined).count
+            guard spec.maxParticipants >= joinedCount else {
+                throw NoctCordProjectionError.invalidEvent
+            }
+            room.name = spec.name
+            room.maxParticipants = spec.maxParticipants
+            room.signalingKey = spec.signalingKey
+            room.realtimeRoute = spec.realtimeRoute
+            voiceRooms[roomID] = room
+
+        case .voiceRoomArchived:
+            try require(.manageChannels, for: event.author)
+            guard let roomID = event.operation.voiceRoomID,
+                  var room = voiceRooms[roomID] else {
+                throw NoctCordProjectionError.missingDependency
+            }
+            room.isArchived = true
+            voiceRooms[roomID] = room
+            voiceParticipants.removeValue(forKey: roomID)
+            activeScreenShares = activeScreenShares.filter { $0.value.roomID != roomID }
+
+        case .voiceParticipantJoined, .voiceParticipantLeft,
+             .voiceParticipantMuted, .voiceParticipantDeafened,
+             .voiceParticipantSpeaking:
+            try require(.readMessages, for: event.author)
+            guard let roomID = event.operation.voiceRoomID,
+                  let state = event.operation.voiceParticipantState,
+                  let room = voiceRooms[roomID],
+                  !room.isArchived,
+                  state.member == event.author else {
+                throw NoctCordProjectionError.invalidEvent
+            }
+            let expectedKind: NoctCordEventKind
+            switch event.operation.kind {
+            case .voiceParticipantJoined: expectedKind = .voiceParticipantJoined
+            case .voiceParticipantLeft: expectedKind = .voiceParticipantLeft
+            case .voiceParticipantMuted: expectedKind = .voiceParticipantMuted
+            case .voiceParticipantDeafened: expectedKind = .voiceParticipantDeafened
+            case .voiceParticipantSpeaking: expectedKind = .voiceParticipantSpeaking
+            default: throw NoctCordProjectionError.invalidEvent
+            }
+            guard event.operation.kind == expectedKind else {
+                throw NoctCordProjectionError.invalidEvent
+            }
+            let existing = voiceParticipants[roomID]?[state.member]
+            switch event.operation.kind {
+            case .voiceParticipantJoined:
+                guard state.isJoined, existing?.isJoined != true else {
+                    throw NoctCordProjectionError.alreadyExists
+                }
+                guard voiceParticipants[roomID, default: [:]].values.filter(\.isJoined).count
+                    < Int(room.maxParticipants) else {
+                    throw NoctCordProjectionError.invalidEvent
+                }
+            case .voiceParticipantLeft:
+                guard !state.isJoined, existing?.isJoined == true else {
+                    throw NoctCordProjectionError.missingDependency
+                }
+            case .voiceParticipantMuted, .voiceParticipantDeafened,
+                 .voiceParticipantSpeaking:
+                guard state.isJoined, existing?.isJoined == true else {
+                    throw NoctCordProjectionError.missingDependency
+                }
+            default: break
+            }
+            voiceParticipants[roomID, default: [:]][state.member] = state
+
+        case .callSignalPosted:
+            try require(.readMessages, for: event.author)
+            guard let roomID = event.operation.voiceRoomID,
+                  let signal = event.operation.callSignal,
+                  let room = voiceRooms[roomID],
+                  !room.isArchived,
+                  signal.keyID == room.signalingKeyID,
+                  voiceParticipants[roomID]?[event.author]?.isJoined == true,
+                  callSignals[signal.callID]?[signal.signalID] == nil else {
+                if let signal = event.operation.callSignal,
+                   callSignals[signal.callID]?[signal.signalID] != nil {
+                    throw NoctCordProjectionError.alreadyExists
+                }
+                throw NoctCordProjectionError.missingDependency
+            }
+            callSignals[signal.callID, default: [:]][signal.signalID] = signal
+
+        case .screenShareStarted:
+            try require(.sendMessages, for: event.author)
+            guard let roomID = event.operation.voiceRoomID,
+                  let descriptor = event.operation.screenShare,
+                  let room = voiceRooms[roomID],
+                  !room.isArchived,
+                  descriptor.presenter == event.author,
+                  voiceParticipants[roomID]?[event.author]?.isJoined == true,
+                  activeScreenShares[descriptor.shareID] == nil else {
+                throw NoctCordProjectionError.missingDependency
+            }
+            activeScreenShares[descriptor.shareID] = NoctCordActiveScreenShare(
+                roomID: roomID,
+                descriptor: descriptor
+            )
+
+        case .screenShareStopped:
+            try require(.sendMessages, for: event.author)
+            guard let shareID = event.operation.screenShareID,
+                  let activeShare = activeScreenShares[shareID],
+                  activeShare.descriptor.presenter == event.author
+                    || permissions(for: event.author).contains(.manageChannels) else {
+                throw NoctCordProjectionError.missingDependency
+            }
+            activeScreenShares.removeValue(forKey: shareID)
         }
 
         appliedEventIDs.insert(event.id)

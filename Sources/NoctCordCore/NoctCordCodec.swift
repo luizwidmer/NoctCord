@@ -12,6 +12,16 @@ public enum NoctCordCodec {
         ContentTypeId(authority: "org.noctcord", name: "event", major: 1)
     }
 
+    /// Group credentials must advertise every content family they may emit.
+    /// Noct Cord retains Noctweave's baseline families and adds its single
+    /// versioned application-event family before group creation or admission.
+    public static var contentCapabilities: [ContentTypeCapabilityV2] {
+        Array(Set(
+            ProtocolCapabilityManifest.defaultContentTypes
+                + [ContentTypeCapabilityV2(contentType)]
+        )).sorted { ($0.authority, $0.name) < ($1.authority, $1.name) }
+    }
+
     public static func encode(_ event: NoctCordEvent) throws -> EncodedContent {
         guard event.isStructurallyValid else { throw NoctCordCodecError.invalidEvent }
         let bytes = try NoctweaveCoder.encode(event, sortedKeys: true)

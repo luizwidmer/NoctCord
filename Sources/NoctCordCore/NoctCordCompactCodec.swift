@@ -12,7 +12,7 @@ public enum NoctCordCompactCodecError: Error, Equatable {
 /// pad records to a common size. Ciphertext length therefore remains visible.
 public enum NoctCordCompactCodec {
     public static let version: UInt8 = 1
-    public static let maximumRecordBytes = 20_000
+    public static let maximumRecordBytes = 512 * 1024
 
     public static func encode(_ event: NoctCordEvent) throws -> Data {
         guard event.isStructurallyValid else { throw NoctCordCompactCodecError.invalidRecord }
@@ -32,16 +32,33 @@ public enum NoctCordCompactCodec {
 
         let operation = event.operation
         var flags: UInt16 = 0
-        if operation.channelID != nil { flags |= 1 << 0 }
-        if operation.messageID != nil { flags |= 1 << 1 }
-        if operation.roleID != nil { flags |= 1 << 2 }
-        if operation.memberHandle != nil { flags |= 1 << 3 }
-        if operation.name != nil { flags |= 1 << 4 }
-        if operation.text != nil { flags |= 1 << 5 }
-        if operation.permissions != nil { flags |= 1 << 6 }
-        if operation.replyTo != nil { flags |= 1 << 7 }
-        if operation.reaction != nil { flags |= 1 << 8 }
+        if operation.kind.usesExtendedCompactPayload {
+            flags = 1 << 15
+        } else {
+            if operation.channelID != nil { flags |= 1 << 0 }
+            if operation.messageID != nil { flags |= 1 << 1 }
+            if operation.roleID != nil { flags |= 1 << 2 }
+            if operation.memberHandle != nil { flags |= 1 << 3 }
+            if operation.name != nil { flags |= 1 << 4 }
+            if operation.text != nil { flags |= 1 << 5 }
+            if operation.permissions != nil { flags |= 1 << 6 }
+            if operation.replyTo != nil { flags |= 1 << 7 }
+            if operation.reaction != nil { flags |= 1 << 8 }
+        }
         writer.append(flags)
+
+        if operation.kind.usesExtendedCompactPayload {
+            let payload = try NoctweaveCoder.encode(operation, sortedKeys: true)
+            guard payload.count <= Int(UInt32.max) else {
+                throw NoctCordCompactCodecError.invalidRecord
+            }
+            writer.append(UInt32(payload.count))
+            writer.append(payload)
+            guard writer.data.count <= maximumRecordBytes else {
+                throw NoctCordCompactCodecError.invalidRecord
+            }
+            return writer.data
+        }
 
         if let value = operation.channelID { writer.append(value) }
         if let value = operation.messageID { writer.append(value) }
@@ -96,45 +113,49 @@ public enum NoctCordCompactCodec {
             timeIntervalSince1970: Double(bitPattern: try reader.readUInt64())
         )
         let flags = try reader.readUInt16()
-        guard flags & ~UInt16(0x01FF) == 0 else {
+        let extendedPayload = flags & (1 << 15) != 0
+        guard extendedPayload
+            ? flags == (1 << 15)
+            : flags & ~UInt16(0x01FF) == 0 else {
             throw NoctCordCompactCodecError.invalidRecord
         }
 
-        let channelID = flags & (1 << 0) != 0 ? try reader.readUUID() : nil
-        let messageID = flags & (1 << 1) != 0 ? try reader.readUUID() : nil
-        let roleID = flags & (1 << 2) != 0 ? try reader.readUUID() : nil
-        let memberHandle = flags & (1 << 3) != 0
-            ? GroupScopedMemberHandleV2(
-                rawValue: try reader.readData(count: 32).base64EncodedString()
-            )
-            : nil
-        let name = flags & (1 << 4) != 0 ? try reader.readString() : nil
-        let text = flags & (1 << 5) != 0 ? try reader.readString() : nil
-        let permissions: Set<NoctCordPermission>?
-        if flags & (1 << 6) != 0 {
-            let bitmap = try reader.readUInt16()
-            guard bitmap >> UInt16(NoctCordPermission.allCases.count) == 0 else {
+        let operation: NoctCordOperation
+        if extendedPayload {
+            let payloadLength = Int(try reader.readUInt32())
+            let payload = try reader.readData(count: payloadLength)
+            operation = try NoctweaveCoder.decode(NoctCordOperation.self, from: payload)
+            guard operation.kind == kind else {
                 throw NoctCordCompactCodecError.invalidRecord
             }
-            permissions = Set(
-                NoctCordPermission.allCases.enumerated().compactMap { index, permission in
-                    bitmap & (1 << UInt16(index)) != 0 ? permission : nil
-                }
-            )
         } else {
-            permissions = nil
-        }
-        let replyTo = flags & (1 << 7) != 0 ? try reader.readUUID() : nil
-        let reaction = flags & (1 << 8) != 0 ? try reader.readString() : nil
-        guard reader.isAtEnd else { throw NoctCordCompactCodecError.invalidRecord }
-
-        let event = NoctCordEvent(
-            id: id,
-            spaceID: spaceID,
-            author: author,
-            logicalClock: logicalClock,
-            createdAt: createdAt,
-            operation: NoctCordOperation(
+            let channelID = flags & (1 << 0) != 0 ? try reader.readUUID() : nil
+            let messageID = flags & (1 << 1) != 0 ? try reader.readUUID() : nil
+            let roleID = flags & (1 << 2) != 0 ? try reader.readUUID() : nil
+            let memberHandle = flags & (1 << 3) != 0
+                ? GroupScopedMemberHandleV2(
+                    rawValue: try reader.readData(count: 32).base64EncodedString()
+                )
+                : nil
+            let name = flags & (1 << 4) != 0 ? try reader.readString() : nil
+            let text = flags & (1 << 5) != 0 ? try reader.readString() : nil
+            let permissions: Set<NoctCordPermission>?
+            if flags & (1 << 6) != 0 {
+                let bitmap = try reader.readUInt16()
+                guard bitmap >> UInt16(NoctCordPermission.allCases.count) == 0 else {
+                    throw NoctCordCompactCodecError.invalidRecord
+                }
+                permissions = Set(
+                    NoctCordPermission.allCases.enumerated().compactMap { index, permission in
+                        bitmap & (1 << UInt16(index)) != 0 ? permission : nil
+                    }
+                )
+            } else {
+                permissions = nil
+            }
+            let replyTo = flags & (1 << 7) != 0 ? try reader.readUUID() : nil
+            let reaction = flags & (1 << 8) != 0 ? try reader.readString() : nil
+            operation = NoctCordOperation(
                 kind: kind,
                 channelID: channelID,
                 messageID: messageID,
@@ -146,6 +167,16 @@ public enum NoctCordCompactCodec {
                 replyTo: replyTo,
                 reaction: reaction
             )
+        }
+        guard reader.isAtEnd else { throw NoctCordCompactCodecError.invalidRecord }
+
+        let event = NoctCordEvent(
+            id: id,
+            spaceID: spaceID,
+            author: author,
+            logicalClock: logicalClock,
+            createdAt: createdAt,
+            operation: operation
         )
         guard event.isStructurallyValid else { throw NoctCordCompactCodecError.invalidRecord }
         return event
@@ -171,6 +202,31 @@ private extension NoctCordEventKind {
         case .reactionRemoved: 13
         case .messagePinned: 14
         case .messageUnpinned: 15
+        case .attachmentAdded: 16
+        case .voiceRoomCreated: 17
+        case .voiceRoomUpdated: 18
+        case .voiceRoomArchived: 19
+        case .voiceParticipantJoined: 20
+        case .voiceParticipantLeft: 21
+        case .voiceParticipantMuted: 22
+        case .voiceParticipantDeafened: 23
+        case .voiceParticipantSpeaking: 24
+        case .callSignalPosted: 25
+        case .screenShareStarted: 26
+        case .screenShareStopped: 27
+        }
+    }
+
+    var usesExtendedCompactPayload: Bool {
+        switch self {
+        case .attachmentAdded, .voiceRoomCreated, .voiceRoomUpdated,
+             .voiceRoomArchived, .voiceParticipantJoined, .voiceParticipantLeft,
+             .voiceParticipantMuted, .voiceParticipantDeafened,
+             .voiceParticipantSpeaking, .callSignalPosted, .screenShareStarted,
+             .screenShareStopped:
+            return true
+        default:
+            return false
         }
     }
 
@@ -192,6 +248,18 @@ private extension NoctCordEventKind {
         case 13: self = .reactionRemoved
         case 14: self = .messagePinned
         case 15: self = .messageUnpinned
+        case 16: self = .attachmentAdded
+        case 17: self = .voiceRoomCreated
+        case 18: self = .voiceRoomUpdated
+        case 19: self = .voiceRoomArchived
+        case 20: self = .voiceParticipantJoined
+        case 21: self = .voiceParticipantLeft
+        case 22: self = .voiceParticipantMuted
+        case 23: self = .voiceParticipantDeafened
+        case 24: self = .voiceParticipantSpeaking
+        case 25: self = .callSignalPosted
+        case 26: self = .screenShareStarted
+        case 27: self = .screenShareStopped
         default: throw NoctCordCompactCodecError.invalidRecord
         }
     }
@@ -205,6 +273,10 @@ private struct CompactWriter {
     }
 
     mutating func append(_ value: UInt16) {
+        appendInteger(value.bigEndian)
+    }
+
+    mutating func append(_ value: UInt32) {
         appendInteger(value.bigEndian)
     }
 
@@ -251,6 +323,11 @@ private struct CompactReader {
     mutating func readUInt16() throws -> UInt16 {
         let bytes = try readData(count: 2)
         return bytes.reduce(UInt16(0)) { ($0 << 8) | UInt16($1) }
+    }
+
+    mutating func readUInt32() throws -> UInt32 {
+        let bytes = try readData(count: 4)
+        return bytes.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
     }
 
     mutating func readUInt64() throws -> UInt64 {
