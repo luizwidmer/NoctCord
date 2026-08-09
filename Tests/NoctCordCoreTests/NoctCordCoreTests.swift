@@ -73,6 +73,52 @@ final class NoctCordCoreTests: XCTestCase {
         XCTAssertThrowsError(try NoctCordCompactCodec.decode(bytes))
     }
 
+    func testCommunityInvitationRoundTripsAndRejectsExpiryOrTampering() throws {
+        let issuedAt = Date()
+        let invitation = try NoctCordCommunityInvitationV1.create(
+            spaceID: spaceID,
+            spaceName: "Night Shift",
+            relay: RelayEndpoint(host: "relay.example", port: 443, useTLS: true),
+            baseEpoch: 7,
+            baseStateDigest: Data(repeating: 0x41, count: 32),
+            lifetime: 600,
+            issuedAt: issuedAt
+        )
+        let encoded = try invitation.encoded()
+
+        XCTAssertEqual(
+            try NoctCordCommunityInvitationV1.decode(
+                encoded,
+                at: issuedAt.addingTimeInterval(1)
+            ),
+            invitation
+        )
+        XCTAssertThrowsError(
+            try NoctCordCommunityInvitationV1.decode(
+                encoded,
+                at: issuedAt.addingTimeInterval(601)
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? NoctCordCommunityInvitationError,
+                .expiredInvitation
+            )
+        }
+
+        var tampered = encoded
+        let mutationIndex = tampered.index(before: tampered.endIndex)
+        tampered.replaceSubrange(
+            mutationIndex...mutationIndex,
+            with: tampered[mutationIndex] == "A" ? "B" : "A"
+        )
+        XCTAssertThrowsError(
+            try NoctCordCommunityInvitationV1.decode(
+                tampered,
+                at: issuedAt.addingTimeInterval(1)
+            )
+        )
+    }
+
     func testPortableIdentityCanBindAcrossCommunitiesWithoutReusingTransportIdentity() throws {
         let key = try NoctCordIdentityKeyV1.generate(scope: .portable)
         let profile = try key.publicProfile(displayName: "Luna", createdAt: timestamp)
@@ -109,6 +155,94 @@ final class NoctCordCoreTests: XCTestCase {
 
         XCTAssertNotEqual(firstProfile.identityID, secondProfile.identityID)
         XCTAssertNotEqual(firstProfile.signingPublicKey, secondProfile.signingPublicKey)
+    }
+
+    func testIdentityBindingIsVerifiedProjectedAndCompactEncoded() throws {
+        let owner = handle(1)
+        let key = try NoctCordIdentityKeyV1.generate(scope: .portable)
+        let profile = try key.publicProfile(displayName: "Luna", createdAt: timestamp)
+        let binding = try key.bind(
+            profile: profile,
+            to: spaceID,
+            memberHandle: owner,
+            issuedAt: timestamp.addingTimeInterval(1)
+        )
+        let event = makeEvent(
+            author: owner,
+            clock: 1,
+            operation: .bindIdentity(binding)
+        )
+
+        let result = project([event], owner: owner, members: [owner])
+
+        XCTAssertTrue(result.rejectedEvents.isEmpty)
+        XCTAssertEqual(result.projection.identityBindings[owner], binding)
+        XCTAssertEqual(
+            try NoctCordCompactCodec.decode(NoctCordCompactCodec.encode(event)),
+            event
+        )
+    }
+
+    func testOwnerBootstrapRestoresConfigurationAfterJoinRequest() throws {
+        let owner = handle(1)
+        let member = handle(2)
+        let spaceCreation = makeEvent(
+            author: owner,
+            clock: 1,
+            operation: .createSpace(name: "Night Shift")
+        )
+        let channelCreation = makeEvent(
+            author: owner,
+            clock: 2,
+            operation: .createChannel(id: channelID, name: "general")
+        )
+        let request = makeEvent(
+            author: member,
+            clock: 3,
+            operation: .requestBootstrap()
+        )
+        let bootstrap = makeEvent(
+            author: owner,
+            clock: 4,
+            operation: .applyBootstrap(
+                [spaceCreation, channelCreation],
+                satisfying: [request.id]
+            )
+        )
+
+        let result = project(
+            [request, bootstrap],
+            owner: owner,
+            members: [owner, member]
+        )
+
+        XCTAssertTrue(result.rejectedEvents.isEmpty)
+        XCTAssertEqual(result.projection.name, "Night Shift")
+        XCTAssertEqual(result.projection.channels[channelID]?.name, "general")
+        XCTAssertEqual(
+            try NoctCordCompactCodec.decode(NoctCordCompactCodec.encode(bootstrap)),
+            bootstrap
+        )
+    }
+
+    func testNonOwnerCannotApplyBootstrap() {
+        let owner = handle(1)
+        let member = handle(2)
+        let nested = makeEvent(
+            author: owner,
+            clock: 1,
+            operation: .createSpace(name: "Forged")
+        )
+        let forged = makeEvent(
+            author: member,
+            clock: 2,
+            operation: .applyBootstrap([nested])
+        )
+
+        let result = project([forged], owner: owner, members: [owner, member])
+
+        XCTAssertNil(result.projection.name)
+        XCTAssertEqual(result.rejectedEvents.count, 1)
     }
 
     func testProjectionIsDeterministicAcrossDeliveryOrder() {

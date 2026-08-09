@@ -6,6 +6,99 @@ import NoctCordCore
 import XCTest
 
 final class NoctCordTransportIntegrationTests: XCTestCase {
+    func testInvitationAdmissionJoinsAndExchangesMessagesBothWays() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctcord-admission-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let port = UInt16.random(in: 42_000...56_000)
+        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
+        let server = RelayServer(store: RelayStore(), opaqueRouteStore: OpaqueRouteRelayStoreV2())
+        try server.start(host: "127.0.0.1", port: port)
+        defer { server.stop() }
+        try await Task.sleep(for: .milliseconds(150))
+
+        let owner = try await makeClient(name: "owner", root: root)
+        let prospectiveMember = try await makeClient(name: "member", root: root)
+        let ownerTransport = try NoctCordTransportCoordinator(client: owner, relay: endpoint)
+        let memberTransport = try NoctCordTransportCoordinator(
+            client: prospectiveMember,
+            relay: endpoint
+        )
+        let created = try await ownerTransport.createSpace(name: "Night Shift")
+        mark("admission-space-created")
+        let invitation = try await ownerTransport.makeCommunityInvitation(
+            spaceID: created.spaceID,
+            spaceName: "Night Shift"
+        )
+        let decodedInvitation = try NoctCordCommunityInvitationV1.decode(
+            invitation.encoded()
+        )
+        let admission = try await memberTransport.prepareCommunityAdmission(
+            invitation: decodedInvitation
+        )
+        mark("admission-request-prepared")
+        let response = try await ownerTransport.approveCommunityAdmissionRequest(
+            admission.requestCode,
+            for: created.spaceID
+        )
+        mark("admission-request-approved")
+
+        let joinedSpaceID = try await memberTransport.acceptCommunityAdmissionResponse(response)
+        mark("admission-response-accepted")
+        XCTAssertEqual(joinedSpaceID, created.spaceID)
+        _ = try await ownerTransport.synchronize(spaceID: created.spaceID)
+        let publishedBootstrap = try await ownerTransport.ensureCommunityBootstrap(
+            spaceID: created.spaceID
+        )
+        XCTAssertTrue(publishedBootstrap)
+        _ = try await memberTransport.synchronize(spaceID: created.spaceID)
+        mark("admission-bootstrap-synchronized")
+
+        let ownerMessageID = UUID()
+        let ownerPublication = try await ownerTransport.publishOperation(
+            spaceID: created.spaceID,
+            operation: .postMessage(
+                id: ownerMessageID,
+                channelID: created.generalChannelID,
+                text: "Welcome aboard"
+            )
+        )
+        mark("admission-owner-message-published")
+        XCTAssertTrue(ownerPublication.complete)
+        _ = try await memberTransport.synchronize(spaceID: created.spaceID)
+        mark("admission-member-synchronized")
+        let memberAfterOwnerMessage = try await memberTransport.storedSpaceSnapshot(
+            spaceID: created.spaceID
+        )
+        XCTAssertTrue(memberAfterOwnerMessage.events.contains {
+            $0.operation.messageID == ownerMessageID
+        })
+
+        let memberMessageID = UUID()
+        let memberPublication = try await memberTransport.publishOperation(
+            spaceID: created.spaceID,
+            operation: .postMessage(
+                id: memberMessageID,
+                channelID: created.generalChannelID,
+                text: "Glad to be here"
+            )
+        )
+        mark("admission-member-message-published")
+        XCTAssertTrue(memberPublication.complete)
+        _ = try await ownerTransport.synchronize(spaceID: created.spaceID)
+        mark("admission-owner-synchronized")
+        let ownerAfterReply = try await ownerTransport.storedSpaceSnapshot(
+            spaceID: created.spaceID
+        )
+        XCTAssertTrue(ownerAfterReply.events.contains {
+            $0.operation.messageID == memberMessageID
+        })
+    }
+
     func testSingleMemberRoomCanPublishAndReadRealtimeSignal() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             "noctcord-single-member-\(UUID().uuidString)",

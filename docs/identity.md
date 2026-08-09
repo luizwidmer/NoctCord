@@ -25,9 +25,10 @@ An isolated profile generates a fresh ML-DSA-65 profile key for one community.
 It publishes no proof relating that key to another profile or community. The
 host app must prevent reuse of an isolated key in a second space.
 
-Users may keep several portable profiles, use isolated identities everywhere,
-or decide per community. Changing the choice later is a visible profile event;
-it cannot erase copies or correlations already observed by other members.
+The current native client keeps one reusable portable profile plus one isolated
+profile key per community. The user chooses per community. Changing the choice
+later is a visible encrypted profile-binding event; it cannot erase copies or
+correlations already observed by other members.
 
 ## Performance rule
 
@@ -36,6 +37,10 @@ sent only during admission, explicit profile change, or proof refresh. Ordinary
 messages are authenticated by the existing group credential and never repeat
 the portable identity proof.
 
-Private profile keys belong in encrypted local storage. Export requires a
-separately authenticated password-protected package; raw private key material
-must never be sent through a relay or exposed to web content.
+Private profile keys are stored in a separate AES-256-GCM identity vault. The
+vault key is non-synchronizing and device-bound in Keychain, and the encrypted
+vault file uses owner-only permissions. Portable currently means reusable
+across communities on this installation; cross-device profile export is not
+implemented. Any future export must use a separately authenticated,
+password-protected package. Raw private key material must never be sent through
+a relay or exposed to web content.

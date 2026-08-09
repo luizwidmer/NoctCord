@@ -18,7 +18,7 @@ public enum NoctCordIdentityError: Error, Equatable {
     case keyMismatch
 }
 
-public struct NoctCordIdentityPublicProfileV1: Codable, Equatable {
+public struct NoctCordIdentityPublicProfileV1: Codable, Equatable, Sendable {
     public static let version = 1
 
     public let version: Int
@@ -125,7 +125,7 @@ public struct NoctCordIdentityKeyV1: Codable {
     }
 }
 
-public struct NoctCordCommunityIdentityBindingV1: Codable, Equatable {
+public struct NoctCordCommunityIdentityBindingV1: Codable, Equatable, Sendable {
     public static let version = 1
 
     public let version: Int

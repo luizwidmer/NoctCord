@@ -14,6 +14,8 @@ public enum NoctCordTransportError: Error, Equatable, LocalizedError {
     case transportIncomplete
     case unsupportedEvent
     case voiceRouteExpired
+    case invitationPermissionDenied
+    case invitationRelayMismatch
 
     public var errorDescription: String? {
         switch self {
@@ -29,6 +31,10 @@ public enum NoctCordTransportError: Error, Equatable, LocalizedError {
             "The received group event is not a supported Noct Cord operation."
         case .voiceRouteExpired:
             "This voice room needs an administrator to renew its encrypted realtime route."
+        case .invitationPermissionDenied:
+            "Only the community owner can complete this admission flow."
+        case .invitationRelayMismatch:
+            "Connect to the relay named by the invitation before preparing the join request."
         }
     }
 }
@@ -231,6 +237,238 @@ public actor NoctCordTransportCoordinator {
             events: events,
             relayAssessment: assessment
         )
+    }
+
+    /// Creates the bounded first artifact in Noct Cord's offline community
+    /// admission exchange. The invitation contains no relay password or group
+    /// secret and must be delivered through a channel where the recipient can
+    /// authenticate the inviter.
+    public func makeCommunityInvitation(
+        spaceID: UUID,
+        spaceName: String,
+        lifetime: TimeInterval = 60 * 60,
+        issuedAt: Date = Date()
+    ) async throws -> NoctCordCommunityInvitationV1 {
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let snapshot = await runtime.snapshot()
+        guard snapshot.deletionState == nil,
+              snapshot.localRemoval == nil,
+              let member = snapshot.signedState.members.first(where: {
+                  $0.id == snapshot.localCredential.memberHandle
+                      && $0.isActive(at: snapshot.signedState.epoch)
+              }),
+              member.role == .owner,
+              snapshot.signedState.permissions.allows(
+                  .manageInvitations,
+                  for: member.role
+              ) else {
+            throw NoctCordTransportError.invitationPermissionDenied
+        }
+        guard let digest = snapshot.signedState.digest else {
+            throw NoctCordTransportError.eventRejected
+        }
+        return try NoctCordCommunityInvitationV1.create(
+            spaceID: spaceID,
+            spaceName: spaceName,
+            relay: relay,
+            baseEpoch: snapshot.signedState.epoch,
+            baseStateDigest: digest,
+            lifetime: lifetime,
+            issuedAt: issuedAt
+        )
+    }
+
+    /// Generates a fresh group-only credential and receive route for one
+    /// invitation. The returned request is safe to transfer only through the
+    /// same authenticated exchange used for the invitation.
+    public func prepareCommunityAdmission(
+        invitation: NoctCordCommunityInvitationV1,
+        createdAt: Date = Date()
+    ) async throws -> NoctCordPreparedCommunityAdmission {
+        guard invitation.isValid(at: createdAt) else {
+            throw NoctCordCommunityInvitationError.expiredInvitation
+        }
+        guard invitation.relay == relay else {
+            throw NoctCordTransportError.invitationRelayMismatch
+        }
+        let prepared = try await client.prepareGroupAdmission(
+            groupID: invitation.spaceID,
+            invitationBindingDigest: invitation.invitationBindingDigest,
+            relay: relay,
+            contentTypes: NoctCordCodec.contentCapabilities,
+            expiresAt: invitation.expiresAt,
+            createdAt: createdAt
+        )
+        let route = try await client.resumeGroupAdmissionRoute(
+            admissionID: prepared.admissionID,
+            at: createdAt
+        )
+        let request = try NoctweaveGroupAdmissionRequestLinkV1(
+            admissionID: prepared.admissionID,
+            groupID: prepared.groupID,
+            invitationBindingDigest: invitation.invitationBindingDigest,
+            admission: route.admission,
+            initialRouteSet: route.routeSet
+        )
+        return NoctCordPreparedCommunityAdmission(
+            invitation: invitation,
+            admissionID: prepared.admissionID,
+            requestCode: try request.encoded()
+        )
+    }
+
+    /// Verifies and admits one prospective member. Explicit invocation is the
+    /// authorization boundary: importing an arbitrary request never adds a
+    /// member until a locally authorized user approves it.
+    public func approveCommunityAdmissionRequest(
+        _ requestCode: String,
+        for spaceID: UUID,
+        role: GroupRole = .member,
+        createdAt: Date = Date()
+    ) async throws -> String {
+        let request = try NoctweaveGroupAdmissionRequestLinkV1.decode(requestCode)
+        guard request.groupID == spaceID else {
+            throw NoctCordCommunityInvitationError.invalidExchange
+        }
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let snapshot = await runtime.snapshot()
+        guard snapshot.deletionState == nil,
+              snapshot.localRemoval == nil,
+              let member = snapshot.signedState.members.first(where: {
+                  $0.id == snapshot.localCredential.memberHandle
+                      && $0.isActive(at: snapshot.signedState.epoch)
+              }),
+              member.role == .owner,
+              snapshot.signedState.permissions.allows(
+                  .manageInvitations,
+                  for: member.role
+              ) else {
+            throw NoctCordTransportError.invitationPermissionDenied
+        }
+        let prepared = try await client.prepareGroupMemberAddition(
+            groupID: spaceID,
+            admission: request.admission,
+            initialRouteSet: request.initialRouteSet,
+            role: role,
+            anchorExpiresAt: request.admission.expiresAt,
+            idempotencyKey: try request.requestDigest,
+            createdAt: createdAt
+        )
+        let response = try NoctweaveGroupAdmissionResponseLinkV1(
+            request: request,
+            prepared: prepared
+        )
+        if let operation = prepared.transportOperation {
+            let resumed = try await client.resumeGroupTransport(
+                groupID: spaceID,
+                operationID: operation.id,
+                at: createdAt
+            )
+            guard resumed.complete else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+        }
+        _ = try? await client.maintainGroup(groupID: spaceID)
+        return try response.encoded()
+    }
+
+    /// Accepts the exact signed epoch and Welcome returned by an authorized
+    /// existing member. Every step is durable and replay-idempotent inside the
+    /// Noctweave client state.
+    public func acceptCommunityAdmissionResponse(
+        _ responseCode: String,
+        observedAt: Date = Date()
+    ) async throws -> UUID {
+        let response = try NoctweaveGroupAdmissionResponseLinkV1.decode(responseCode)
+        if await storedSpaceIDs().contains(response.groupID) {
+            return response.groupID
+        }
+        _ = try await client.pinGroupJoinAnchor(
+            admissionID: response.admissionID,
+            anchor: response.anchor,
+            invitationBindingDigest: response.invitationBindingDigest,
+            observedAt: observedAt
+        )
+        for announcement in response.existingMemberRouteAnnouncements {
+            _ = try await client.acceptGroupAdmissionRouteAnnouncement(
+                admissionID: response.admissionID,
+                announcement: announcement,
+                observedAt: observedAt
+            )
+        }
+        _ = try await client.acceptGroupAdmissionTransition(
+            admissionID: response.admissionID,
+            transition: response.transition,
+            observedAt: observedAt
+        )
+        let completed = try await client.acceptGroupAdmissionWelcome(
+            admissionID: response.admissionID,
+            welcome: response.welcome,
+            observedAt: observedAt
+        )
+        guard completed.completed else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        _ = try await client.maintainGroup(groupID: response.groupID)
+        let bootstrapRequest = try await publishOperation(
+            spaceID: response.groupID,
+            operation: .requestBootstrap(),
+            at: observedAt
+        )
+        guard bootstrapRequest.complete else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        return response.groupID
+    }
+
+    /// Answers encrypted bootstrap requests once the owner's route cache has
+    /// learned the new member's announced receive route. Calls are idempotent:
+    /// request IDs already covered by an owner batch are not sent again.
+    @discardableResult
+    public func ensureCommunityBootstrap(spaceID: UUID) async throws -> Bool {
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let snapshot = await runtime.snapshot()
+        guard snapshot.localCredential.memberHandle
+                == snapshot.signedState.members.first(where: {
+                    $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
+                })?.id else {
+            return false
+        }
+        let events = snapshot.events.compactMap { try? NoctCordCodec.unwrap($0) }
+        let fulfilled = Set(events.flatMap {
+            $0.operation.kind == .bootstrapApplied
+                ? ($0.operation.bootstrapRequestIDs ?? [])
+                : []
+        })
+        let pending = events
+            .filter { $0.operation.kind == .bootstrapRequested && !fulfilled.contains($0.id) }
+            .map(\.id)
+            .sorted { $0.uuidString < $1.uuidString }
+        guard !pending.isEmpty else { return false }
+
+        let batches = try Self.bootstrapBatches(
+            from: events,
+            spaceID: spaceID,
+            owner: snapshot.localCredential.memberHandle,
+            createdAt: Date()
+        )
+        guard !batches.isEmpty else {
+            throw NoctCordTransportError.eventRejected
+        }
+        let coveredRequests = Array(pending.prefix(128))
+        for (index, batch) in batches.enumerated() {
+            let publication = try await publishOperation(
+                spaceID: spaceID,
+                operation: .applyBootstrap(
+                    batch,
+                    satisfying: index == batches.indices.last ? coveredRequests : []
+                )
+            )
+            guard publication.complete else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+        }
+        return true
     }
 
     @discardableResult
@@ -628,6 +866,76 @@ public actor NoctCordTransportCoordinator {
             throw NoctCordTransportError.spaceNotFound
         }
         return room
+    }
+
+    /// Replays only durable application configuration. Message bodies,
+    /// attachments, presence, calls, and other ephemeral activity are not
+    /// copied into admission artifacts or bootstrap batches.
+    private static func bootstrapBatches(
+        from events: [NoctCordEvent],
+        spaceID: UUID,
+        owner: GroupScopedMemberHandleV2,
+        createdAt: Date
+    ) throws -> [[NoctCordEvent]] {
+        let eligible = events
+            .filter { isBootstrapStateEvent($0.operation.kind) }
+            .sorted(by: canonicalEventOrder)
+        guard !eligible.isEmpty else { return [] }
+
+        var result: [[NoctCordEvent]] = []
+        var current: [NoctCordEvent] = []
+        for event in eligible {
+            let candidate = current + [event]
+            let probe = NoctCordEvent(
+                spaceID: spaceID,
+                author: owner,
+                logicalClock: 1,
+                createdAt: createdAt,
+                operation: .applyBootstrap(candidate)
+            )
+            if probe.isStructurallyValid {
+                current = candidate
+                continue
+            }
+            guard !current.isEmpty else {
+                throw NoctCordTransportError.eventRejected
+            }
+            result.append(current)
+            current = [event]
+            let singleProbe = NoctCordEvent(
+                spaceID: spaceID,
+                author: owner,
+                logicalClock: 1,
+                createdAt: createdAt,
+                operation: .applyBootstrap(current)
+            )
+            guard singleProbe.isStructurallyValid else {
+                throw NoctCordTransportError.eventRejected
+            }
+        }
+        if !current.isEmpty { result.append(current) }
+        return result
+    }
+
+    private static func isBootstrapStateEvent(_ kind: NoctCordEventKind) -> Bool {
+        switch kind {
+        case .spaceCreated, .spaceRenamed,
+             .channelCreated, .channelRenamed, .channelArchived,
+             .roleDefined, .roleDeleted, .roleGranted, .roleRevoked,
+             .channelPermissionSet, .channelPermissionRemoved,
+             .voiceRoomCreated, .voiceRoomUpdated, .voiceRoomArchived,
+             .botInstalled, .botUpdated, .botRemoved,
+             .identityBound:
+            true
+        case .messagePosted, .messageEdited, .messageRetracted,
+             .reactionAdded, .reactionRemoved, .messagePinned, .messageUnpinned,
+             .attachmentAdded, .voiceParticipantJoined, .voiceParticipantLeft,
+             .voiceParticipantMuted, .voiceParticipantDeafened,
+             .voiceParticipantSpeaking, .callSignalPosted,
+             .screenShareStarted, .screenShareStopped,
+             .botCommandInvoked, .bootstrapRequested, .bootstrapApplied:
+            false
+        }
     }
 
     private static func verifyRealtimeEnvelope(

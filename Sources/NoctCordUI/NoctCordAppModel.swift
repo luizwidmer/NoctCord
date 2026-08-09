@@ -145,6 +145,9 @@ public final class NoctCordAppModel: ObservableObject {
     @Published public var searchQuery = ""
     @Published public var showsMemberInspector = true
     @Published public var showsCreateSpace = false
+    @Published public var showsJoinSpace = false
+    @Published public var showsInvitationExchange = false
+    @Published public var stagedInvitationCode = ""
     @Published public var showsCreateChannel = false
     @Published public var showsCommunitySettings = false
     @Published public var appearance: NoctCordAppearance = .system
@@ -158,6 +161,7 @@ public final class NoctCordAppModel: ObservableObject {
     @Published public private(set) var composerNotice: String?
 
     private let previewMode: Bool
+    private let identityVault: NoctCordIdentityVault
     private var transport: NoctCordTransportCoordinator?
     private var refreshTask: Task<Void, Never>?
     private var identityScopes: [UUID: NoctCordIdentityScope] = [:]
@@ -165,9 +169,29 @@ public final class NoctCordAppModel: ObservableObject {
     private var mediaRefreshTask: Task<Void, Never>?
     private var processedCallSignalIDs: Set<UUID> = []
     private var iceServers: [NoctCordMediaICEServer] = []
+    private var localDisplayName = "Member"
 
     public init(seedPreviewData: Bool = false) {
         previewMode = seedPreviewData
+        if seedPreviewData {
+            identityVault = NoctCordIdentityVault(
+                fileURL: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("noctcord-preview-\(UUID().uuidString).vault"),
+                encryptionKey: SymmetricKey(size: .bits256)
+            )
+        } else {
+            let base = (try? FileManager.default.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )) ?? FileManager.default.temporaryDirectory
+            identityVault = NoctCordIdentityVault(
+                fileURL: base
+                    .appendingPathComponent("NoctCord", isDirectory: true)
+                    .appendingPathComponent("identity-vault.noctcord")
+            )
+        }
         spaces = seedPreviewData ? Self.previewSpaces() : []
         connectionState = seedPreviewData ? .preview : .needsSetup
         selectedSpaceID = spaces.first?.id
@@ -247,6 +271,11 @@ public final class NoctCordAppModel: ObservableObject {
         canSendInSelectedChannel && selectedChannelPermissions.contains(.attachFiles)
     }
 
+    public var canInviteToSelectedSpace: Bool {
+        guard let space = selectedSpace else { return false }
+        return space.currentMember == space.projection.owner
+    }
+
     public var availableBotCommands: [(bot: NoctCordBotApplication, command: NoctCordBotCommand)] {
         guard selectedChannelPermissions.contains(.useApplicationCommands),
               let space = selectedSpace else { return [] }
@@ -294,6 +323,7 @@ public final class NoctCordAppModel: ObservableObject {
             )
             try await coordinator.testRelay()
             transport = coordinator
+            localDisplayName = configuration.displayName
             self.iceServers = iceServers
             try await reloadAllSpaces()
             connectionState = .ready
@@ -439,6 +469,24 @@ public final class NoctCordAppModel: ObservableObject {
                 do {
                     let bootstrap = try await transport.createSpace(name: cleanName)
                     identityScopes[bootstrap.spaceID] = identityScope
+                    do {
+                        let binding = try await identityVault.binding(
+                            scope: identityScope,
+                            displayName: localDisplayName,
+                            spaceID: bootstrap.spaceID,
+                            memberHandle: bootstrap.owner
+                        )
+                        let publication = try await transport.publishOperation(
+                            spaceID: bootstrap.spaceID,
+                            operation: .bindIdentity(binding)
+                        )
+                        if !publication.complete {
+                            try await transport.maintain(spaceID: bootstrap.spaceID)
+                        }
+                    } catch {
+                        identityScopes[bootstrap.spaceID] = .isolated
+                        composerNotice = "The community was created with its isolated group identity, but the optional profile binding could not be saved: \(error.localizedDescription)"
+                    }
                     try await reloadAllSpaces(using: transport)
                     selectedSpaceID = bootstrap.spaceID
                     selectedChannelID = bootstrap.generalChannelID
@@ -499,6 +547,98 @@ public final class NoctCordAppModel: ObservableObject {
         selectedSpaceID = spaceID
         selectedChannelID = channelID
         showsCreateSpace = false
+    }
+
+    public func makeCommunityInvitation(
+        lifetime: TimeInterval = 60 * 60
+    ) async throws -> String {
+        guard let transport, let space = selectedSpace else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        guard canInviteToSelectedSpace else {
+            throw NoctCordTransportError.invitationPermissionDenied
+        }
+        activityMessage = "Preparing a one-use invitation…"
+        defer { activityMessage = nil }
+        let invitation = try await transport.makeCommunityInvitation(
+            spaceID: space.id,
+            spaceName: space.name,
+            lifetime: lifetime
+        )
+        return try invitation.encoded()
+    }
+
+    public func prepareCommunityAdmission(
+        invitationCode: String,
+        identityScope: NoctCordIdentityScope
+    ) async throws -> NoctCordPreparedCommunityAdmission {
+        guard let transport else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        let invitation = try NoctCordCommunityInvitationV1.decode(invitationCode)
+        activityMessage = "Creating a fresh community identity…"
+        defer { activityMessage = nil }
+        let prepared = try await transport.prepareCommunityAdmission(
+            invitation: invitation
+        )
+        identityScopes[invitation.spaceID] = identityScope
+        return prepared
+    }
+
+    public func approveCommunityAdmissionRequest(
+        _ requestCode: String
+    ) async throws -> String {
+        guard let transport, let spaceID = selectedSpaceID else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        guard canInviteToSelectedSpace else {
+            throw NoctCordTransportError.invitationPermissionDenied
+        }
+        activityMessage = "Adding the new member…"
+        defer { activityMessage = nil }
+        let response = try await transport.approveCommunityAdmissionRequest(
+            requestCode,
+            for: spaceID
+        )
+        try await reloadSpace(spaceID, using: transport)
+        return response
+    }
+
+    @discardableResult
+    public func acceptCommunityAdmissionResponse(
+        _ responseCode: String
+    ) async throws -> UUID {
+        guard let transport else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        activityMessage = "Verifying the signed community welcome…"
+        defer { activityMessage = nil }
+        let spaceID = try await transport.acceptCommunityAdmissionResponse(responseCode)
+        let snapshot = try await transport.storedSpaceSnapshot(spaceID: spaceID)
+        let scope = identityScopes[spaceID] ?? .isolated
+        do {
+            let binding = try await identityVault.binding(
+                scope: scope,
+                displayName: localDisplayName,
+                spaceID: spaceID,
+                memberHandle: snapshot.currentMember
+            )
+            let publication = try await transport.publishOperation(
+                spaceID: spaceID,
+                operation: .bindIdentity(binding)
+            )
+            if !publication.complete {
+                try await transport.maintain(spaceID: spaceID)
+            }
+        } catch {
+            identityScopes[spaceID] = .isolated
+            composerNotice = "You joined with a fresh group-only identity, but the optional profile binding could not be saved: \(error.localizedDescription)"
+        }
+        try await reloadSpace(spaceID, using: transport)
+        selectedSpaceID = spaceID
+        selectedChannelID = spaces.first { $0.id == spaceID }?.textChannels.first?.id
+        connectionState = .ready
+        return spaceID
     }
 
     public func createChannel(name: String) {
@@ -753,11 +893,36 @@ public final class NoctCordAppModel: ObservableObject {
     }
 
     public func setIdentityScope(_ scope: NoctCordIdentityScope) {
-        if let selectedSpaceID {
-            identityScopes[selectedSpaceID] = scope
+        if previewMode {
+            updateSelectedSpace { $0.identityScope = scope }
+            return
         }
-        updateSelectedSpace { space in
-            space.identityScope = scope
+        guard let selectedSpaceID, let transport, let space = selectedSpace else { return }
+        activityMessage = "Updating the community profile…"
+        Task {
+            do {
+                let binding = try await identityVault.binding(
+                    scope: scope,
+                    displayName: localDisplayName,
+                    spaceID: selectedSpaceID,
+                    memberHandle: space.currentMember
+                )
+                let publication = try await transport.publishOperation(
+                    spaceID: selectedSpaceID,
+                    operation: .bindIdentity(binding)
+                )
+                if !publication.complete {
+                    try await transport.maintain(spaceID: selectedSpaceID)
+                }
+                identityScopes[selectedSpaceID] = scope
+                try await reloadSpace(selectedSpaceID, using: transport)
+                composerNotice = scope == .portable
+                    ? "This community can now correlate your portable profile where you disclose it."
+                    : "A fresh profile is now bound only to this community. Existing observations cannot be erased."
+            } catch {
+                composerNotice = error.localizedDescription
+            }
+            activityMessage = nil
         }
     }
 
@@ -1208,6 +1373,7 @@ public final class NoctCordAppModel: ObservableObject {
         var loaded: [NoctCordSpaceSession] = []
         for spaceID in await transport.storedSpaceIDs() {
             _ = try? await transport.synchronize(spaceID: spaceID)
+            _ = try? await transport.ensureCommunityBootstrap(spaceID: spaceID)
             loaded.append(try await makeSession(spaceID: spaceID, using: transport))
         }
         spaces = loaded.sorted {
@@ -1231,6 +1397,7 @@ public final class NoctCordAppModel: ObservableObject {
         using transport: NoctCordTransportCoordinator
     ) async throws {
         _ = try? await transport.synchronize(spaceID: spaceID)
+        _ = try? await transport.ensureCommunityBootstrap(spaceID: spaceID)
         let session = try await makeSession(spaceID: spaceID, using: transport)
         if let index = spaces.firstIndex(where: { $0.id == spaceID }) {
             spaces[index] = session
@@ -1270,9 +1437,10 @@ public final class NoctCordAppModel: ObservableObject {
             }
             return NoctCordMemberViewState(
                 id: member.handle,
-                displayName: member.isCurrentMember
-                    ? "You"
-                    : "Member \(Self.compactHandle(member.handle))",
+                displayName: projection.identityBindings[member.handle]?.profile.displayName
+                    ?? (member.isCurrentMember
+                        ? "You"
+                        : "Member \(Self.compactHandle(member.handle))"),
                 roleName: projectedRoleName,
                 presence: member.isCurrentMember ? .active : .offline,
                 isBot: botMembers.contains(member.handle)
@@ -1297,7 +1465,9 @@ public final class NoctCordAppModel: ObservableObject {
             id: spaceID,
             shortName: Self.shortName(projection.name ?? "Space"),
             currentMember: snapshot.currentMember,
-            identityScope: identityScopes[spaceID] ?? .isolated,
+            identityScope: projection.identityBindings[snapshot.currentMember]?.profile.scope
+                ?? identityScopes[spaceID]
+                ?? .isolated,
             members: members,
             events: snapshot.events,
             projection: projection,
@@ -1343,7 +1513,8 @@ public final class NoctCordAppModel: ObservableObject {
             }
             return NoctCordMemberViewState(
                 id: member.id,
-                displayName: member.displayName,
+                displayName: space.projection.identityBindings[member.id]?.profile.displayName
+                    ?? member.displayName,
                 roleName: roleName,
                 presence: member.presence,
                 isBot: botMembers.contains(member.id)

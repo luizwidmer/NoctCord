@@ -55,6 +55,12 @@ public struct NoctCordRootView: View {
         .sheet(isPresented: $model.showsCreateSpace) {
             CreateSpaceSheet(model: model)
         }
+        .sheet(isPresented: $model.showsJoinSpace) {
+            NoctCordJoinSpaceSheet(model: model)
+        }
+        .sheet(isPresented: $model.showsInvitationExchange) {
+            NoctCordInvitationExchangeSheet(model: model)
+        }
         .sheet(isPresented: $model.showsCreateChannel) {
             CreateChannelSheet(model: model)
         }
@@ -113,15 +119,24 @@ public struct NoctCordRootView: View {
 }
 
 private struct NoctCordSetupView: View {
+    private enum Stage: Int, CaseIterable {
+        case welcome
+        case profile
+        case relay
+    }
+
     @ObservedObject var model: NoctCordAppModel
     @AppStorage("NoctCord.displayName") private var savedDisplayName = ""
     @AppStorage("NoctCord.relayAddress") private var savedRelayAddress = ""
     @AppStorage("NoctCord.stunURL") private var savedSTUNURL = ""
     @AppStorage("NoctCord.turnURL") private var savedTURNURL = ""
     @AppStorage("NoctCord.turnUsername") private var savedTURNUsername = ""
+    @State private var stage: Stage = .welcome
     @State private var displayName = ""
     @State private var relayAddress = ""
     @State private var accessPassword = ""
+    @State private var invitationCode = ""
+    @State private var showsInvitationInput = false
     @State private var showsCallConnectivity = false
     @State private var stunURL = ""
     @State private var turnURL = ""
@@ -134,107 +149,59 @@ private struct NoctCordSetupView: View {
             LinearGradient(
                 colors: [
                     NoctCordTheme.canvas,
-                    NoctCordTheme.mutedCoral.opacity(0.10),
+                    NoctCordTheme.mutedCoral.opacity(0.11),
                     NoctCordTheme.canvas,
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
-            VStack(spacing: 22) {
-                NoctCordMark()
-                    .frame(width: 76, height: 76)
-                VStack(spacing: 7) {
-                    Text("Welcome to Noct Cord")
-                        .font(.system(size: 27, weight: .bold, design: .rounded))
-                    Text("Choose a Noctweave relay and create the local identity used for your encrypted communities.")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(NoctCordTheme.secondaryText)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 460)
-                }
+            ScrollView {
+                VStack(spacing: 22) {
+                    NoctCordMark()
+                        .frame(width: 76, height: 76)
 
-                VStack(alignment: .leading, spacing: 13) {
-                    setupField("DISPLAY NAME", placeholder: "Your display name", text: $displayName)
-                    setupField("RELAY", placeholder: "https://relay.example", text: $relayAddress)
-                    setupField(
-                        "RELAY PASSWORD · OPTIONAL",
-                        placeholder: "Not stored",
-                        text: $accessPassword,
-                        secure: true
-                    )
-                    DisclosureGroup(isExpanded: $showsCallConnectivity) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("No third-party call service is selected automatically. Leave these blank for LAN-only calls, add STUN for NAT discovery, or add TURN when peers need a media relay.")
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(NoctCordTheme.secondaryText)
-                                .fixedSize(horizontal: false, vertical: true)
-                            setupField(
-                                "STUN URL · OPTIONAL",
-                                placeholder: "stun:stun.example.org:3478",
-                                text: $stunURL
-                            )
-                            setupField(
-                                "TURN URL · OPTIONAL",
-                                placeholder: "turns:turn.example.org:5349?transport=tcp",
-                                text: $turnURL
-                            )
-                            if !turnURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                setupField(
-                                    "TURN USERNAME",
-                                    placeholder: "Short-lived username",
-                                    text: $turnUsername
-                                )
-                                setupField(
-                                    "TURN CREDENTIAL",
-                                    placeholder: "Not stored on disk",
-                                    text: $turnCredential,
-                                    secure: true
-                                )
-                            }
-                        }
-                        .padding(.top, 11)
-                    } label: {
-                        Label("Advanced call connectivity", systemImage: "antenna.radiowaves.left.and.right")
-                            .font(.system(size: 11.5, weight: .semibold))
+                    VStack(spacing: 7) {
+                        Text(stageTitle)
+                            .font(.system(size: 28, weight: .bold, design: .rounded))
+                        Text(stageSubtitle)
+                            .font(.system(size: 12.5))
                             .foregroundStyle(NoctCordTheme.secondaryText)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 480)
                     }
-                    if let validationError {
-                        Label(validationError, systemImage: "exclamationmark.triangle.fill")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(NoctCordTheme.warning)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    if case .failed(let message) = model.connectionState {
-                        Label(message, systemImage: "network.slash")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(NoctCordTheme.mutedCoral)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Button {
-                        connect()
-                    } label: {
-                        HStack(spacing: 8) {
-                            if model.connectionState == .connecting {
-                                ProgressView().controlSize(.small)
-                            }
-                            Text(model.connectionState == .connecting ? "Connecting…" : "Test relay and continue")
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(NoctCordPrimaryButtonStyle())
-                    .disabled(model.connectionState == .connecting)
-                }
-                .padding(22)
-                .frame(maxWidth: 500)
-                .noctCordPanel(radius: 22, elevated: true)
 
-                Text("Your identity state is encrypted locally. The relay stores opaque encrypted records and never receives channel plaintext.")
-                    .font(.system(size: 10.5))
+                    HStack(spacing: 7) {
+                        ForEach(Stage.allCases, id: \.rawValue) { item in
+                            Capsule()
+                                .fill(
+                                    item.rawValue <= stage.rawValue
+                                        ? NoctCordTheme.mutedCoral
+                                        : NoctCordTheme.secondaryText.opacity(0.20)
+                                )
+                                .frame(
+                                    width: item == stage ? 28 : 8,
+                                    height: 8
+                                )
+                        }
+                    }
+
+                    stageContent
+                        .padding(23)
+                        .frame(maxWidth: 540)
+                        .noctCordPanel(radius: 28, elevated: true)
+
+                    Label(
+                        "Encrypted locally · relay-blind content · no central Noct Cord account",
+                        systemImage: "lock.shield.fill"
+                    )
+                    .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(NoctCordTheme.secondaryText)
                     .multilineTextAlignment(.center)
-                    .frame(maxWidth: 480)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 28)
+                .padding(.vertical, 38)
             }
-            .padding(38)
         }
         .onAppear {
             if displayName.isEmpty { displayName = savedDisplayName }
@@ -246,8 +213,231 @@ private struct NoctCordSetupView: View {
                !savedRelayAddress.isEmpty,
                savedTURNURL.isEmpty,
                model.connectionState == .needsSetup {
+                stage = .relay
                 connect()
             }
+        }
+    }
+
+    private var stageTitle: String {
+        switch stage {
+        case .welcome: "Welcome to Noct Cord"
+        case .profile: "Your local profile"
+        case .relay: "Connect a relay"
+        }
+    }
+
+    private var stageSubtitle: String {
+        switch stage {
+        case .welcome:
+            "Encrypted communities and realtime collaboration over the Noctweave transport."
+        case .profile:
+            "Name this installation. Each community still receives fresh group-only credentials."
+        case .relay:
+            "Use your own relay, a community relay, or the endpoint supplied by an invitation."
+        }
+    }
+
+    @ViewBuilder
+    private var stageContent: some View {
+        switch stage {
+        case .welcome:
+            welcomeStage
+        case .profile:
+            profileStage
+        case .relay:
+            relayStage
+        }
+    }
+
+    private var welcomeStage: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            setupFeature(
+                "rectangle.3.group.bubble.left.fill",
+                title: "Communities without central accounts",
+                text: "Channels, roles, attachments, and calls are encrypted application state."
+            )
+            setupFeature(
+                "person.crop.circle.badge.checkmark",
+                title: "A different credential in every community",
+                text: "Portable profiles are optional; group transport keys are never reused."
+            )
+            setupFeature(
+                "server.rack",
+                title: "Bring a relay",
+                text: "Noct Cord does not silently enroll you in a developer-operated service."
+            )
+
+            DisclosureGroup(isExpanded: $showsInvitationInput) {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextEditor(text: $invitationCode)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .frame(minHeight: 94)
+                        .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 15))
+                        .overlay { RoundedRectangle(cornerRadius: 15).stroke(NoctCordTheme.border) }
+                    Button("Use invitation relay") { useInvitation() }
+                        .buttonStyle(NoctCordSecondaryButtonStyle())
+                }
+                .padding(.top, 11)
+            } label: {
+                Label("I already have a community invitation", systemImage: "link.badge.plus")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(NoctCordTheme.secondaryText)
+            }
+
+            validationView
+
+            Button("Set up Noct Cord") {
+                validationError = nil
+                stage = .profile
+            }
+            .buttonStyle(NoctCordPrimaryButtonStyle())
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+    }
+
+    private var profileStage: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            setupField("DISPLAY NAME", placeholder: "How you appear", text: $displayName)
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "eye.slash.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(NoctCordTheme.mutedCoral)
+                    .frame(width: 38, height: 38)
+                    .background(NoctCordTheme.mutedCoral.opacity(0.10), in: Circle())
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Private by default")
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Text("When joining or creating a community, Noct Cord recommends an isolated profile. You can deliberately disclose a portable profile per community instead.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(NoctCordTheme.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(15)
+            .background(NoctCordTheme.surface, in: RoundedRectangle(cornerRadius: 18))
+            .overlay { RoundedRectangle(cornerRadius: 18).stroke(NoctCordTheme.border) }
+            validationView
+            HStack {
+                Button("Back") { stage = .welcome }
+                    .buttonStyle(NoctCordSecondaryButtonStyle())
+                Spacer()
+                Button("Continue") {
+                    let clean = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !clean.isEmpty, clean.utf8.count <= 128 else {
+                        validationError = "Enter a display name of 128 bytes or fewer."
+                        return
+                    }
+                    validationError = nil
+                    stage = .relay
+                }
+                .buttonStyle(NoctCordPrimaryButtonStyle())
+            }
+        }
+    }
+
+    private var relayStage: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            setupField("RELAY", placeholder: "https://relay.example", text: $relayAddress)
+            setupField(
+                "RELAY PASSWORD · OPTIONAL",
+                placeholder: "Used for this connection",
+                text: $accessPassword,
+                secure: true
+            )
+            DisclosureGroup(isExpanded: $showsCallConnectivity) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("No third-party call service is selected automatically. Leave these blank for LAN-only calls, add STUN for NAT discovery, or TURN when peers require a media relay.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(NoctCordTheme.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    setupField(
+                        "STUN URL · OPTIONAL",
+                        placeholder: "stun:stun.example.org:3478",
+                        text: $stunURL
+                    )
+                    setupField(
+                        "TURN URL · OPTIONAL",
+                        placeholder: "turns:turn.example.org:5349?transport=tcp",
+                        text: $turnURL
+                    )
+                    if !turnURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        setupField(
+                            "TURN USERNAME",
+                            placeholder: "Short-lived username",
+                            text: $turnUsername
+                        )
+                        setupField(
+                            "TURN CREDENTIAL",
+                            placeholder: "Kept only for this app session",
+                            text: $turnCredential,
+                            secure: true
+                        )
+                    }
+                }
+                .padding(.top, 11)
+            } label: {
+                Label("Advanced call connectivity", systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(NoctCordTheme.secondaryText)
+            }
+            validationView
+            if case .failed(let message) = model.connectionState {
+                Label(message, systemImage: "network.slash")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(NoctCordTheme.mutedCoral)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Button("Back") { stage = .profile }
+                    .buttonStyle(NoctCordSecondaryButtonStyle())
+                Spacer()
+                Button {
+                    connect()
+                } label: {
+                    HStack(spacing: 8) {
+                        if model.connectionState == .connecting {
+                            ProgressView().controlSize(.small)
+                        }
+                        Text(
+                            model.connectionState == .connecting
+                                ? "Connecting…"
+                                : "Test relay and finish"
+                        )
+                    }
+                }
+                .buttonStyle(NoctCordPrimaryButtonStyle())
+                .disabled(model.connectionState == .connecting)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var validationView: some View {
+        if let validationError {
+            Label(validationError, systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(NoctCordTheme.warning)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func setupFeature(_ symbol: String, title: String, text: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(NoctCordTheme.mutedCoral)
+                .frame(width: 38, height: 38)
+                .background(NoctCordTheme.mutedCoral.opacity(0.10), in: Circle())
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.system(size: 12.5, weight: .semibold))
+                Text(text)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(NoctCordTheme.secondaryText)
+            }
+            Spacer(minLength: 0)
         }
     }
 
@@ -335,10 +525,38 @@ private struct NoctCordSetupView: View {
                     configuration: configuration,
                     iceServers: iceServers
                 )
+                if model.connectionState == .ready, !model.stagedInvitationCode.isEmpty {
+                    model.showsJoinSpace = true
+                }
             }
         } catch {
             validationError = error.localizedDescription
         }
+    }
+
+    private func useInvitation() {
+        do {
+            let invitation = try NoctCordCommunityInvitationV1.decode(invitationCode)
+            relayAddress = endpointString(invitation.relay)
+            model.stagedInvitationCode = invitationCode
+            validationError = nil
+            stage = .profile
+        } catch {
+            validationError = error.localizedDescription
+        }
+    }
+
+    private func endpointString(_ endpoint: RelayEndpoint) -> String {
+        let scheme: String
+        switch (endpoint.transport, endpoint.useTLS) {
+        case (.http, true): scheme = "https"
+        case (.http, false): scheme = "http"
+        case (.websocket, true): scheme = "wss"
+        case (.websocket, false): scheme = "ws"
+        case (.tcp, true): scheme = "tls"
+        case (.tcp, false): scheme = "tcp"
+        }
+        return "\(scheme)://\(endpoint.host):\(endpoint.port)"
     }
 
     private static func stateDirectory() throws -> URL {
@@ -380,10 +598,16 @@ private struct NoctCordEmptyState: View {
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 420)
                 }
-                Button("Create a space") {
-                    model.showsCreateSpace = true
+                HStack(spacing: 11) {
+                    Button("Create a community") {
+                        model.showsCreateSpace = true
+                    }
+                    .buttonStyle(NoctCordPrimaryButtonStyle())
+                    Button("Join with invitation") {
+                        model.showsJoinSpace = true
+                    }
+                    .buttonStyle(NoctCordSecondaryButtonStyle())
                 }
-                .buttonStyle(NoctCordPrimaryButtonStyle())
             }
             .padding(36)
             .noctCordPanel(radius: 26, elevated: true)

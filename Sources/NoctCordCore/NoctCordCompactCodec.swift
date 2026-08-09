@@ -220,6 +220,9 @@ private extension NoctCordEventKind {
         case .botUpdated: 31
         case .botRemoved: 32
         case .botCommandInvoked: 33
+        case .identityBound: 34
+        case .bootstrapRequested: 35
+        case .bootstrapApplied: 36
         }
     }
 
@@ -231,7 +234,7 @@ private extension NoctCordEventKind {
              .voiceParticipantMuted, .voiceParticipantDeafened,
              .voiceParticipantSpeaking, .callSignalPosted, .screenShareStarted,
              .screenShareStopped, .botInstalled, .botUpdated, .botRemoved,
-             .botCommandInvoked:
+             .botCommandInvoked, .identityBound, .bootstrapApplied:
             return true
         default:
             return false
@@ -274,6 +277,9 @@ private extension NoctCordEventKind {
         case 31: self = .botUpdated
         case 32: self = .botRemoved
         case 33: self = .botCommandInvoked
+        case 34: self = .identityBound
+        case 35: self = .bootstrapRequested
+        case 36: self = .bootstrapApplied
         default: throw NoctCordCompactCodecError.invalidRecord
         }
     }

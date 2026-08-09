@@ -32,8 +32,17 @@ struct NoctCordSpaceRail: View {
                 .padding(.vertical, 2)
             }
 
-            Button {
-                model.showsCreateSpace = true
+            Menu {
+                Button {
+                    model.showsCreateSpace = true
+                } label: {
+                    Label("Create community", systemImage: "plus")
+                }
+                Button {
+                    model.showsJoinSpace = true
+                } label: {
+                    Label("Join with invitation", systemImage: "person.crop.circle.badge.plus")
+                }
             } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 16, weight: .semibold))
@@ -45,9 +54,10 @@ struct NoctCordSpaceRail: View {
                             .stroke(NoctCordTheme.border, lineWidth: 1)
                     }
             }
-            .buttonStyle(.plain)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .foregroundStyle(NoctCordTheme.mutedCoral)
-            .help("Create a space")
+            .help("Create or join a community")
 
             Spacer(minLength: 12)
 
@@ -155,6 +165,19 @@ struct NoctCordChannelSidebar: View {
                             .foregroundStyle(NoctCordTheme.primaryText)
                             .lineLimit(1)
                         Spacer()
+                        if model.canInviteToSelectedSpace {
+                            Button {
+                                model.showsInvitationExchange = true
+                            } label: {
+                                Image(systemName: "person.crop.circle.badge.plus")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .frame(width: 30, height: 30)
+                                    .background(NoctCordTheme.surface, in: Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(NoctCordTheme.secondaryText)
+                            .help("Invite a member")
+                        }
                         Button {
                             model.showsCommunitySettings = true
                         } label: {

@@ -85,6 +85,7 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
     public private(set) var roleAssignments: [GroupScopedMemberHandleV2: Set<UUID>]
     public private(set) var botApplications: [UUID: NoctCordBotApplication]
     public private(set) var botInvocations: [UUID: NoctCordBotCommandInvocation]
+    public private(set) var identityBindings: [GroupScopedMemberHandleV2: NoctCordCommunityIdentityBindingV1]
     public private(set) var messages: [UUID: NoctCordMessage]
     public private(set) var attachments: [UUID: NoctCordAttachmentManifestV1]
     public private(set) var voiceRooms: [UUID: NoctCordVoiceRoom]
@@ -109,6 +110,7 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
         roleAssignments = [:]
         botApplications = [:]
         botInvocations = [:]
+        identityBindings = [:]
         messages = [:]
         attachments = [:]
         voiceRooms = [:]
@@ -169,6 +171,7 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
         activeMembers = members.union([owner])
         roleAssignments = roleAssignments.filter { activeMembers.contains($0.key) }
         botApplications = botApplications.filter { activeMembers.contains($0.value.memberHandle) }
+        identityBindings = identityBindings.filter { activeMembers.contains($0.key) }
     }
 
     public func permissions(for member: GroupScopedMemberHandleV2) -> Set<NoctCordPermission> {
@@ -232,12 +235,13 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
     }
 
     public mutating func apply(_ event: NoctCordEvent) throws {
-        try apply(event, permittingHistoricalAuthor: false)
+        try apply(event, permittingHistoricalAuthor: false, enforcingOrder: true)
     }
 
     private mutating func apply(
         _ event: NoctCordEvent,
-        permittingHistoricalAuthor: Bool
+        permittingHistoricalAuthor: Bool,
+        enforcingOrder: Bool = true
     ) throws {
         guard event.isStructurallyValid else { throw NoctCordProjectionError.invalidEvent }
         guard event.spaceID == spaceID else { throw NoctCordProjectionError.wrongSpace }
@@ -246,7 +250,9 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
             throw NoctCordProjectionError.inactiveMember
         }
         let order = EventOrder(event)
-        if let lastOrder, order < lastOrder { throw NoctCordProjectionError.outOfOrder }
+        if enforcingOrder, let lastOrder, order < lastOrder {
+            throw NoctCordProjectionError.outOfOrder
+        }
 
         switch event.operation.kind {
         case .spaceCreated:
@@ -700,10 +706,39 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
             )
             channel.messageIDs.append(invocation.id)
             channels[invocation.channelID] = channel
+
+        case .identityBound:
+            guard let binding = event.operation.identityBinding,
+                  binding.spaceID == spaceID,
+                  binding.memberHandle == event.author,
+                  try binding.verify() else {
+                throw NoctCordProjectionError.invalidEvent
+            }
+            if let existing = identityBindings[event.author],
+               binding.issuedAt < existing.issuedAt {
+                throw NoctCordProjectionError.outOfOrder
+            }
+            identityBindings[event.author] = binding
+
+        case .bootstrapRequested:
+            break
+
+        case .bootstrapApplied:
+            guard event.author == owner,
+                  let events = event.operation.bootstrapEvents else {
+                throw NoctCordProjectionError.permissionDenied(.manageSpace)
+            }
+            for nested in events.sorted(by: canonicalOrder) {
+                try apply(
+                    nested,
+                    permittingHistoricalAuthor: true,
+                    enforcingOrder: false
+                )
+            }
         }
 
         appliedEventIDs.insert(event.id)
-        lastOrder = order
+        if enforcingOrder { lastOrder = order }
     }
 
     private func require(

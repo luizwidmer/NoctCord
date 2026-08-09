@@ -114,6 +114,9 @@ public enum NoctCordEventKind: String, Codable, CaseIterable, Sendable {
     case botUpdated
     case botRemoved
     case botCommandInvoked
+    case identityBound
+    case bootstrapRequested
+    case bootstrapApplied
 }
 
 /// A bounded, application-level operation. It is encoded inside a Noctweave
@@ -142,6 +145,9 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
     public let botApplication: NoctCordBotApplication?
     public let botID: UUID?
     public let botInvocation: NoctCordBotCommandInvocation?
+    public let identityBinding: NoctCordCommunityIdentityBindingV1?
+    public let bootstrapRequestIDs: [UUID]?
+    public let bootstrapEvents: [NoctCordEvent]?
 
     public init(
         kind: NoctCordEventKind,
@@ -166,7 +172,10 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         screenShareID: UUID? = nil,
         botApplication: NoctCordBotApplication? = nil,
         botID: UUID? = nil,
-        botInvocation: NoctCordBotCommandInvocation? = nil
+        botInvocation: NoctCordBotCommandInvocation? = nil,
+        identityBinding: NoctCordCommunityIdentityBindingV1? = nil,
+        bootstrapRequestIDs: [UUID]? = nil,
+        bootstrapEvents: [NoctCordEvent]? = nil
     ) {
         self.kind = kind
         self.channelID = channelID
@@ -191,6 +200,11 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         self.botApplication = botApplication
         self.botID = botID
         self.botInvocation = botInvocation
+        self.identityBinding = identityBinding
+        self.bootstrapRequestIDs = bootstrapRequestIDs?.sorted {
+            $0.uuidString < $1.uuidString
+        }
+        self.bootstrapEvents = bootstrapEvents
     }
 
     public static func createSpace(name: String) -> Self {
@@ -409,6 +423,28 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         Self(kind: .botCommandInvoked, botInvocation: invocation)
     }
 
+    public static func bindIdentity(_ binding: NoctCordCommunityIdentityBindingV1) -> Self {
+        Self(kind: .identityBound, identityBinding: binding)
+    }
+
+    /// Owner-attested application state sent immediately after a new member
+    /// joins. The batch is transported as a fresh authenticated group event;
+    /// nested events are never accepted as a standalone admission artifact.
+    public static func requestBootstrap() -> Self {
+        Self(kind: .bootstrapRequested)
+    }
+
+    public static func applyBootstrap(
+        _ events: [NoctCordEvent],
+        satisfying requestIDs: [UUID] = []
+    ) -> Self {
+        Self(
+            kind: .bootstrapApplied,
+            bootstrapRequestIDs: requestIDs,
+            bootstrapEvents: events
+        )
+    }
+
     public var isStructurallyValid: Bool {
         let permissionListIsValid = permissions.map {
             $0.count <= NoctCordPermission.allCases.count
@@ -424,7 +460,22 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
               callSignal?.isStructurallyValid ?? true,
               screenShare?.isStructurallyValid ?? true,
               botApplication?.isStructurallyValid ?? true,
-              botInvocation?.isStructurallyValid ?? true else {
+              botInvocation?.isStructurallyValid ?? true,
+              identityBinding.map({ (try? $0.verify()) == true }) ?? true,
+              bootstrapRequestIDs.map({ requestIDs in
+                  requestIDs.count <= 128
+                      && Set(requestIDs).count == requestIDs.count
+                      && requestIDs == requestIDs.sorted { $0.uuidString < $1.uuidString }
+              }) ?? true,
+              bootstrapEvents.map({ events in
+                  !events.isEmpty
+                      && events.count <= 128
+                      && events.allSatisfy {
+                          $0.operation.kind != .bootstrapApplied && $0.isStructurallyValid
+                      }
+                      && ((try? NoctweaveCoder.encode(events, sortedKeys: true).count) ?? .max)
+                          <= 48 * 1_024
+              }) ?? true else {
             return false
         }
 
@@ -514,6 +565,14 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
             return botID != nil && only(botID: true)
         case .botCommandInvoked:
             return botInvocation != nil && only(botInvocation: true)
+        case .identityBound:
+            return identityBinding != nil && only(identityBinding: true)
+        case .bootstrapRequested:
+            return only()
+        case .bootstrapApplied:
+            return bootstrapEvents != nil
+                && bootstrapRequestIDs != nil
+                && only(bootstrapRequestIDs: true, bootstrapEvents: true)
         }
     }
 
@@ -539,7 +598,10 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
         screenShareID: Bool = false,
         botApplication: Bool = false,
         botID: Bool = false,
-        botInvocation: Bool = false
+        botInvocation: Bool = false,
+        identityBinding: Bool = false,
+        bootstrapRequestIDs: Bool = false,
+        bootstrapEvents: Bool = false
     ) -> Bool {
         (channelID != nil) == channel
             && (messageID != nil) == message
@@ -563,6 +625,9 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
             && (self.botApplication != nil) == botApplication
             && (self.botID != nil) == botID
             && (self.botInvocation != nil) == botInvocation
+            && (self.identityBinding != nil) == identityBinding
+            && (self.bootstrapRequestIDs != nil) == bootstrapRequestIDs
+            && (self.bootstrapEvents != nil) == bootstrapEvents
     }
 }
 
@@ -608,6 +673,12 @@ public struct NoctCordEvent: Codable, Equatable, Identifiable, Sendable {
             && createdAt >= Date(timeIntervalSince1970: 1_577_836_800)
             && createdAt <= Date(timeIntervalSince1970: 4_102_444_800)
             && operation.isStructurallyValid
+            && (operation.identityBinding.map {
+                $0.spaceID == spaceID && $0.memberHandle == author
+            } ?? true)
+            && (operation.bootstrapEvents?.allSatisfy {
+                $0.spaceID == spaceID && $0.operation.kind != .bootstrapApplied
+            } ?? true)
     }
 }
 

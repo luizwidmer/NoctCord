@@ -20,6 +20,25 @@ relay plaintext application authority.
 
 ## Current capabilities
 
+- **Complete first-run and community admission flow.** Setup explains the
+  trust boundary, creates a local display profile, verifies a real relay, and
+  keeps STUN/TURN under Advanced. A community owner can create a bounded
+  invitation; the recipient returns a fresh one-use post-quantum admission
+  request; and the owner returns a signed Welcome. Acceptance automatically
+  requests an encrypted configuration bootstrap, so the new member receives
+  the current space, channel, role, bot, voice-room, and disclosed profile
+  state without a fourth user-facing exchange.
+- **Relay-hosted community model.** Communities remain cryptographically
+  owner-controlled while their home relay supplies transport and availability.
+  The accepted design lets a relay advertise one official community and choose
+  whether additional creation is disabled, operator-only, approval-based, or
+  open. Membership is either private by invitation or open to anyone who knows
+  the address or finds it through the relay's signed directory. Public
+  discovery will reuse signed
+  `noct://<community-label>.<relay-suffix>/` publications rather than inventing
+  a central directory. An open community's separately scoped admission agent,
+  not the relay, signs membership transitions. The registry and admission queue
+  are not implemented yet.
 - **Encrypted spaces and channels.** One space maps to one Noctweave group.
   Channel creation, messages, edits, reactions, pins, roles, and voice-room
   state are versioned Noct Cord events. The coordinator publishes through
@@ -118,8 +137,11 @@ swift run NoctCordApp
 ```
 
 `NoctCordDemo` is deterministic projection/codec smoke coverage. `NoctCordApp`
-starts with setup enabled: enter a display name and a reachable relay URL,
-then use **Test relay and continue**. It does not create a local relay.
+starts with a full-screen setup flow: review the security boundary, choose the
+local display name, optionally paste a community invitation, and connect to a
+reachable relay with **Test relay and continue**. It does not create a local
+relay or insert a third-party relay. Community admission is available from the
+empty state and the community menu after setup.
 
 To build a launchable macOS bundle:
 
@@ -163,14 +185,22 @@ match the feature being enabled.
   reviewed media-forwarding design.
 - ICE configuration is exposed under advanced setup and never silently
   populates a third-party STUN/TURN service. TURN credentials are session-only.
+- Community admission is currently owner-mediated. The bootstrap transfers
+  durable configuration, not pre-join message bodies, attachments, presence,
+  or call history. If the owner goes offline immediately after approval, the
+  accepted member remains joined and receives configuration when the owner
+  next synchronizes.
 - Final iOS host packaging, ReplayKit behavior, and platform permission flows
   still require signed-device validation.
 
-See [identity design](docs/identity.md),
+See [onboarding and community admission](docs/onboarding.md),
+[identity design](docs/identity.md),
 [roles, channel access, and applications](docs/roles-channels-and-bots.md),
 [relay extensions](docs/relay-extension.md),
 [media and calls](docs/media-and-calls.md), and
-[ADR 0001](docs/adr/0001-application-boundary.md) for the detailed boundaries.
+[ADR 0001](docs/adr/0001-application-boundary.md) and
+[ADR 0002](docs/adr/0002-relay-hosting-and-noctweb-discovery.md) for the detailed
+boundaries.
 
 ## Contributing and security
 
