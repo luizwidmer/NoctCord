@@ -137,6 +137,7 @@ private struct NoctCordSetupView: View {
     @State private var accessPassword = ""
     @State private var invitationCode = ""
     @State private var showsInvitationInput = false
+    @State private var showsRelayAccessOptions = false
     @State private var showsCallConnectivity = false
     @State private var stunURL = ""
     @State private var turnURL = ""
@@ -202,6 +203,7 @@ private struct NoctCordSetupView: View {
                 .padding(.horizontal, 28)
                 .padding(.vertical, 38)
             }
+            .id(stage.rawValue)
         }
         .onAppear {
             if displayName.isEmpty { displayName = savedDisplayName }
@@ -234,7 +236,7 @@ private struct NoctCordSetupView: View {
         case .profile:
             "Name this installation. Each community still receives fresh group-only credentials."
         case .relay:
-            "Use your own relay, a community relay, or the endpoint supplied by an invitation."
+            "Enter one address. Noct Cord verifies the relay and discovers call connectivity automatically."
         }
     }
 
@@ -264,8 +266,8 @@ private struct NoctCordSetupView: View {
             )
             setupFeature(
                 "server.rack",
-                title: "Bring a relay",
-                text: "Noct Cord does not silently enroll you in a developer-operated service."
+                title: "Choose your community network",
+                text: "Use an invitation's relay or one you trust. Noct Cord never silently enrolls you in a service."
             )
 
             DisclosureGroup(isExpanded: $showsInvitationInput) {
@@ -282,14 +284,14 @@ private struct NoctCordSetupView: View {
                 }
                 .padding(.top, 11)
             } label: {
-                Label("I already have a community invitation", systemImage: "link.badge.plus")
+                Label("Join with a community invitation", systemImage: "link.badge.plus")
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(NoctCordTheme.secondaryText)
             }
 
             validationView
 
-            Button("Set up Noct Cord") {
+            Button("Continue without an invitation") {
                 validationError = nil
                 stage = .profile
             }
@@ -341,12 +343,23 @@ private struct NoctCordSetupView: View {
     private var relayStage: some View {
         VStack(alignment: .leading, spacing: 13) {
             setupField("RELAY", placeholder: "https://relay.example", text: $relayAddress)
-            setupField(
-                "RELAY PASSWORD · OPTIONAL",
-                placeholder: "Used for this connection",
-                text: $accessPassword,
-                secure: true
-            )
+            Text("The relay is checked before anything is saved. Calls use the relay's advertised STUN/TURN service when available.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(NoctCordTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup(isExpanded: $showsRelayAccessOptions) {
+                setupField(
+                    "RELAY PASSWORD",
+                    placeholder: "Only if required by the operator",
+                    text: $accessPassword,
+                    secure: true
+                )
+                .padding(.top, 11)
+            } label: {
+                Label("Advanced relay access", systemImage: "key.fill")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(NoctCordTheme.secondaryText)
+            }
             DisclosureGroup(isExpanded: $showsCallConnectivity) {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Noct Cord automatically uses the STUN/TURN service advertised by this relay. Add values here only to override the operator's service for this app session.")
@@ -379,7 +392,7 @@ private struct NoctCordSetupView: View {
                 }
                 .padding(.top, 11)
             } label: {
-                Label("Advanced ICE override", systemImage: "antenna.radiowaves.left.and.right")
+                Label("Advanced call network override", systemImage: "antenna.radiowaves.left.and.right")
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(NoctCordTheme.secondaryText)
             }
@@ -404,7 +417,7 @@ private struct NoctCordSetupView: View {
                         Text(
                             model.connectionState == .connecting
                                 ? "Connecting…"
-                                : "Test relay and finish"
+                                : "Connect Securely"
                         )
                     }
                 }
