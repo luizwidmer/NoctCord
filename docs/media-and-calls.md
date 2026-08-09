@@ -105,11 +105,18 @@ capture permissions and signed-device validation.
 `turns`; embedded URL credentials are rejected. Up to eight server entries are
 accepted and TURN username/credential pairs must be supplied together.
 
-An empty list means LAN-only ICE. No public STUN/TURN service is inserted by
-default, so users and operators must choose and trust the service that learns
-their connectivity metadata. A TURN service relays encrypted WebRTC packets
-but can observe source/destination and timing metadata. It should use
-short-lived credentials and an operator-controlled endpoint.
+On connection, `NoctCordTransportCoordinator` validates relay info and the
+`nw.ice-service@1` capability. It uses advertised STUN URLs directly and, for
+`turn-rest`, sends a fresh nonce to the relay's credential endpoint. The relay
+returns a short-lived coturn username and credential; the client keeps both in
+memory and refreshes them before a room join when expiry is near. Advanced
+setup entries replace this automatic result for the current session.
+
+An empty result means direct/LAN-only ICE. No unrelated public STUN/TURN
+service is inserted by default, so users still choose the relay operator whose
+traversal service learns their connectivity metadata. A TURN service relays
+encrypted WebRTC packets but can observe source/destination and timing
+metadata. Messaging remains available if traversal discovery fails.
 
 Joining with a microphone requests the host microphone permission. Starting a
 share requests screen-capture access through ScreenCaptureKit or ReplayKit.

@@ -1,11 +1,89 @@
 import Foundation
 import CryptoKit
 import NoctCordCore
+import NoctCordMedia
 @testable import NoctCordUI
 @preconcurrency import NoctweaveCore
 import XCTest
 
 final class NoctCordTransportIntegrationTests: XCTestCase {
+    func testRelayAdvertisedCoturnIsDiscoveredWithTemporaryCredentials() async throws {
+        let relayPassword = "correct horse battery staple"
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctcord-ice-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let descriptor = RelayICEServiceDescriptorV1(
+            urls: [
+                "stun:turn.example.test:3478",
+                "turn:turn.example.test:3478?transport=udp"
+            ],
+            credentialMode: .turnREST,
+            credentialLifetimeSeconds: 600,
+            realm: "turn.example.test",
+            relayOnlySupported: true
+        )
+        let port = UInt16.random(in: 42_000...56_000)
+        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
+        let server = RelayServer(
+            store: RelayStore(),
+            configuration: RelayConfiguration(
+                iceService: descriptor,
+                accessPassword: relayPassword
+            ),
+            coturnCredentialIssuer: try XCTUnwrap(CoturnCredentialIssuerV1(
+                sharedSecret: "0123456789abcdef0123456789abcdef"
+            ))
+        )
+        try server.start(host: "127.0.0.1", port: port)
+        defer { server.stop() }
+        try await Task.sleep(for: .milliseconds(150))
+
+        let client = try await makeClient(name: "ice-client", root: root)
+        let coordinator = try NoctCordTransportCoordinator(
+            client: client,
+            relay: endpoint,
+            relayAccessPassword: relayPassword
+        )
+        let configuration = try await coordinator.discoverCallConnectivity()
+
+        XCTAssertTrue(configuration.relayAdvertised)
+        XCTAssertTrue(configuration.relayOnlySupported)
+        XCTAssertEqual(configuration.servers.count, 2)
+        XCTAssertEqual(configuration.servers[0].urls, ["stun:turn.example.test:3478"])
+        XCTAssertEqual(configuration.servers[1].urls, ["turn:turn.example.test:3478?transport=udp"])
+        XCTAssertNotNil(configuration.servers[1].username)
+        XCTAssertNotNil(configuration.servers[1].credential)
+        XCTAssertGreaterThan(try XCTUnwrap(configuration.credentialExpiresAt), Date())
+    }
+
+    func testRelayWithoutICEAdvertisementStaysDirectOnly() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctcord-direct-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let port = UInt16.random(in: 42_000...56_000)
+        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
+        let server = RelayServer(store: RelayStore())
+        try server.start(host: "127.0.0.1", port: port)
+        defer { server.stop() }
+        try await Task.sleep(for: .milliseconds(150))
+
+        let client = try await makeClient(name: "direct-client", root: root)
+        let configuration = try await NoctCordTransportCoordinator(
+            client: client,
+            relay: endpoint
+        ).discoverCallConnectivity()
+        XCTAssertFalse(configuration.relayAdvertised)
+        XCTAssertTrue(configuration.servers.isEmpty)
+        XCTAssertNil(configuration.credentialExpiresAt)
+    }
+
     func testInvitationAdmissionJoinsAndExchangesMessagesBothWays() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             "noctcord-admission-\(UUID().uuidString)",

@@ -1,5 +1,6 @@
 import Foundation
 import NoctCordCore
+import NoctCordMedia
 @preconcurrency import NoctweaveCore
 
 // Noctweave's sync result is immutable value state, but its current public
@@ -107,6 +108,25 @@ public struct NoctCordStoredSpaceSnapshot: Sendable {
 public struct NoctCordReceivedRealtimeSignal: Sendable {
     public let author: GroupScopedMemberHandleV2
     public let signal: NoctCordEncryptedCallSignalV1
+}
+
+public struct NoctCordRelayICEConfiguration: Sendable {
+    public let servers: [NoctCordMediaICEServer]
+    public let relayAdvertised: Bool
+    public let relayOnlySupported: Bool
+    public let credentialExpiresAt: Date?
+
+    public init(
+        servers: [NoctCordMediaICEServer],
+        relayAdvertised: Bool,
+        relayOnlySupported: Bool,
+        credentialExpiresAt: Date?
+    ) {
+        self.servers = servers
+        self.relayAdvertised = relayAdvertised
+        self.relayOnlySupported = relayOnlySupported
+        self.credentialExpiresAt = credentialExpiresAt
+    }
 }
 
 private struct NoctCordRealtimeSubscriptionState: Sendable {
@@ -621,6 +641,81 @@ public actor NoctCordTransportCoordinator {
         ).send(.health(), timeout: timeout)
         guard response.status == .success, response.error == nil else {
             throw NoctCordTransportError.transportIncomplete
+        }
+    }
+
+    /// Resolves the relay's optional ICE service and acquires a fresh coturn
+    /// credential when required. The returned credential is session state;
+    /// callers must not persist it with community or identity data.
+    public func discoverCallConnectivity(
+        timeout: TimeInterval = 5
+    ) async throws -> NoctCordRelayICEConfiguration {
+        let client = relayClient()
+        let infoResponse = try await client.send(.info(), timeout: timeout)
+        guard infoResponse.error == nil,
+              case .relayInfo(let info)? = infoResponse.successBody else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        guard let descriptor = info.iceService else {
+            return NoctCordRelayICEConfiguration(
+                servers: [],
+                relayAdvertised: false,
+                relayOnlySupported: false,
+                credentialExpiresAt: nil
+            )
+        }
+        guard descriptor.isStructurallyValid,
+              info.protocolCapabilities?.supports(
+                module: "nw.ice-service",
+                version: 1
+              ) == true else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+
+        let stunURLs = descriptor.urls.filter {
+            $0.hasPrefix("stun:") || $0.hasPrefix("stuns:")
+        }
+        var servers: [NoctCordMediaICEServer] = []
+        if !stunURLs.isEmpty {
+            servers.append(try NoctCordMediaICEServer(urls: stunURLs))
+        }
+
+        switch descriptor.credentialMode {
+        case .none:
+            let turnURLs = descriptor.urls.filter {
+                $0.hasPrefix("turn:") || $0.hasPrefix("turns:")
+            }
+            if !turnURLs.isEmpty {
+                servers.append(try NoctCordMediaICEServer(urls: turnURLs))
+            }
+            return NoctCordRelayICEConfiguration(
+                servers: servers,
+                relayAdvertised: true,
+                relayOnlySupported: descriptor.relayOnlySupported,
+                credentialExpiresAt: nil
+            )
+        case .turnREST:
+            let credentialResponse = try await client.send(
+                .acquireICECredentialsV1(.fresh()),
+                timeout: timeout
+            )
+            guard credentialResponse.error == nil,
+                  case .iceCredentials(let credentials)? = credentialResponse.successBody,
+                  credentials.isStructurallyValid,
+                  credentials.expiresAt > Date() else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+            servers.append(try NoctCordMediaICEServer(
+                urls: credentials.urls,
+                username: credentials.username,
+                credential: credentials.credential
+            ))
+            return NoctCordRelayICEConfiguration(
+                servers: servers,
+                relayAdvertised: true,
+                relayOnlySupported: descriptor.relayOnlySupported,
+                credentialExpiresAt: credentials.expiresAt
+            )
         }
     }
 

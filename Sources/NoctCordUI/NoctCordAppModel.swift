@@ -159,6 +159,8 @@ public final class NoctCordAppModel: ObservableObject {
     @Published public var showsCreateVoiceRoom = false
     @Published public private(set) var callSnapshot: NoctCordMediaRoomSnapshot?
     @Published public private(set) var composerNotice: String?
+    @Published public private(set) var callConnectivityDescription =
+        "Call traversal will be discovered from the relay when available."
 
     private let previewMode: Bool
     private let identityVault: NoctCordIdentityVault
@@ -169,6 +171,8 @@ public final class NoctCordAppModel: ObservableObject {
     private var mediaRefreshTask: Task<Void, Never>?
     private var processedCallSignalIDs: Set<UUID> = []
     private var iceServers: [NoctCordMediaICEServer] = []
+    private var usesRelayDiscoveredICE = true
+    private var relayICECredentialExpiresAt: Date?
     private var localDisplayName = "Member"
 
     public init(seedPreviewData: Bool = false) {
@@ -324,7 +328,15 @@ public final class NoctCordAppModel: ObservableObject {
             try await coordinator.testRelay()
             transport = coordinator
             localDisplayName = configuration.displayName
-            self.iceServers = iceServers
+            usesRelayDiscoveredICE = iceServers.isEmpty
+            if iceServers.isEmpty {
+                await refreshRelayCallConnectivity(using: coordinator)
+            } else {
+                self.iceServers = iceServers
+                relayICECredentialExpiresAt = nil
+                callConnectivityDescription =
+                    "Using your manual ICE override for this session."
+            }
             try await reloadAllSpaces()
             connectionState = .ready
             activityMessage = nil
@@ -1084,6 +1096,11 @@ public final class NoctCordAppModel: ObservableObject {
         }
         activityMessage = "Joining encrypted voice room…"
         do {
+            if usesRelayDiscoveredICE,
+               let expiry = relayICECredentialExpiresAt,
+               expiry.timeIntervalSinceNow <= 60 {
+                await refreshRelayCallConnectivity(using: transport)
+            }
             var projectedRoom = initialRoom
             // Never rotate an otherwise valid route from a single joining
             // client: peers already in the room are still bound to that
@@ -1195,6 +1212,33 @@ public final class NoctCordAppModel: ObservableObject {
                 )
             )
             try? await reloadSpace(spaceID, using: transport)
+        }
+    }
+
+    private func refreshRelayCallConnectivity(
+        using coordinator: NoctCordTransportCoordinator
+    ) async {
+        do {
+            let discovered = try await coordinator.discoverCallConnectivity()
+            iceServers = discovered.servers
+            relayICECredentialExpiresAt = discovered.credentialExpiresAt
+            if discovered.servers.contains(where: { $0.credential != nil }) {
+                callConnectivityDescription =
+                    "Relay-provided TURN is ready. Media remains application-encrypted."
+            } else if !discovered.servers.isEmpty {
+                callConnectivityDescription =
+                    "Relay-provided STUN is ready; direct peers may see each other's network address."
+            } else {
+                callConnectivityDescription =
+                    "This relay does not advertise call traversal. Calls are limited to directly reachable peers."
+            }
+        } catch {
+            if relayICECredentialExpiresAt.map({ $0 <= Date() }) != false {
+                iceServers.removeAll { $0.credential != nil }
+                relayICECredentialExpiresAt = nil
+            }
+            callConnectivityDescription =
+                "Messaging is connected, but relay call traversal could not be verified. Direct paths may still work."
         }
     }
 

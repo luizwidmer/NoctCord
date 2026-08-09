@@ -349,7 +349,7 @@ private struct NoctCordSetupView: View {
             )
             DisclosureGroup(isExpanded: $showsCallConnectivity) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("No third-party call service is selected automatically. Leave these blank for LAN-only calls, add STUN for NAT discovery, or TURN when peers require a media relay.")
+                    Text("Noct Cord automatically uses the STUN/TURN service advertised by this relay. Add values here only to override the operator's service for this app session.")
                         .font(.system(size: 10.5))
                         .foregroundStyle(NoctCordTheme.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
@@ -379,7 +379,7 @@ private struct NoctCordSetupView: View {
                 }
                 .padding(.top, 11)
             } label: {
-                Label("Advanced call connectivity", systemImage: "antenna.radiowaves.left.and.right")
+                Label("Advanced ICE override", systemImage: "antenna.radiowaves.left.and.right")
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(NoctCordTheme.secondaryText)
             }
@@ -804,6 +804,14 @@ private struct CreateVoiceRoomSheet: View {
                         .foregroundStyle(NoctCordTheme.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                Label(
+                    model.callConnectivityDescription,
+                    systemImage: "network"
+                )
+                .font(.system(size: 10.5))
+                .foregroundStyle(NoctCordTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
 
                 HStack {
                     Button("Cancel") { dismiss() }

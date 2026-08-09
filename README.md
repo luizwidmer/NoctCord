@@ -22,7 +22,8 @@ relay plaintext application authority.
 
 - **Complete first-run and community admission flow.** Setup explains the
   trust boundary, creates a local display profile, verifies a real relay, and
-  keeps STUN/TURN under Advanced. A community owner can create a bounded
+  discovers the relay operator's optional coturn service while keeping manual
+  ICE overrides under Advanced. A community owner can create a bounded
   invitation; the recipient returns a fresh one-use post-quantum admission
   request; and the owner returns a signed Welcome. Acceptance automatically
   requests an encrypted configuration bootstrap, so the new member receives
@@ -108,10 +109,12 @@ WebRTC media plane.
 ## ICE, permissions, and privacy choices
 
 `NoctCordMediaICEServer` accepts only explicit `stun:`, `stuns:`, `turn:`, or
-`turns:` URLs. An empty ICE list is intentional LAN-only operation. No silent
-third-party STUN or TURN default is inserted. Operators or users must provide
-their own ICE service and short-lived TURN credentials when NAT traversal is
-needed; credentials must not be embedded in the URL.
+`turns:` URLs. The client first checks the connected relay's optional
+`nw.ice-service@1` advertisement and acquires short-lived coturn credentials
+over the authenticated relay connection. Credentials remain in memory and are
+refreshed before joining a room. The Advanced setup fields are a manual
+session override. No unrelated public STUN/TURN default is inserted; an empty
+result intentionally leaves calls limited to directly reachable peers.
 
 Joining a microphone room requests microphone permission through the host OS.
 Starting screen share requests the platform-specific capture permission. macOS
@@ -183,8 +186,9 @@ match the feature being enabled.
   observer is outside the protection claim.
 - Voice currently uses a native peer mesh; large rooms need a separately
   reviewed media-forwarding design.
-- ICE configuration is exposed under advanced setup and never silently
-  populates a third-party STUN/TURN service. TURN credentials are session-only.
+- ICE configuration is discovered from the chosen relay or supplied as an
+  explicit advanced override. TURN credentials are short-lived and
+  session-only; the coturn operator can observe call network metadata.
 - Community admission is currently owner-mediated. The bootstrap transfers
   durable configuration, not pre-join message bodies, attachments, presence,
   or call history. If the owner goes offline immediately after approval, the
