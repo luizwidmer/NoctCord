@@ -528,18 +528,24 @@ private struct NoctCordSetupView: View {
                 relayName: endpoint.host,
                 relayAccessPassword: accessPassword.isEmpty ? nil : accessPassword
             )
-            savedDisplayName = cleanName
-            savedRelayAddress = relayAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-            savedSTUNURL = stunURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            savedTURNURL = turnURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            savedTURNUsername = turnUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+            let relayAddressToSave = relayAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stunURLToSave = stunURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            let turnURLToSave = turnURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            let turnUsernameToSave = turnUsername.trimmingCharacters(in: .whitespacesAndNewlines)
             Task {
                 await model.connect(
                     configuration: configuration,
                     iceServers: iceServers
                 )
-                if model.connectionState == .ready, !model.stagedInvitationCode.isEmpty {
-                    model.showsJoinSpace = true
+                if model.connectionState == .ready {
+                    savedDisplayName = cleanName
+                    savedRelayAddress = relayAddressToSave
+                    savedSTUNURL = stunURLToSave
+                    savedTURNURL = turnURLToSave
+                    savedTURNUsername = turnUsernameToSave
+                    if !model.stagedInvitationCode.isEmpty {
+                        model.showsJoinSpace = true
+                    }
                 }
             }
         } catch {
@@ -587,6 +593,7 @@ private struct NoctCordSetupView: View {
         )
         return directory
     }
+
 }
 
 private struct NoctCordEmptyState: View {

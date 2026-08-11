@@ -2,9 +2,6 @@ import CryptoKit
 import Foundation
 import NoctCordCore
 @preconcurrency import NoctweaveCore
-#if canImport(Security)
-import Security
-#endif
 
 enum NoctCordIdentityVaultError: Error, LocalizedError {
     case unavailable
@@ -29,6 +26,8 @@ enum NoctCordIdentityVaultError: Error, LocalizedError {
 actor NoctCordIdentityVault {
     private static let maximumBytes = 2 * 1_024 * 1_024
     private static let aad = Data("org.noctcord.identity-vault/v1\0".utf8)
+    // Keep the original service/account pair stable so existing encrypted
+    // vaults continue to open after upgrading the implementation.
     private static let keychainService = "org.noctcord.identity-vault"
 
     private struct State: Codable {
@@ -156,7 +155,7 @@ actor NoctCordIdentityVault {
                 Envelope(version: 1, sealed: combined),
                 sortedKeys: true
             )
-            try bytes.write(to: fileURL, options: [.atomic, .completeFileProtection])
+            try bytes.write(to: fileURL, options: .atomic)
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o600],
                 ofItemAtPath: fileURL.path
@@ -171,45 +170,17 @@ actor NoctCordIdentityVault {
     private func encryptionKey() throws -> SymmetricKey {
         if let suppliedKey { return suppliedKey }
         #if canImport(Security)
-        let account = Data(SHA256.hash(data: Data(fileURL.path.utf8))).base64EncodedString()
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: account,
-            kSecAttrSynchronizable as String: false,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecSuccess,
-           let data = result as? Data,
-           data.count == 32 {
-            return SymmetricKey(data: data)
-        }
-        guard status == errSecItemNotFound else {
+        let account = Data(SHA256.hash(data: Data(fileURL.path.utf8)))
+            .base64EncodedString()
+        do {
+            return try SecureStorageKeyProvider.shared.loadOrCreateKey(
+                service: Self.keychainService,
+                account: account,
+                accessibility: .afterFirstUnlockDeviceOnly
+            )
+        } catch {
             throw NoctCordIdentityVaultError.unavailable
         }
-        var bytes = Data(count: 32)
-        let randomStatus = bytes.withUnsafeMutableBytes { buffer in
-            SecRandomCopyBytes(kSecRandomDefault, 32, buffer.baseAddress!)
-        }
-        guard randomStatus == errSecSuccess else {
-            throw NoctCordIdentityVaultError.unavailable
-        }
-        var add = query
-        add.removeValue(forKey: kSecReturnData as String)
-        add.removeValue(forKey: kSecMatchLimit as String)
-        add[kSecValueData as String] = bytes
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let addStatus = SecItemAdd(add as CFDictionary, nil)
-        if addStatus == errSecDuplicateItem {
-            return try encryptionKey()
-        }
-        guard addStatus == errSecSuccess else {
-            throw NoctCordIdentityVaultError.unavailable
-        }
-        return SymmetricKey(data: bytes)
         #else
         throw NoctCordIdentityVaultError.unavailable
         #endif

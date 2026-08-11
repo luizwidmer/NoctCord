@@ -266,8 +266,14 @@ final class NoctCordMediaTests: XCTestCase {
         XCTAssertTrue(kinds.contains(.join))
         XCTAssertTrue(kinds.contains(.offer))
         XCTAssertTrue(kinds.contains(.answer))
-        XCTAssertTrue(isConnected(aliceSnapshot.remoteConnectionStates["bob"]))
-        XCTAssertTrue(isConnected(bobSnapshot.remoteConnectionStates["alice"]))
+        XCTAssertTrue(
+            isConnected(aliceSnapshot.remoteConnectionStates["bob"]),
+            "Alice/Bob ICE state: \(aliceSnapshot.remoteConnectionStates); signals: \(kinds)"
+        )
+        XCTAssertTrue(
+            isConnected(bobSnapshot.remoteConnectionStates["alice"]),
+            "Bob/Alice ICE state: \(bobSnapshot.remoteConnectionStates); signals: \(kinds)"
+        )
     }
 
     func testRawWebRTCMeshNegotiatesThreePeersWithTargetedJoinAcknowledgements() async throws {
@@ -362,9 +368,18 @@ final class NoctCordMediaTests: XCTestCase {
         XCTAssertEqual(aliceSnapshot.participants.count, 3)
         XCTAssertEqual(bobSnapshot.participants.count, 3)
         XCTAssertEqual(carolSnapshot.participants.count, 3)
-        XCTAssertTrue(["bob", "carol"].allSatisfy { isConnected(aliceSnapshot.remoteConnectionStates[$0]) })
-        XCTAssertTrue(["alice", "carol"].allSatisfy { isConnected(bobSnapshot.remoteConnectionStates[$0]) })
-        XCTAssertTrue(["alice", "bob"].allSatisfy { isConnected(carolSnapshot.remoteConnectionStates[$0]) })
+        XCTAssertTrue(
+            ["bob", "carol"].allSatisfy { isConnected(aliceSnapshot.remoteConnectionStates[$0]) },
+            "Alice mesh ICE state: \(aliceSnapshot.remoteConnectionStates); signals: \(kinds)"
+        )
+        XCTAssertTrue(
+            ["alice", "carol"].allSatisfy { isConnected(bobSnapshot.remoteConnectionStates[$0]) },
+            "Bob mesh ICE state: \(bobSnapshot.remoteConnectionStates); signals: \(kinds)"
+        )
+        XCTAssertTrue(
+            ["alice", "bob"].allSatisfy { isConnected(carolSnapshot.remoteConnectionStates[$0]) },
+            "Carol mesh ICE state: \(carolSnapshot.remoteConnectionStates); signals: \(kinds)"
+        )
     }
 
     private func isConnected(_ state: String?) -> Bool {

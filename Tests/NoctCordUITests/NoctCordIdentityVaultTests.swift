@@ -47,6 +47,10 @@ final class NoctCordIdentityVaultTests: XCTestCase {
         XCTAssertNotEqual(portableOne.profile.identityID, isolatedOne.profile.identityID)
         let storedBytes = try Data(contentsOf: fileURL)
         XCTAssertNil(String(data: storedBytes, encoding: .utf8)?.range(of: "Luna"))
+        let permissions = try FileManager.default.attributesOfItem(atPath: fileURL.path)[
+            .posixPermissions
+        ] as? NSNumber
+        XCTAssertEqual(permissions?.intValue, 0o600)
 
         let reopenedVault = NoctCordIdentityVault(
             fileURL: fileURL,
