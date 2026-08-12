@@ -42,6 +42,26 @@ final class NoctCordAttachmentSanitizerTests: XCTestCase {
         }
     }
 
+    func testSymlinkedInputIsRejected() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctcord-attachment-symlink-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let realURL = root.appendingPathComponent("real.txt")
+        try Data("private".utf8).write(to: realURL)
+        let linkedURL = root.appendingPathComponent("linked.txt")
+        try FileManager.default.createSymbolicLink(at: linkedURL, withDestinationURL: realURL)
+
+        do {
+            _ = try await NoctCordAttachmentSanitizer.sanitize(url: linkedURL)
+            XCTFail("Expected symlinked attachment to be rejected")
+        } catch let error as NoctCordAttachmentSanitizerError {
+            XCTAssertEqual(error, .inaccessible)
+        }
+    }
+
     private func imageWithMetadata() throws -> Data {
         let colorSpace = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
         let context = try XCTUnwrap(

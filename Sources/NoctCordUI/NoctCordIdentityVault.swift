@@ -96,11 +96,18 @@ actor NoctCordIdentityVault {
     }
 
     private func load() throws -> State {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+        let directory = fileURL.deletingLastPathComponent()
+        try NoctCordSecureFileIO.ensurePrivateDirectory(at: directory)
+        let stored: Data
+        do {
+            stored = try NoctCordSecureFileIO.readBoundedRegularFile(
+                at: fileURL,
+                maximumBytes: Self.maximumBytes,
+                requireCurrentUserOwner: true
+            )
+        } catch NoctCordSecureFileError.notFound {
             return .empty
-        }
-        let stored = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
-        guard stored.count <= Self.maximumBytes else {
+        } catch {
             throw NoctCordIdentityVaultError.corrupted
         }
         do {
@@ -132,13 +139,7 @@ actor NoctCordIdentityVault {
     }
 
     private func save(_ state: State) throws {
-        let directory = fileURL.deletingLastPathComponent()
         do {
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
             let plaintext = try NoctweaveCoder.encode(state, sortedKeys: true)
             guard plaintext.count <= Self.maximumBytes else {
                 throw NoctCordIdentityVaultError.writeFailed
@@ -155,10 +156,10 @@ actor NoctCordIdentityVault {
                 Envelope(version: 1, sealed: combined),
                 sortedKeys: true
             )
-            try bytes.write(to: fileURL, options: .atomic)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: fileURL.path
+            try NoctCordSecureFileIO.writeAtomicPrivateFile(
+                bytes,
+                to: fileURL,
+                maximumBytes: Self.maximumBytes
             )
         } catch let error as NoctCordIdentityVaultError {
             throw error

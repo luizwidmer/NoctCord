@@ -15,6 +15,7 @@ repository_dir="$(cd "$script_dir/.." && pwd)"
 scratch_path="${NOCTCORD_BUILD_PATH:-$repository_dir/.build}"
 bundle_path="$repository_dir/dist/Noct Cord.app"
 contents_path="$bundle_path/Contents"
+codesign_identity="${NOCTCORD_CODESIGN_IDENTITY:--}"
 
 swift build \
     --package-path "$repository_dir" \
@@ -28,6 +29,9 @@ binary_dir="$(swift build \
     --configuration "$configuration" \
     --show-bin-path)"
 
+if [[ -e "$bundle_path" ]]; then
+    rm -rf -- "$bundle_path"
+fi
 mkdir -p "$contents_path/MacOS" "$contents_path/Resources" "$contents_path/Frameworks"
 cp "$binary_dir/NoctCordApp" "$contents_path/MacOS/NoctCordApp"
 cp "$repository_dir/Resources/NoctCordApp-Info.plist" "$contents_path/Info.plist"
@@ -43,7 +47,18 @@ if [[ -f "$repository_dir/Resources/NoctCordIcon.icns" ]]; then
     cp "$repository_dir/Resources/NoctCordIcon.icns" "$contents_path/Resources/NoctCordIcon.icns"
 fi
 chmod 755 "$contents_path/MacOS/NoctCordApp"
-codesign --force --deep --sign - "$bundle_path"
+signing_options=(--force --options runtime --sign "$codesign_identity")
+if [[ "$codesign_identity" == "-" ]]; then
+    signing_options+=(--timestamp=none)
+else
+    signing_options+=(--timestamp)
+fi
+codesign "${signing_options[@]}" "$contents_path/Frameworks/WebRTC.framework"
+codesign \
+    "${signing_options[@]}" \
+    --entitlements "$repository_dir/Resources/NoctCordApp.entitlements" \
+    "$bundle_path"
+codesign --verify --deep --strict --verbose=2 "$bundle_path"
 touch "$bundle_path"
 
 echo "$bundle_path"

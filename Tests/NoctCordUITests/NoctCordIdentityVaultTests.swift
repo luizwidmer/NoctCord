@@ -66,6 +66,42 @@ final class NoctCordIdentityVaultTests: XCTestCase {
         XCTAssertTrue(try isolatedAgain.verify())
     }
 
+    func testVaultRejectsSymlinkedStorage() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctcord-identity-vault-symlink-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let realURL = root.appendingPathComponent("real.vault")
+        try Data([0x01]).write(to: realURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: realURL.path
+        )
+        let linkedURL = root.appendingPathComponent("identities.vault")
+        try FileManager.default.createSymbolicLink(at: linkedURL, withDestinationURL: realURL)
+        let vault = NoctCordIdentityVault(
+            fileURL: linkedURL,
+            encryptionKey: SymmetricKey(data: Data(repeating: 0x44, count: 32))
+        )
+
+        do {
+            _ = try await vault.binding(
+                scope: .portable,
+                displayName: "Luna",
+                spaceID: UUID(),
+                memberHandle: handle(0x31)
+            )
+            XCTFail("Expected symlinked vault storage to be rejected")
+        } catch let error as NoctCordIdentityVaultError {
+            guard case .corrupted = error else {
+                return XCTFail("Unexpected vault error: \(error)")
+            }
+        }
+    }
+
     private func handle(_ byte: UInt8) -> GroupScopedMemberHandleV2 {
         GroupScopedMemberHandleV2(
             rawValue: Data(repeating: byte, count: 32).base64EncodedString()

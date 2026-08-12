@@ -66,6 +66,7 @@ public enum NoctCordAttachmentSanitizer {
     public static let maximumBytes = 8 * 1_024 * 1_024
     public static let maximumImageDimension = 4_096
     public static let maximumSourceImagePixels = 64 * 1_024 * 1_024
+    public static let maximumSourceAVBytes = 256 * 1_024 * 1_024
     public static let maximumDuration: TimeInterval = 15 * 60
     public static let maximumPDFPages = 200
 
@@ -81,10 +82,10 @@ public enum NoctCordAttachmentSanitizer {
             return try sanitizeImage(data: boundedData(at: url))
         }
         if type.conforms(to: .movie) || type.conforms(to: .video) {
-            return try await sanitizeAVAsset(at: url, kind: .video)
+            return try await sanitizeStagedAVAsset(at: url, kind: .video)
         }
         if type.conforms(to: .audio) {
-            return try await sanitizeAVAsset(at: url, kind: .audio)
+            return try await sanitizeStagedAVAsset(at: url, kind: .audio)
         }
         if type.conforms(to: .pdf) {
             return try sanitizePDF(data: boundedData(at: url))
@@ -275,16 +276,39 @@ public enum NoctCordAttachmentSanitizer {
         )
     }
 
-    private static func boundedData(at url: URL) throws -> Data {
-        let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-        guard values.isRegularFile == true,
-              let fileSize = values.fileSize,
-              fileSize > 0,
-              fileSize <= maximumBytes * 4 else {
-            throw NoctCordAttachmentSanitizerError.tooLarge
+    private static func sanitizeStagedAVAsset(
+        at sourceURL: URL,
+        kind: NoctCordAttachmentKind
+    ) async throws -> NoctCordSanitizedAttachment {
+        let extensionComponent = sourceURL.pathExtension.lowercased()
+        var stagedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("noctcord-source-\(UUID().uuidString)")
+        if !extensionComponent.isEmpty {
+            stagedURL.appendPathExtension(extensionComponent)
         }
+        defer { try? FileManager.default.removeItem(at: stagedURL) }
         do {
-            return try Data(contentsOf: url, options: [.mappedIfSafe, .uncached])
+            try NoctCordSecureFileIO.copyBoundedRegularFile(
+                at: sourceURL,
+                to: stagedURL,
+                maximumBytes: maximumSourceAVBytes
+            )
+        } catch NoctCordSecureFileError.tooLarge {
+            throw NoctCordAttachmentSanitizerError.tooLarge
+        } catch {
+            throw NoctCordAttachmentSanitizerError.inaccessible
+        }
+        return try await sanitizeAVAsset(at: stagedURL, kind: kind)
+    }
+
+    private static func boundedData(at url: URL) throws -> Data {
+        do {
+            return try NoctCordSecureFileIO.readBoundedRegularFile(
+                at: url,
+                maximumBytes: maximumBytes * 4
+            )
+        } catch NoctCordSecureFileError.tooLarge {
+            throw NoctCordAttachmentSanitizerError.tooLarge
         } catch {
             throw NoctCordAttachmentSanitizerError.inaccessible
         }

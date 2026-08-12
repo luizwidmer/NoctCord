@@ -154,6 +154,12 @@ Scripts/build-macos-app.sh debug
 open "dist/Noct Cord.app"
 ```
 
+The packaging script creates an App Sandbox and hardened-runtime bundle. It
+uses ad-hoc signing by default; set `NOCTCORD_CODESIGN_IDENTITY` to a suitable
+Developer ID identity for distribution signing. The sandbox permits relay and
+WebRTC networking, microphone capture, and read-only access to files the user
+selects. Existing pre-sandbox local state is not imported automatically.
+
 For local UI inspection, a debug bundle can start with deterministic sample
 spaces by launching its executable with `NOCTCORD_PREVIEW_DATA=1`. Release
 builds always ignore this environment variable.
