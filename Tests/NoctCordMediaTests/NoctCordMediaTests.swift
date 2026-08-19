@@ -21,6 +21,60 @@ final class NoctCordMediaTests: XCTestCase {
         XCTAssertEqual(try NoctCordMediaSignalingCodec.decode(first), envelope)
     }
 
+    func testSignalingDecoderRejectsUnboundedAndNonCanonicalInput() throws {
+        let envelope = try NoctCordMediaSignalEnvelope(
+            roomID: roomID,
+            sender: "alice",
+            recipient: "bob",
+            sequence: 1,
+            timestampMilliseconds: 1_800_000_000_000,
+            signal: .iceCandidate("candidate:1 1 UDP 1 192.0.2.1 1234 typ host")
+        )
+        let canonical = try NoctCordMediaSignalingCodec.encode(envelope)
+
+        var nonCanonical = canonical
+        nonCanonical.append(0x20)
+        XCTAssertThrowsError(try NoctCordMediaSignalingCodec.decode(nonCanonical))
+
+        let oversizedIdentifier = try JSONEncoder().encode([
+            "rawValue": String(repeating: "r", count: 257)
+        ])
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(NoctCordMediaRoomID.self, from: oversizedIdentifier)
+        )
+
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: canonical) as? [String: Any]
+        )
+        var signal = try XCTUnwrap(object["signal"] as? [String: Any])
+        signal["iceCandidate"] = [
+            "sdp": "candidate:1 1 UDP 1 192.0.2.1 1234 typ host",
+            "sdpMid": "0",
+            "sdpMLineIndex": 0
+        ]
+        object["signal"] = signal
+        let ambiguousCandidate = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        XCTAssertThrowsError(try NoctCordMediaSignalingCodec.decode(ambiguousCandidate))
+
+        object["unexpected"] = true
+        let unknownField = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        XCTAssertThrowsError(try NoctCordMediaSignalingCodec.decode(unknownField))
+
+        XCTAssertFalse(
+            NoctCordMediaICECandidate(
+                sdp: String(repeating: "c", count: NoctCordMediaICECandidate.maximumSDPBytes + 1),
+                sdpMid: "0",
+                sdpMLineIndex: 0
+            ).isStructurallyValid
+        )
+    }
+
     func testICEServerValidationAndWebRTCMapping() throws {
         let stun = try NoctCordMediaICEServer(url: "stun:stun.example.test:3478")
         let turn = try NoctCordMediaICEServer(

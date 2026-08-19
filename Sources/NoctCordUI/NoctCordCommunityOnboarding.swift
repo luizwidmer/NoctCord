@@ -1,6 +1,7 @@
 import SwiftUI
 import NoctCordCore
 @preconcurrency import NoctweaveCore
+import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
 #elseif os(iOS)
@@ -672,13 +673,42 @@ private struct NoctCordCodeOutput: View {
     }
 }
 
+@MainActor
 private enum NoctCordClipboard {
+    private static let lifetime: Duration = .seconds(120)
+
     static func copy(_ value: String) {
+        guard !value.isEmpty else { return }
         #if os(macOS)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(value, forType: .string)
+        let pasteboard = NSPasteboard.general
+        let item = NSPasteboardItem()
+        guard item.setString(value, forType: .string),
+              item.setString(
+                  "",
+                  forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
+              ),
+              item.setString(
+                  "",
+                  forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+              ) else {
+            return
+        }
+        pasteboard.clearContents()
+        guard pasteboard.writeObjects([item]) else { return }
+        let changeCount = pasteboard.changeCount
+        Task { @MainActor in
+            try? await Task.sleep(for: lifetime)
+            guard NSPasteboard.general.changeCount == changeCount else { return }
+            NSPasteboard.general.clearContents()
+        }
         #elseif os(iOS)
-        UIPasteboard.general.string = value
+        UIPasteboard.general.setItems(
+            [[UTType.plainText.identifier: value]],
+            options: [
+                .localOnly: true,
+                .expirationDate: Date().addingTimeInterval(120)
+            ]
+        )
         #endif
     }
 

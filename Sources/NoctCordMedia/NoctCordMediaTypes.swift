@@ -16,10 +16,26 @@ public struct NoctCordMediaRoomID: Codable, Hashable, Sendable, ExpressibleByStr
 
     public init(_ rawValue: String) throws {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty, value.utf8.count <= 256 else {
+        guard Self.isValid(value), value == rawValue else {
             throw NoctCordMediaError.invalidConfiguration("room id must be 1-256 UTF-8 bytes")
         }
         self.rawValue = value
+    }
+
+    public var isStructurallyValid: Bool { Self.isValid(rawValue) }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(values.decode(String.self, forKey: .rawValue))
+    }
+
+    private enum CodingKeys: String, CodingKey { case rawValue }
+
+    private static func isValid(_ value: String) -> Bool {
+        !value.isEmpty
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= 256
+            && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
     }
 
     public init(stringLiteral value: String) {
@@ -32,10 +48,26 @@ public struct NoctCordMediaParticipantID: Codable, Hashable, Sendable, Expressib
 
     public init(_ rawValue: String) throws {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty, value.utf8.count <= 256 else {
+        guard Self.isValid(value), value == rawValue else {
             throw NoctCordMediaError.invalidConfiguration("participant id must be 1-256 UTF-8 bytes")
         }
         self.rawValue = value
+    }
+
+    public var isStructurallyValid: Bool { Self.isValid(rawValue) }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(values.decode(String.self, forKey: .rawValue))
+    }
+
+    private enum CodingKeys: String, CodingKey { case rawValue }
+
+    private static func isValid(_ value: String) -> Bool {
+        !value.isEmpty
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= 256
+            && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
     }
 
     public init(stringLiteral value: String) {
@@ -233,10 +265,26 @@ public struct NoctCordMediaTrackID: Codable, Hashable, Sendable {
 
     public init(_ rawValue: String) throws {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty, value.utf8.count <= 256 else {
+        guard Self.isValid(value), value == rawValue else {
             throw NoctCordMediaError.invalidConfiguration("track id must be 1-256 UTF-8 bytes")
         }
         self.rawValue = value
+    }
+
+    public var isStructurallyValid: Bool { Self.isValid(rawValue) }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(values.decode(String.self, forKey: .rawValue))
+    }
+
+    private enum CodingKeys: String, CodingKey { case rawValue }
+
+    private static func isValid(_ value: String) -> Bool {
+        !value.isEmpty
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.count <= 256
+            && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
     }
 }
 

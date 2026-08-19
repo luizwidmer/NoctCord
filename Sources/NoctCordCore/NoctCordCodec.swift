@@ -8,6 +8,8 @@ public enum NoctCordCodecError: Error, Equatable {
 }
 
 public enum NoctCordCodec {
+    public static let maximumEventBytes = NoctweaveArchitectureV2.maximumContentPayloadBytes
+
     public static var contentType: ContentTypeId {
         ContentTypeId(authority: "org.noctcord", name: "event", major: 1)
     }
@@ -25,6 +27,9 @@ public enum NoctCordCodec {
     public static func encode(_ event: NoctCordEvent) throws -> EncodedContent {
         guard event.isStructurallyValid else { throw NoctCordCodecError.invalidEvent }
         let bytes = try NoctweaveCoder.encode(event, sortedKeys: true)
+        guard !bytes.isEmpty, bytes.count <= maximumEventBytes else {
+            throw NoctCordCodecError.invalidEvent
+        }
         let content = EncodedContent(
             type: contentType,
             parameters: ["space": event.spaceID.uuidString.lowercased()],
@@ -38,9 +43,20 @@ public enum NoctCordCodec {
 
     public static func decode(_ content: EncodedContent) throws -> NoctCordEvent {
         guard content.type == contentType else { throw NoctCordCodecError.unsupportedContent }
+        guard content.isStructurallyValid,
+              !content.payload.isEmpty,
+              content.payload.count <= maximumEventBytes,
+              content.fallbackText == "Noct Cord event",
+              content.disposition == .visible,
+              NoctweaveCanonicalJSON.isCanonical(content.payload) else {
+            throw NoctCordCodecError.invalidEvent
+        }
         let event = try NoctweaveCoder.decode(NoctCordEvent.self, from: content.payload)
         guard event.isStructurallyValid,
-              content.parameters["space"] == event.spaceID.uuidString.lowercased() else {
+              content.parameters == [
+                  "space": event.spaceID.uuidString.lowercased()
+              ],
+              try NoctweaveCoder.encode(event, sortedKeys: true) == content.payload else {
             throw NoctCordCodecError.invalidEvent
         }
         return event

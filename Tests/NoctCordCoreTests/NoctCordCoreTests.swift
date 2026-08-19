@@ -20,6 +20,73 @@ final class NoctCordCoreTests: XCTestCase {
         XCTAssertEqual(try NoctCordCodec.decode(content), event)
     }
 
+    func testContentDecoderRejectsNonCanonicalAndAmbiguousWrappers() throws {
+        let event = makeEvent(
+            author: handle(1),
+            clock: 1,
+            operation: .createSpace(name: "Noct Cord")
+        )
+        let content = try NoctCordCodec.encode(event)
+
+        var nonCanonicalPayload = content.payload
+        nonCanonicalPayload.append(0x20)
+        XCTAssertThrowsError(
+            try NoctCordCodec.decode(
+                EncodedContent(
+                    type: content.type,
+                    parameters: content.parameters,
+                    payload: nonCanonicalPayload,
+                    fallbackText: content.fallbackText,
+                    disposition: content.disposition
+                )
+            )
+        )
+
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: content.payload) as? [String: Any]
+        )
+        object["unexpected"] = true
+        let payloadWithUnknownField = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        XCTAssertTrue(NoctweaveCanonicalJSON.isCanonical(payloadWithUnknownField))
+        XCTAssertThrowsError(
+            try NoctCordCodec.decode(
+                EncodedContent(
+                    type: content.type,
+                    parameters: content.parameters,
+                    payload: payloadWithUnknownField,
+                    fallbackText: content.fallbackText,
+                    disposition: content.disposition
+                )
+            )
+        )
+
+        XCTAssertThrowsError(
+            try NoctCordCodec.decode(
+                EncodedContent(
+                    type: content.type,
+                    parameters: content.parameters.merging(["shadow": "1"]) { current, _ in current },
+                    payload: content.payload,
+                    fallbackText: content.fallbackText,
+                    disposition: content.disposition
+                )
+            )
+        )
+        XCTAssertThrowsError(
+            try NoctCordCodec.decode(
+                EncodedContent(
+                    type: content.type,
+                    parameters: content.parameters,
+                    payload: content.payload,
+                    fallbackText: "alternate interpretation",
+                    disposition: content.disposition
+                )
+            )
+        )
+    }
+
     func testGroupWrapperAcceptsNoctweaveCanonicalTimestampPrecision() throws {
         let event = NoctCordEvent(
             id: UUID(),

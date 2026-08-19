@@ -13,6 +13,9 @@ public enum NoctCordMediaSignalKind: String, Codable, CaseIterable, Sendable {
 }
 
 public struct NoctCordMediaICECandidate: Codable, Equatable, Sendable {
+    public static let maximumSDPBytes = 8 * 1_024
+    public static let maximumSDPMidBytes = 256
+
     public let sdp: String
     public let sdpMid: String?
     public let sdpMLineIndex: Int32
@@ -22,10 +25,23 @@ public struct NoctCordMediaICECandidate: Codable, Equatable, Sendable {
         self.sdpMid = sdpMid
         self.sdpMLineIndex = sdpMLineIndex
     }
+
+    public var isStructurallyValid: Bool {
+        !sdp.isEmpty
+            && sdp.utf8.count <= Self.maximumSDPBytes
+            && !sdp.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            && sdpMLineIndex >= 0
+            && (sdpMid.map {
+                !$0.isEmpty
+                    && $0.utf8.count <= Self.maximumSDPMidBytes
+                    && !$0.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            } ?? true)
+    }
 }
 
 /// Control-plane data only. Media samples never belong in a signaling envelope.
 public struct NoctCordMediaSignal: Codable, Equatable, Sendable {
+    public static let maximumSessionDescriptionBytes = 256 * 1_024
     public let kind: NoctCordMediaSignalKind
     public let value: String?
     public let iceCandidate: NoctCordMediaICECandidate?
@@ -63,19 +79,33 @@ public struct NoctCordMediaSignal: Codable, Equatable, Sendable {
     public static let screenShareStopped = Self(kind: .screenShareStopped)
 
     public var isStructurallyValid: Bool {
-        let valueIsValid = value.map { !$0.isEmpty && $0.utf8.count <= 256 * 1024 } ?? true
+        let valueIsValid = value.map {
+            !$0.isEmpty
+                && $0.utf8.count <= Self.maximumSessionDescriptionBytes
+                && !$0.unicodeScalars.contains(where: { $0.value == 0 })
+        } ?? true
         switch kind {
         case .join, .leave, .screenShareStopped:
             return value == nil && iceCandidate == nil && track == nil
         case .offer, .answer, .iceCandidate:
             if kind == .iceCandidate {
-                return track == nil && ((iceCandidate != nil && !iceCandidate!.sdp.isEmpty) || (valueIsValid && value != nil))
+                let legacyCandidateIsValid = value.map {
+                    !$0.isEmpty
+                        && $0.utf8.count <= NoctCordMediaICECandidate.maximumSDPBytes
+                        && !$0.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+                } ?? false
+                let structuredCandidateIsValid = iceCandidate?.isStructurallyValid == true
+                return track == nil
+                    && (legacyCandidateIsValid != structuredCandidateIsValid)
             }
             return valueIsValid && value != nil && iceCandidate == nil && track == nil
         case .microphoneState, .deafenState:
             return (value == "enabled" || value == "disabled") && iceCandidate == nil && track == nil
         case .screenShareStarted:
-            return value == nil && iceCandidate == nil && track?.cameraIndependent == true
+            return value == nil
+                && iceCandidate == nil
+                && track?.cameraIndependent == true
+                && track?.trackID.isStructurallyValid == true
         }
     }
 }
@@ -117,8 +147,9 @@ public struct NoctCordMediaSignalEnvelope: Codable, Equatable, Sendable {
     public var isStructurallyValid: Bool {
         schema == Self.schema
             && version == Self.version
-            && !roomID.rawValue.isEmpty
-            && !sender.rawValue.isEmpty
+            && roomID.isStructurallyValid
+            && sender.isStructurallyValid
+            && (recipient?.isStructurallyValid ?? true)
             && sequence > 0
             && timestampMilliseconds >= 0
             && signal.isStructurallyValid
@@ -145,7 +176,8 @@ public enum NoctCordMediaSignalingCodec {
         }
         do {
             let envelope = try JSONDecoder().decode(NoctCordMediaSignalEnvelope.self, from: data)
-            guard envelope.isStructurallyValid else {
+            guard envelope.isStructurallyValid,
+                  try encode(envelope) == data else {
                 throw NoctCordMediaError.invalidEnvelope("decoded envelope failed structural validation")
             }
             return envelope

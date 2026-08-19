@@ -178,7 +178,10 @@ public enum NoctCordCompactCodec {
             createdAt: createdAt,
             operation: operation
         )
-        guard event.isStructurallyValid else { throw NoctCordCompactCodecError.invalidRecord }
+        guard event.isStructurallyValid,
+              try encode(event) == data else {
+            throw NoctCordCompactCodecError.invalidRecord
+        }
         return event
     }
 }

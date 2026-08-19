@@ -26,8 +26,6 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
             realm: "turn.example.test",
             relayOnlySupported: true
         )
-        let port = UInt16.random(in: 42_000...56_000)
-        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
         let server = RelayServer(
             store: RelayStore(),
             configuration: RelayConfiguration(
@@ -38,9 +36,8 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
                 sharedSecret: "0123456789abcdef0123456789abcdef"
             ))
         )
-        try server.start(host: "127.0.0.1", port: port)
+        let endpoint = try await startOnEphemeralLoopbackPort(server)
         defer { server.stop() }
-        try await Task.sleep(for: .milliseconds(150))
 
         let client = try await makeClient(name: "ice-client", root: root)
         let coordinator = try NoctCordTransportCoordinator(
@@ -67,12 +64,9 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         )
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let port = UInt16.random(in: 42_000...56_000)
-        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
         let server = RelayServer(store: RelayStore())
-        try server.start(host: "127.0.0.1", port: port)
+        let endpoint = try await startOnEphemeralLoopbackPort(server)
         defer { server.stop() }
-        try await Task.sleep(for: .milliseconds(150))
 
         let client = try await makeClient(name: "direct-client", root: root)
         let configuration = try await NoctCordTransportCoordinator(
@@ -92,12 +86,9 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let port = UInt16.random(in: 42_000...56_000)
-        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
         let server = RelayServer(store: RelayStore(), opaqueRouteStore: OpaqueRouteRelayStoreV2())
-        try server.start(host: "127.0.0.1", port: port)
+        let endpoint = try await startOnEphemeralLoopbackPort(server)
         defer { server.stop() }
-        try await Task.sleep(for: .milliseconds(150))
 
         let owner = try await makeClient(name: "owner", root: root)
         let prospectiveMember = try await makeClient(name: "member", root: root)
@@ -185,12 +176,9 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let port = UInt16.random(in: 42_000...56_000)
-        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
         let server = RelayServer(store: RelayStore(), opaqueRouteStore: OpaqueRouteRelayStoreV2())
-        try server.start(host: "127.0.0.1", port: port)
+        let endpoint = try await startOnEphemeralLoopbackPort(server)
         defer { server.stop() }
-        try await Task.sleep(for: .milliseconds(150))
 
         let client = try await makeClient(name: "owner", root: root)
         let transport = try NoctCordTransportCoordinator(client: client, relay: endpoint)
@@ -302,15 +290,12 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let port = UInt16.random(in: 42_000...56_000)
-        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
         let server = RelayServer(
             store: RelayStore(),
             opaqueRouteStore: OpaqueRouteRelayStoreV2()
         )
-        try server.start(host: "127.0.0.1", port: port)
+        let endpoint = try await startOnEphemeralLoopbackPort(server)
         defer { server.stop() }
-        try await Task.sleep(for: .milliseconds(180))
 
         let owner = try await makeClient(name: "owner", root: root)
         let memberOne = try await makeClient(name: "member-one", root: root)
@@ -504,6 +489,25 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         XCTAssertEqual(received.map(\.author), [ownerHandle])
         XCTAssertEqual(received.map(\.signal), [signal])
         mark("realtime-signal-received")
+    }
+
+    private func startOnEphemeralLoopbackPort(
+        _ server: RelayServer
+    ) async throws -> RelayEndpoint {
+        let started = expectation(description: "relay started")
+        var boundPort: UInt16?
+        server.onEvent = { event in
+            if case .started(let port) = event {
+                boundPort = port
+                started.fulfill()
+            }
+        }
+        try server.start(host: "127.0.0.1", port: 0)
+        await fulfillment(of: [started], timeout: 5)
+        return RelayEndpoint(
+            host: "127.0.0.1",
+            port: try XCTUnwrap(boundPort)
+        )
     }
 
     private func makeClient(name: String, root: URL) async throws -> HeadlessMessagingClient {
