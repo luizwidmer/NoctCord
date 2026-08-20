@@ -14,6 +14,26 @@ enum NoctCordSecureFileError: Error {
 /// input. Final path components are never followed, byte counts are bounded,
 /// and private replacements are written atomically inside a mode-0700 folder.
 enum NoctCordSecureFileIO {
+    static func validateBoundedRegularFile(
+        at url: URL,
+        maximumBytes: Int
+    ) throws {
+        let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return -1 }
+            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else {
+            throw errno == ENOENT ? NoctCordSecureFileError.notFound : .inaccessible
+        }
+        defer { _ = close(descriptor) }
+        _ = try validateRegularDescriptor(
+            descriptor,
+            maximumBytes: maximumBytes,
+            allowEmpty: false,
+            requireCurrentUserOwner: false
+        )
+    }
+
     static func readBoundedRegularFile(
         at url: URL,
         maximumBytes: Int,

@@ -188,7 +188,7 @@ struct NoctCordChannelSidebar: View {
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(NoctCordTheme.secondaryText)
-                        .help("Space and identity settings")
+                        .help("Community settings")
                     }
 
                     HStack(spacing: 7) {
@@ -308,7 +308,7 @@ struct NoctCordChannelSidebar: View {
 
     private func currentIdentityFooter(_ space: NoctCordSpaceSession) -> some View {
         Button {
-            model.showsCommunitySettings = true
+            model.showsUserSettings = true
         } label: {
             HStack(spacing: 10) {
                 MemberMonogram(
@@ -336,7 +336,7 @@ struct NoctCordChannelSidebar: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Change the identity used in this space")
+        .help("Your profile, privacy, relays, and appearance")
     }
 
     private func relayColor(_ assessment: NoctCordRelayAssessment) -> Color {
@@ -937,6 +937,7 @@ struct NoctCordComposer: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .lineLimit(1...4)
+                .autocorrectionDisabled(model.privacySettings.secureTypingEnabled)
                 .focused($isFocused)
                 .disabled(!model.canSendInSelectedChannel)
                 .onSubmit { model.sendCurrentMessage() }

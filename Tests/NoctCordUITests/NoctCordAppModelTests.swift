@@ -1,9 +1,42 @@
 import NoctCordCore
 @testable import NoctCordUI
+@preconcurrency import NoctweaveCore
 import XCTest
 
 @MainActor
 final class NoctCordAppModelTests: XCTestCase {
+    func testStateScopesSeparateSandboxedAppFromDevelopmentRuns() {
+        let sandboxed = URL(fileURLWithPath:
+            "/Users/member/Library/Containers/org.noctweave.noctcord/Data/Library/Application Support/NoctCord/client-state.noctcord"
+        )
+        let development = URL(fileURLWithPath:
+            "/Users/member/Library/Application Support/NoctCord/client-state.noctcord"
+        )
+
+        XCTAssertEqual(
+            NoctCordTransportConfiguration.defaultStorageScopeIdentifier(
+                for: sandboxed
+            ),
+            "org.noctcord.client-state.macos-sandbox.v1"
+        )
+        XCTAssertEqual(
+            NoctCordTransportConfiguration.defaultStorageScopeIdentifier(
+                for: development
+            ),
+            "org.noctcord.client-state.v1"
+        )
+    }
+
+    func testRollbackFailureExplainsThatRelayWasNotContacted() {
+        let presentation = NoctCordConnectionFailurePresentation(
+            error: ClientStateStoreError.rollbackDetected
+        )
+
+        XCTAssertTrue(presentation.permitsLocalStateReset)
+        XCTAssertTrue(presentation.message.contains("rollback anchor"))
+        XCTAssertTrue(presentation.message.contains("No relay request was sent"))
+    }
+
     func testPreviewUsesRealProjectionAndDurableRealtimeRelayAssessment() {
         let model = NoctCordAppModel(seedPreviewData: true)
 
@@ -77,6 +110,57 @@ final class NoctCordAppModelTests: XCTestCase {
         XCTAssertEqual(model.spaces.first { $0.id == secondSpaceID }?.identityScope, .portable)
     }
 
+    func testDisplayNameCanUpdateAcrossPreviewCommunities() async throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let currentMembers = Dictionary(uniqueKeysWithValues: model.spaces.map {
+            ($0.id, $0.currentMember)
+        })
+
+        let updated = await model.updateDisplayName(
+            "River",
+            acrossAllCommunities: true
+        )
+
+        XCTAssertTrue(updated)
+        XCTAssertEqual(model.userDisplayName, "River")
+        for space in model.spaces {
+            let currentMember = try XCTUnwrap(currentMembers[space.id])
+            XCTAssertEqual(
+                space.members.first { $0.id == currentMember }?.displayName,
+                "River"
+            )
+        }
+    }
+
+    func testUserAndCommunitySettingsHaveIndependentPresentationState() {
+        let model = NoctCordAppModel(seedPreviewData: true)
+
+        model.showsUserSettings = true
+        XCTAssertTrue(model.showsUserSettings)
+        XCTAssertFalse(model.showsCommunitySettings)
+
+        model.showsUserSettings = false
+        model.showsCommunitySettings = true
+        XCTAssertFalse(model.showsUserSettings)
+        XCTAssertTrue(model.showsCommunitySettings)
+    }
+
+    func testPrivacyPreferencesCanChangeInPreviewMode() {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        var privacy = model.privacySettings
+        privacy.hideSensitiveWhenUnfocused = false
+        privacy.macBlockWindowCapture = false
+        privacy.secureTypingEnabled = false
+
+        model.setPrivacySettings(privacy)
+
+        XCTAssertEqual(model.privacySettings, privacy)
+        XCTAssertEqual(
+            model.settingsNotice,
+            "Privacy preferences are active on this device."
+        )
+    }
+
     func testMemberCannotCreateChannelWithoutPermission() {
         let model = NoctCordAppModel(seedPreviewData: true)
         let memberSpaceID = model.spaces[1].id
@@ -139,5 +223,31 @@ final class NoctCordAppModelTests: XCTestCase {
             model.selectedSpace?.projection.roleAssignments[member.id, default: []]
                 .contains(roleID) == true
         )
+    }
+
+    func testCommunityLifecycleControlsFollowTheLocalMembershipRole() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let ownerSpace = try XCTUnwrap(model.spaces.first)
+        let memberSpace = try XCTUnwrap(model.spaces.first(where: { !$0.isCurrentUserOwner }))
+
+        model.selectSpace(ownerSpace.id)
+        XCTAssertTrue(try XCTUnwrap(model.selectedSpace).isCurrentUserOwner)
+
+        model.selectSpace(memberSpace.id)
+        XCTAssertFalse(try XCTUnwrap(model.selectedSpace).isCurrentUserOwner)
+    }
+
+    func testPreviewMemberCanLeaveAndOwnerCanDestroy() async throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let ownerSpace = try XCTUnwrap(model.spaces.first(where: \.isCurrentUserOwner))
+        let memberSpace = try XCTUnwrap(model.spaces.first(where: { !$0.isCurrentUserOwner }))
+
+        model.selectSpace(memberSpace.id)
+        try await model.leaveSelectedCommunity()
+        XCTAssertFalse(model.spaces.contains { $0.id == memberSpace.id })
+
+        model.selectSpace(ownerSpace.id)
+        try await model.destroySelectedCommunity()
+        XCTAssertFalse(model.spaces.contains { $0.id == ownerSpace.id })
     }
 }

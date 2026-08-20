@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import NoctCordCore
 import NoctCordMedia
 @preconcurrency import NoctweaveCore
@@ -16,7 +17,9 @@ public enum NoctCordTransportError: Error, Equatable, LocalizedError {
     case unsupportedEvent
     case voiceRouteExpired
     case invitationPermissionDenied
-    case invitationRelayMismatch
+    case ownerCannotLeave
+    case communityOwnerRequired
+    case communityTerminal
 
     public var errorDescription: String? {
         switch self {
@@ -34,8 +37,12 @@ public enum NoctCordTransportError: Error, Equatable, LocalizedError {
             "This voice room needs an administrator to renew its encrypted realtime route."
         case .invitationPermissionDenied:
             "Only the community owner can complete this admission flow."
-        case .invitationRelayMismatch:
-            "Connect to the relay named by the invitation before preparing the join request."
+        case .ownerCannotLeave:
+            "The community owner cannot leave. Destroy the community instead."
+        case .communityOwnerRequired:
+            "Only the community owner can destroy this community."
+        case .communityTerminal:
+            "This community has already been left or destroyed."
         }
     }
 }
@@ -50,7 +57,7 @@ public struct NoctCordTransportConfiguration: Sendable {
 
     public init(
         stateURL: URL,
-        storageScopeIdentifier: String = "org.noctcord.client-state.v1",
+        storageScopeIdentifier: String? = nil,
         displayName: String,
         relay: RelayEndpoint,
         relayName: String,
@@ -58,10 +65,25 @@ public struct NoctCordTransportConfiguration: Sendable {
     ) {
         self.stateURL = stateURL
         self.storageScopeIdentifier = storageScopeIdentifier
+            ?? Self.defaultStorageScopeIdentifier(for: stateURL)
         self.displayName = displayName
         self.relay = relay
         self.relayName = relayName
         self.relayAccessPassword = relayAccessPassword
+    }
+
+    /// The sandboxed app and local `swift run` builds have different storage
+    /// containers. They must not share one Keychain rollback anchor because a
+    /// valid state file in either container is intentionally invisible to the
+    /// other and would otherwise look like a rollback attack.
+    public static func defaultStorageScopeIdentifier(for stateURL: URL) -> String {
+        let path = stateURL.standardizedFileURL.path
+        if path.contains("/Library/Containers/") {
+            return "org.noctcord.client-state.macos-sandbox.v1"
+        }
+        // Preserve the deployed development scope so existing unsandboxed
+        // state remains readable while production state is isolated.
+        return "org.noctcord.client-state.v1"
     }
 
     public var isStructurallyValid: Bool {
@@ -84,8 +106,52 @@ public struct NoctCordSpaceBootstrap: Sendable {
     public let relayAssessment: NoctCordRelayAssessment
 }
 
+public struct NoctCordRelayProfile: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let name: String
+    public let endpoint: RelayEndpoint
+    public let hasAccessPassword: Bool
+
+    public init(
+        id: UUID,
+        name: String,
+        endpoint: RelayEndpoint,
+        hasAccessPassword: Bool
+    ) {
+        self.id = id
+        self.name = name
+        self.endpoint = endpoint
+        self.hasAccessPassword = hasAccessPassword
+    }
+
+    public var address: String {
+        let scheme: String
+        switch endpoint.transport {
+        case .tcp:
+            scheme = endpoint.useTLS ? "tls" : "tcp"
+        case .http:
+            scheme = endpoint.useTLS ? "https" : "http"
+        case .websocket:
+            scheme = endpoint.useTLS ? "wss" : "ws"
+        }
+        return "\(scheme)://\(endpoint.host):\(endpoint.port)"
+    }
+}
+
 public struct NoctCordTransportPublication: Sendable {
     public let event: NoctCordEvent
+    public let operationID: UUID?
+    public let complete: Bool
+}
+
+public enum NoctCordCommunityLifecycleAction: String, Equatable, Sendable {
+    case leave
+    case destroy
+}
+
+public struct NoctCordCommunityLifecycleResult: Sendable {
+    public let spaceID: UUID
+    public let action: NoctCordCommunityLifecycleAction
     public let operationID: UUID?
     public let complete: Bool
 }
@@ -102,6 +168,8 @@ public struct NoctCordStoredSpaceSnapshot: Sendable {
     public let currentMember: GroupScopedMemberHandleV2
     public let members: [NoctCordTransportMember]
     public let events: [NoctCordEvent]
+    public let relay: RelayEndpoint
+    public let relayName: String
     public let relayAssessment: NoctCordRelayAssessment
 }
 
@@ -130,6 +198,7 @@ public struct NoctCordRelayICEConfiguration: Sendable {
 }
 
 private struct NoctCordRealtimeSubscriptionState: Sendable {
+    let spaceID: UUID
     let routeCapability: Data
     let subscriptionCapability: Data
     var cursor: UInt64
@@ -141,6 +210,9 @@ private struct NoctCordRealtimeSubscriptionState: Sendable {
 /// capabilities, or relay credentials to the SwiftUI layer.
 public actor NoctCordTransportCoordinator {
     private let client: HeadlessMessagingClient
+    /// Bootstrap/default relay for creating a community when the caller has
+    /// not selected one. Existing communities always resolve their own relay
+    /// from their encrypted group receive-route state.
     private let relay: RelayEndpoint
     private let relayAccessPassword: String?
     private var realtimeSubscriptions: [UUID: NoctCordRealtimeSubscriptionState] = [:]
@@ -172,6 +244,23 @@ public actor NoctCordTransportCoordinator {
         )
     }
 
+    /// Destructive recovery is deliberately explicit. The state store writes
+    /// a trusted tombstone before removing ciphertext, so replaying an older
+    /// database remains detectable after the reset.
+    public static func eraseLocalState(
+        configuration: NoctCordTransportConfiguration
+    ) async throws {
+        guard configuration.isStructurallyValid else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        let store = ClientStateStore(
+            fileURL: configuration.stateURL,
+            protection: .encrypted,
+            storageScopeIdentifier: configuration.storageScopeIdentifier
+        )
+        try await store.eraseAllLocalState()
+    }
+
     /// Test and embedding initializer. The caller owns the client's encrypted
     /// state-store policy and lifecycle.
     public init(
@@ -188,24 +277,105 @@ public actor NoctCordTransportCoordinator {
     }
 
     public func storedSpaceIDs() async -> [UUID] {
-        await client.snapshot().activePersona.groupRuntimes.map(\.groupId).sorted {
+        await client.snapshot().activePersona.groupRuntimes
+            .filter { $0.localRemoval == nil && $0.deletionState == nil }
+            .map(\.groupId).sorted {
             $0.uuidString < $1.uuidString
         }
     }
 
+    /// Retries only already-persisted work for every retained runtime,
+    /// including terminal records hidden from the active community list.
+    /// This is what lets an interrupted leave or destruction finish after a
+    /// restart without discarding the replay-rejection record.
+    public func maintainAllStoredCommunities(at date: Date = Date()) async {
+        let groupIDs = await client.snapshot().activePersona.groupRuntimes
+            .filter { runtime in
+                if let deletion = runtime.deletionState {
+                    return deletion.publicationState != .published
+                }
+                return runtime.localRemoval == nil
+                    && runtime.epochIntents.contains {
+                        $0.isLocalSelfRemoval && $0.phase != .finalized
+                    }
+            }
+            .map(\.groupId)
+            .sorted { $0.uuidString < $1.uuidString }
+        for groupID in groupIDs {
+            _ = try? await client.maintainGroup(groupID: groupID, at: date)
+        }
+    }
+
+    public func relayProfiles() async -> [NoctCordRelayProfile] {
+        await client.snapshot().relayPreferences
+            .map(Self.profile(from:))
+            .sorted {
+                if $0.name != $1.name {
+                    return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                }
+                return $0.address < $1.address
+            }
+    }
+
+    @discardableResult
+    public func addRelay(
+        endpoint: RelayEndpoint,
+        name: String,
+        accessPassword: String?
+    ) async throws -> NoctCordRelayProfile {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanPassword = accessPassword?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty,
+              cleanName.utf8.count <= 512,
+              cleanPassword?.utf8.count ?? 0 <= RelayClient.maxAuthenticationBytes,
+              (try? endpoint.isStructurallyValidThrowing) == true else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        let response = try await RelayClient(
+            endpoint: endpoint,
+            authToken: cleanPassword?.isEmpty == false ? cleanPassword : nil
+        ).send(.health(), timeout: 5)
+        guard response.status == .success, response.error == nil else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        try await client.upsertRelayPreference(
+            endpoint: endpoint,
+            name: cleanName,
+            accessPassword: cleanPassword?.isEmpty == false ? cleanPassword : nil
+        )
+        guard let preference = await client.snapshot().relayPreferences.first(where: {
+            $0.endpoint == endpoint
+        }) else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        return Self.profile(from: preference)
+    }
+
+    public func privacySettings() async -> PrivacySettings {
+        await client.snapshot().privacy
+    }
+
+    public func updatePrivacySettings(_ settings: PrivacySettings) async throws {
+        try await client.updatePrivacySettings(settings)
+    }
+
     public func createSpace(
         name: String,
+        relayPreferenceID: UUID? = nil,
         createdAt: Date = Date()
     ) async throws -> NoctCordSpaceBootstrap {
         guard NoctCordValidationBridge.isName(name),
               createdAt.timeIntervalSince1970.isFinite else {
             throw NoctCordTransportError.invalidConfiguration
         }
+        let selectedRelay = try await relayEndpoint(
+            forPreferenceID: relayPreferenceID
+        )
         let groupID = UUID()
         let generalChannelID = UUID()
         _ = try await client.createGroup(
             groupID: groupID,
-            relay: relay,
+            relay: selectedRelay,
             contentTypes: NoctCordCodec.contentCapabilities,
             createdAt: createdAt
         )
@@ -234,7 +404,7 @@ public actor NoctCordTransportCoordinator {
                 throw NoctCordTransportError.transportIncomplete
             }
         }
-        let infoResponse = try? await RelayClient(endpoint: relay).send(.info())
+        let infoResponse = try? await relayClient(for: selectedRelay).send(.info())
         let assessment: NoctCordRelayAssessment
         if case .relayInfo(let info)? = infoResponse?.successBody {
             assessment = NoctCordRelaySupport.assess(info)
@@ -287,10 +457,11 @@ public actor NoctCordTransportCoordinator {
         guard let digest = snapshot.signedState.digest else {
             throw NoctCordTransportError.eventRejected
         }
+        let communityRelay = try await relayEndpoint(for: spaceID)
         return try NoctCordCommunityInvitationV1.create(
             spaceID: spaceID,
             spaceName: spaceName,
-            relay: relay,
+            relay: communityRelay,
             baseEpoch: snapshot.signedState.epoch,
             baseStateDigest: digest,
             lifetime: lifetime,
@@ -308,13 +479,14 @@ public actor NoctCordTransportCoordinator {
         guard invitation.isValid(at: createdAt) else {
             throw NoctCordCommunityInvitationError.expiredInvitation
         }
-        guard invitation.relay == relay else {
-            throw NoctCordTransportError.invitationRelayMismatch
-        }
+        try await ensureRelayPreference(
+            endpoint: invitation.relay,
+            name: invitation.relay.host
+        )
         let prepared = try await client.prepareGroupAdmission(
             groupID: invitation.spaceID,
             invitationBindingDigest: invitation.invitationBindingDigest,
-            relay: relay,
+            relay: invitation.relay,
             contentTypes: NoctCordCodec.contentCapabilities,
             expiresAt: invitation.expiresAt,
             createdAt: createdAt
@@ -593,7 +765,8 @@ public actor NoctCordTransportCoordinator {
     }
 
     public func storedSpaceSnapshot(
-        spaceID: UUID
+        spaceID: UUID,
+        assessRelay: Bool = true
     ) async throws -> NoctCordStoredSpaceSnapshot {
         let runtime = try await client.openGroupRuntime(groupID: spaceID)
         let snapshot = await runtime.snapshot()
@@ -616,6 +789,8 @@ public actor NoctCordTransportCoordinator {
         })?.id else {
             throw NoctCordTransportError.eventRejected
         }
+        let communityRelay = try Self.relayEndpoint(from: snapshot)
+        let preference = await relayPreference(for: communityRelay)
         return NoctCordStoredSpaceSnapshot(
             spaceID: spaceID,
             owner: owner,
@@ -624,7 +799,172 @@ public actor NoctCordTransportCoordinator {
             events: snapshot.events
                 .compactMap { try? NoctCordCodec.unwrap($0) }
                 .sorted(by: NoctCordTransportCoordinator.canonicalEventOrder),
-            relayAssessment: await relayAssessment()
+            relay: communityRelay,
+            relayName: preference?.name ?? communityRelay.host,
+            relayAssessment: assessRelay
+                ? await relayAssessment(for: communityRelay)
+                : Self.offlineRelayAssessment()
+        )
+    }
+
+    /// Removes the local member through a signed group epoch transition. The
+    /// terminal runtime remains encrypted on this device so stale epochs and
+    /// replayed application traffic continue to fail closed.
+    @discardableResult
+    public func leaveCommunity(
+        spaceID: UUID,
+        createdAt: Date = Date()
+    ) async throws -> NoctCordCommunityLifecycleResult {
+        guard createdAt.timeIntervalSince1970.isFinite else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let snapshot = await runtime.snapshot()
+        guard snapshot.localRemoval == nil, snapshot.deletionState == nil else {
+            throw NoctCordTransportError.communityTerminal
+        }
+        let epoch = snapshot.signedState.epoch
+        let localHandle = snapshot.localCredential.memberHandle
+        guard let localMember = snapshot.signedState.members.first(where: {
+            $0.id == localHandle && $0.isActive(at: epoch)
+        }) else {
+            throw NoctCordTransportError.communityTerminal
+        }
+        guard localMember.role != .owner else {
+            throw NoctCordTransportError.ownerCannotLeave
+        }
+        let (nextEpoch, overflow) = epoch.addingReportingOverflow(1)
+        guard !overflow, let stateDigest = snapshot.signedState.digest else {
+            throw NoctCordTransportError.eventRejected
+        }
+        let proposedMembers = snapshot.signedState.members.map { member in
+            member.id == localHandle
+                ? GroupMemberV2(
+                    id: member.id,
+                    role: member.role,
+                    addedEpoch: member.addedEpoch,
+                    removedEpoch: nextEpoch
+                )
+                : member
+        }
+        let proposedCredentials = snapshot.signedState.memberCredentials.map { credential in
+            credential.memberHandle == localHandle && credential.isActive(at: epoch)
+                ? GroupMemberCredentialV2(
+                    memberHandle: credential.memberHandle,
+                    credentialHandle: credential.credentialHandle,
+                    admissionDigest: credential.admissionDigest,
+                    signingPublicKey: credential.signingPublicKey,
+                    agreementPublicKey: credential.agreementPublicKey,
+                    contentTypes: credential.contentTypes,
+                    addedEpoch: credential.addedEpoch,
+                    removedEpoch: nextEpoch
+                )
+                : credential
+        }
+        let idempotencyKey = Self.communityLifecycleIdempotencyKey(
+            action: .leave,
+            spaceID: spaceID,
+            epoch: epoch,
+            stateDigest: stateDigest,
+            memberHandle: localHandle
+        )
+        let prepared = try await client.prepareGroupEpoch(
+            groupID: spaceID,
+            operation: .removeMember,
+            proposedMembers: proposedMembers,
+            proposedCredentials: proposedCredentials,
+            proposedPermissions: snapshot.signedState.permissions,
+            proposedMetadataDigest: snapshot.signedState.metadataDigest,
+            idempotencyKey: idempotencyKey,
+            createdAt: createdAt
+        )
+        var complete = prepared.complete
+        if let operation = prepared.transportOperation {
+            complete = try await client.resumeGroupTransport(
+                groupID: spaceID,
+                operationID: operation.id,
+                at: createdAt
+            ).complete
+        }
+        guard complete else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        let finalizedRuntime = try await client.openGroupRuntime(groupID: spaceID)
+        guard await finalizedRuntime.snapshot().localRemoval != nil else {
+            throw NoctCordTransportError.eventRejected
+        }
+        await discardRealtimeSubscriptions(for: spaceID)
+        return NoctCordCommunityLifecycleResult(
+            spaceID: spaceID,
+            action: .leave,
+            operationID: prepared.transportOperation?.id,
+            complete: true
+        )
+    }
+
+    /// Publishes the owner's signed terminal tombstone to every currently
+    /// active remote credential. Relay-retained ciphertext is governed by the
+    /// operator's retention policy; the group itself cannot be resurrected.
+    @discardableResult
+    public func destroyCommunity(
+        spaceID: UUID,
+        createdAt: Date = Date()
+    ) async throws -> NoctCordCommunityLifecycleResult {
+        guard createdAt.timeIntervalSince1970.isFinite else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let snapshot = await runtime.snapshot()
+        guard snapshot.localRemoval == nil else {
+            throw NoctCordTransportError.communityTerminal
+        }
+        if let deletion = snapshot.deletionState,
+           deletion.origin != .local || deletion.publicationState != .pending {
+            throw NoctCordTransportError.communityTerminal
+        }
+        let epoch = snapshot.signedState.epoch
+        let localHandle = snapshot.localCredential.memberHandle
+        guard let localMember = snapshot.signedState.members.first(where: {
+            $0.id == localHandle && $0.isActive(at: epoch)
+        }), localMember.role == .owner else {
+            throw NoctCordTransportError.communityOwnerRequired
+        }
+        guard let stateDigest = snapshot.signedState.digest else {
+            throw NoctCordTransportError.eventRejected
+        }
+        let idempotencyKey = Self.communityLifecycleIdempotencyKey(
+            action: .destroy,
+            spaceID: spaceID,
+            epoch: epoch,
+            stateDigest: stateDigest,
+            memberHandle: localHandle
+        )
+        let prepared = try await client.prepareGroupDeletion(
+            groupID: spaceID,
+            idempotencyKey: idempotencyKey,
+            createdAt: createdAt
+        )
+        var complete = prepared.complete
+        if let operation = prepared.transportOperation {
+            complete = try await client.resumeGroupTransport(
+                groupID: spaceID,
+                operationID: operation.id,
+                at: createdAt
+            ).complete
+        }
+        guard complete else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        let finalizedRuntime = try await client.openGroupRuntime(groupID: spaceID)
+        guard await finalizedRuntime.snapshot().deletionState?.publicationState == .published else {
+            throw NoctCordTransportError.eventRejected
+        }
+        await discardRealtimeSubscriptions(for: spaceID)
+        return NoctCordCommunityLifecycleResult(
+            spaceID: spaceID,
+            action: .destroy,
+            operationID: prepared.transportOperation?.id,
+            complete: true
         )
     }
 
@@ -633,6 +973,11 @@ public actor NoctCordTransportCoordinator {
     }
 
     public func relayEndpoint() -> RelayEndpoint { relay }
+
+    public func relayEndpoint(for spaceID: UUID) async throws -> RelayEndpoint {
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        return try Self.relayEndpoint(from: await runtime.snapshot())
+    }
 
     public func testRelay(timeout: TimeInterval = 5) async throws {
         let response = try await RelayClient(
@@ -650,7 +995,25 @@ public actor NoctCordTransportCoordinator {
     public func discoverCallConnectivity(
         timeout: TimeInterval = 5
     ) async throws -> NoctCordRelayICEConfiguration {
-        let client = relayClient()
+        try await discoverCallConnectivity(endpoint: relay, timeout: timeout)
+    }
+
+    public func discoverCallConnectivity(
+        for spaceID: UUID,
+        timeout: TimeInterval = 5
+    ) async throws -> NoctCordRelayICEConfiguration {
+        let endpoint = try await relayEndpoint(for: spaceID)
+        return try await discoverCallConnectivity(
+            endpoint: endpoint,
+            timeout: timeout
+        )
+    }
+
+    private func discoverCallConnectivity(
+        endpoint: RelayEndpoint,
+        timeout: TimeInterval
+    ) async throws -> NoctCordRelayICEConfiguration {
+        let client = await relayClient(for: endpoint)
         let infoResponse = try await client.send(.info(), timeout: timeout)
         guard infoResponse.error == nil,
               case .relayInfo(let info)? = infoResponse.successBody else {
@@ -726,9 +1089,44 @@ public actor NoctCordTransportCoordinator {
         )
     }
 
+    public func attachmentTransfer(
+        for spaceID: UUID
+    ) async throws -> NoctCordAttachmentTransfer {
+        let endpoint = try await relayEndpoint(for: spaceID)
+        return NoctCordAttachmentTransfer(
+            relay: endpoint,
+            accessPassword: await relayPreference(for: endpoint)?.accessPassword
+        )
+    }
+
     public func createRealtimeRoute(
         lifetime: TimeInterval = 23 * 60 * 60,
         now: Date = Date()
+    ) async throws -> NoctCordRealtimeRouteV1 {
+        try await createRealtimeRoute(
+            endpoint: relay,
+            lifetime: lifetime,
+            now: now
+        )
+    }
+
+    public func createRealtimeRoute(
+        for spaceID: UUID,
+        lifetime: TimeInterval = 23 * 60 * 60,
+        now: Date = Date()
+    ) async throws -> NoctCordRealtimeRouteV1 {
+        let endpoint = try await relayEndpoint(for: spaceID)
+        return try await createRealtimeRoute(
+            endpoint: endpoint,
+            lifetime: lifetime,
+            now: now
+        )
+    }
+
+    private func createRealtimeRoute(
+        endpoint: RelayEndpoint,
+        lifetime: TimeInterval,
+        now: Date
     ) async throws -> NoctCordRealtimeRouteV1 {
         guard lifetime.isFinite, lifetime >= 60, lifetime <= 24 * 60 * 60 else {
             throw NoctCordTransportError.invalidConfiguration
@@ -742,10 +1140,8 @@ public actor NoctCordTransportCoordinator {
         guard request.isStructurallyValid else {
             throw NoctCordTransportError.invalidConfiguration
         }
-        let response = try await RelayClient(
-            endpoint: relay,
-            authToken: relayAccessPassword
-        ).send(.createRealtimeRouteV1(request))
+        let response = try await relayClient(for: endpoint)
+            .send(.createRealtimeRouteV1(request))
         guard response.error == nil,
               case .realtimeRouteCreated(let created)? = response.successBody,
               created.routeCapability == request.routeCapability,
@@ -800,7 +1196,8 @@ public actor NoctCordTransportCoordinator {
             recordID: signal.signalID,
             payload: payload
         )
-        let response = try await relayClient().send(.appendRealtimeRouteV1(append))
+        let response = try await relayClient(for: spaceID)
+            .send(.appendRealtimeRouteV1(append))
         guard response.error == nil,
               case .realtimeRouteAppend(let receipt)? = response.successBody,
               receipt.recordID == signal.signalID else {
@@ -825,13 +1222,16 @@ public actor NoctCordTransportCoordinator {
         guard room.realtimeRoute.expiresAt > now else {
             throw NoctCordTransportError.transportIncomplete
         }
+        let communityRelayClient = try await relayClient(for: spaceID)
         var subscription = try await realtimeSubscription(
+            spaceID: spaceID,
             room: room,
-            now: now
+            now: now,
+            relayClient: communityRelayClient
         )
         var received: [NoctCordReceivedRealtimeSignal] = []
         for _ in 0..<4 {
-            let response = try await relayClient().send(.syncRealtimeRouteV1(
+            let response = try await communityRelayClient.send(.syncRealtimeRouteV1(
                 RealtimeRouteSyncRequestV1(
                     routeCapability: room.realtimeRoute.routeCapability,
                     subscriptionCapability: subscription.subscriptionCapability,
@@ -865,10 +1265,22 @@ public actor NoctCordTransportCoordinator {
     }
 
     public func closeRealtimeRoom(roomID: UUID) async {
+        await closeRealtimeRoom(roomID: roomID, relayClient: relayClient())
+    }
+
+    public func closeRealtimeRoom(spaceID: UUID, roomID: UUID) async {
+        guard let client = try? await relayClient(for: spaceID) else { return }
+        await closeRealtimeRoom(roomID: roomID, relayClient: client)
+    }
+
+    private func closeRealtimeRoom(
+        roomID: UUID,
+        relayClient: RelayClient
+    ) async {
         guard let subscription = realtimeSubscriptions.removeValue(forKey: roomID) else {
             return
         }
-        _ = try? await relayClient().send(.unsubscribeRealtimeRouteV1(
+        _ = try? await relayClient.send(.unsubscribeRealtimeRouteV1(
             RealtimeRouteUnsubscribeRequestV1(
                 routeCapability: subscription.routeCapability,
                 subscriptionCapability: subscription.subscriptionCapability
@@ -877,18 +1289,15 @@ public actor NoctCordTransportCoordinator {
     }
 
     public func relayAssessment() async -> NoctCordRelayAssessment {
-        guard let response = try? await RelayClient(endpoint: relay).send(.info()),
+        await relayAssessment(for: relay)
+    }
+
+    public func relayAssessment(
+        for endpoint: RelayEndpoint
+    ) async -> NoctCordRelayAssessment {
+        guard let response = try? await relayClient(for: endpoint).send(.info()),
               case .relayInfo(let info)? = response.successBody else {
-            return NoctCordRelaySupport.assess(
-                RelayCapabilityManifestV2.advertised(
-                    attachmentsEnabled: false,
-                    wakeEnabled: false,
-                    hiddenRetrievalEnabled: false,
-                    onionEnabled: false,
-                    mixnetEnabled: false
-                ),
-                temporalBucketSeconds: 0
-            )
+            return Self.offlineRelayAssessment()
         }
         return NoctCordRelaySupport.assess(info)
     }
@@ -899,9 +1308,94 @@ public actor NoctCordTransportCoordinator {
         RelayClient(endpoint: relay, authToken: relayAccessPassword)
     }
 
+    private func relayClient(for spaceID: UUID) async throws -> RelayClient {
+        let endpoint = try await relayEndpoint(for: spaceID)
+        return await relayClient(for: endpoint)
+    }
+
+    private func relayClient(for endpoint: RelayEndpoint) async -> RelayClient {
+        RelayClient(
+            endpoint: endpoint,
+            authToken: await relayPreference(for: endpoint)?.accessPassword
+        )
+    }
+
+    private func relayPreference(
+        for endpoint: RelayEndpoint
+    ) async -> LocalRelayPreference? {
+        await client.snapshot().relayPreferences.first { $0.endpoint == endpoint }
+    }
+
+    private func relayEndpoint(
+        forPreferenceID preferenceID: UUID?
+    ) async throws -> RelayEndpoint {
+        guard let preferenceID else { return relay }
+        guard let preference = await client.snapshot().relayPreferences.first(where: {
+            $0.id == preferenceID
+        }) else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        return preference.endpoint
+    }
+
+    private func ensureRelayPreference(
+        endpoint: RelayEndpoint,
+        name: String
+    ) async throws {
+        if await relayPreference(for: endpoint) != nil { return }
+        try await client.upsertRelayPreference(
+            endpoint: endpoint,
+            name: name,
+            accessPassword: nil
+        )
+    }
+
+    private static func profile(
+        from preference: LocalRelayPreference
+    ) -> NoctCordRelayProfile {
+        NoctCordRelayProfile(
+            id: preference.id,
+            name: preference.name,
+            endpoint: preference.endpoint,
+            hasAccessPassword: preference.accessPassword?.isEmpty == false
+        )
+    }
+
+    private static func offlineRelayAssessment() -> NoctCordRelayAssessment {
+        NoctCordRelaySupport.assess(
+            RelayCapabilityManifestV2.advertised(
+                attachmentsEnabled: false,
+                wakeEnabled: false,
+                hiddenRetrievalEnabled: false,
+                onionEnabled: false,
+                mixnetEnabled: false
+            ),
+            temporalBucketSeconds: 0
+        )
+    }
+
+    private static func relayEndpoint(
+        from snapshot: GroupRuntimeRecord
+    ) throws -> RelayEndpoint {
+        if let active = snapshot.inboundTransport.localRoutes.first(where: {
+            $0.advertisedState == .active
+        }) {
+            return active.localRoute.relay
+        }
+        if let retained = snapshot.inboundTransport.localRoutes.first {
+            return retained.localRoute.relay
+        }
+        if let pending = snapshot.inboundTransport.pendingRoute {
+            return pending.relay
+        }
+        throw NoctCordTransportError.spaceNotFound
+    }
+
     private func realtimeSubscription(
+        spaceID: UUID,
         room: NoctCordCore.NoctCordVoiceRoom,
-        now: Date
+        now: Date,
+        relayClient: RelayClient
     ) async throws -> NoctCordRealtimeSubscriptionState {
         if let existing = realtimeSubscriptions[room.id],
            existing.routeCapability == room.realtimeRoute.routeCapability,
@@ -909,14 +1403,14 @@ public actor NoctCordTransportCoordinator {
             return existing
         }
         if let obsolete = realtimeSubscriptions.removeValue(forKey: room.id) {
-            _ = try? await relayClient().send(.unsubscribeRealtimeRouteV1(
+            _ = try? await relayClient.send(.unsubscribeRealtimeRouteV1(
                 RealtimeRouteUnsubscribeRequestV1(
                     routeCapability: obsolete.routeCapability,
                     subscriptionCapability: obsolete.subscriptionCapability
                 )
             ))
         }
-        let response = try await relayClient().send(.subscribeRealtimeRouteV1(
+        let response = try await relayClient.send(.subscribeRealtimeRouteV1(
             RealtimeRouteSubscribeRequestV1(
                 routeCapability: room.realtimeRoute.routeCapability,
                 readCapability: room.realtimeRoute.readCapability
@@ -928,6 +1422,7 @@ public actor NoctCordTransportCoordinator {
             throw NoctCordTransportError.transportIncomplete
         }
         let state = NoctCordRealtimeSubscriptionState(
+            spaceID: spaceID,
             routeCapability: created.routeCapability,
             subscriptionCapability: created.subscriptionCapability,
             cursor: created.nextSequence,
@@ -935,6 +1430,46 @@ public actor NoctCordTransportCoordinator {
         )
         realtimeSubscriptions[room.id] = state
         return state
+    }
+
+    private func discardRealtimeSubscriptions(for spaceID: UUID) async {
+        let roomIDs = realtimeSubscriptions.compactMap { roomID, state in
+            state.spaceID == spaceID ? roomID : nil
+        }
+        guard !roomIDs.isEmpty else { return }
+        let relayClient = try? await relayClient(for: spaceID)
+        for roomID in roomIDs {
+            guard let state = realtimeSubscriptions.removeValue(forKey: roomID) else {
+                continue
+            }
+            if let relayClient {
+                _ = try? await relayClient.send(.unsubscribeRealtimeRouteV1(
+                    RealtimeRouteUnsubscribeRequestV1(
+                        routeCapability: state.routeCapability,
+                        subscriptionCapability: state.subscriptionCapability
+                    )
+                ))
+            }
+        }
+    }
+
+    private static func communityLifecycleIdempotencyKey(
+        action: NoctCordCommunityLifecycleAction,
+        spaceID: UUID,
+        epoch: UInt64,
+        stateDigest: Data,
+        memberHandle: GroupScopedMemberHandleV2
+    ) -> Data {
+        var material = Data("org.noctcord/community-lifecycle/v1\0".utf8)
+        material.append(Data(action.rawValue.utf8))
+        material.append(0)
+        material.append(Data(spaceID.uuidString.lowercased().utf8))
+        material.append(0)
+        material.append(Data(String(epoch).utf8))
+        material.append(0)
+        material.append(stateDigest)
+        material.append(Data(memberHandle.rawValue.utf8))
+        return Data(SHA256.hash(data: material))
     }
 
     private static func projectedRoom(

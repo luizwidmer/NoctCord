@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 
 public struct NoctCordRootView: View {
     @StateObject private var model: NoctCordAppModel
+    @Environment(\.scenePhase) private var scenePhase
 
     public init(seedPreviewData: Bool = false) {
         _model = StateObject(
@@ -70,6 +71,9 @@ public struct NoctCordRootView: View {
         .sheet(isPresented: $model.showsCommunitySettings) {
             NoctCordCommunitySettingsSheet(model: model)
         }
+        .sheet(isPresented: $model.showsUserSettings) {
+            NoctCordUserSettingsSheet(model: model)
+        }
         .sheet(
             isPresented: Binding(
                 get: { model.selectedAttachmentID != nil },
@@ -102,6 +106,19 @@ public struct NoctCordRootView: View {
                     .background(NoctCordTheme.elevated, in: Capsule())
                     .overlay { Capsule().stroke(NoctCordTheme.border) }
                     .padding(16)
+            }
+        }
+        .background {
+            NoctCordWindowCaptureProtection(
+                blocked: model.privacySettings.macBlockWindowCapture
+            )
+            .frame(width: 0, height: 0)
+        }
+        .overlay {
+            if model.privacySettings.hideSensitiveWhenUnfocused,
+               scenePhase != .active,
+               !shouldShowSetup {
+                NoctCordPrivacyShield()
             }
         }
     }
@@ -144,6 +161,7 @@ private struct NoctCordSetupView: View {
     @State private var turnUsername = ""
     @State private var turnCredential = ""
     @State private var validationError: String?
+    @State private var showsLocalStateResetConfirmation = false
 
     var body: some View {
         ZStack {
@@ -156,54 +174,59 @@ private struct NoctCordSetupView: View {
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
-            ScrollView {
-                VStack(spacing: 22) {
-                    NoctCordMark()
-                        .frame(width: 76, height: 76)
+            GeometryReader { proxy in
+                ScrollView {
+                    VStack(spacing: 0) {
+                        Spacer(minLength: 38)
+                        VStack(spacing: 22) {
+                            NoctCordMark()
+                                .frame(width: 76, height: 76)
 
-                    VStack(spacing: 7) {
-                        Text(stageTitle)
-                            .font(.system(size: 28, weight: .bold, design: .rounded))
-                        Text(stageSubtitle)
-                            .font(.system(size: 12.5))
+                            VStack(spacing: 7) {
+                                Text(stageTitle)
+                                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                                Text(stageSubtitle)
+                                    .font(.system(size: 12.5))
+                                    .foregroundStyle(NoctCordTheme.secondaryText)
+                                    .multilineTextAlignment(.center)
+                                    .frame(maxWidth: 480)
+                            }
+
+                            HStack(spacing: 7) {
+                                ForEach(Stage.allCases, id: \.rawValue) { item in
+                                    Capsule()
+                                        .fill(
+                                            item.rawValue <= stage.rawValue
+                                                ? NoctCordTheme.mutedCoral
+                                                : NoctCordTheme.secondaryText.opacity(0.20)
+                                        )
+                                        .frame(
+                                            width: item == stage ? 28 : 8,
+                                            height: 8
+                                        )
+                                }
+                            }
+
+                            stageContent
+                                .padding(23)
+                                .frame(maxWidth: 540)
+                                .noctCordPanel(radius: 28, elevated: true)
+
+                            Label(
+                                "Encrypted locally · relay-blind content · no central Noct Cord account",
+                                systemImage: "lock.shield.fill"
+                            )
+                            .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(NoctCordTheme.secondaryText)
                             .multilineTextAlignment(.center)
-                            .frame(maxWidth: 480)
-                    }
-
-                    HStack(spacing: 7) {
-                        ForEach(Stage.allCases, id: \.rawValue) { item in
-                            Capsule()
-                                .fill(
-                                    item.rawValue <= stage.rawValue
-                                        ? NoctCordTheme.mutedCoral
-                                        : NoctCordTheme.secondaryText.opacity(0.20)
-                                )
-                                .frame(
-                                    width: item == stage ? 28 : 8,
-                                    height: 8
-                                )
                         }
+                        .padding(.horizontal, 28)
+                        Spacer(minLength: 38)
                     }
-
-                    stageContent
-                        .padding(23)
-                        .frame(maxWidth: 540)
-                        .noctCordPanel(radius: 28, elevated: true)
-
-                    Label(
-                        "Encrypted locally · relay-blind content · no central Noct Cord account",
-                        systemImage: "lock.shield.fill"
-                    )
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(NoctCordTheme.secondaryText)
-                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, minHeight: proxy.size.height)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, 28)
-                .padding(.vertical, 38)
+                .id(stage.rawValue)
             }
-            .id(stage.rawValue)
         }
         .onAppear {
             if displayName.isEmpty { displayName = savedDisplayName }
@@ -218,6 +241,17 @@ private struct NoctCordSetupView: View {
                 stage = .relay
                 connect()
             }
+        }
+        .alert(
+            "Reset local transport state?",
+            isPresented: $showsLocalStateResetConfirmation
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Reset and reconnect", role: .destructive) {
+                connect(resetLocalState: true)
+            }
+        } message: {
+            Text("This permanently removes Noct Cord's local encrypted community transport state from this app container. A rollback-protected tombstone is kept so old state cannot be replayed.")
         }
     }
 
@@ -398,10 +432,18 @@ private struct NoctCordSetupView: View {
             }
             validationView
             if case .failed(let message) = model.connectionState {
-                Label(message, systemImage: "network.slash")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(NoctCordTheme.mutedCoral)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 10) {
+                    Label(message, systemImage: "network.slash")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(NoctCordTheme.mutedCoral)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if model.permitsLocalStateReset {
+                        Button("Reset local transport state…") {
+                            showsLocalStateResetConfirmation = true
+                        }
+                        .buttonStyle(NoctCordSecondaryButtonStyle())
+                    }
+                }
             }
             HStack {
                 Button("Back") { stage = .profile }
@@ -482,7 +524,7 @@ private struct NoctCordSetupView: View {
         }
     }
 
-    private func connect() {
+    private func connect(resetLocalState: Bool = false) {
         validationError = nil
         let cleanName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanName.isEmpty, cleanName.utf8.count <= 128 else {
@@ -533,10 +575,17 @@ private struct NoctCordSetupView: View {
             let turnURLToSave = turnURL.trimmingCharacters(in: .whitespacesAndNewlines)
             let turnUsernameToSave = turnUsername.trimmingCharacters(in: .whitespacesAndNewlines)
             Task {
-                await model.connect(
-                    configuration: configuration,
-                    iceServers: iceServers
-                )
+                if resetLocalState {
+                    await model.resetLocalStateAndConnect(
+                        configuration: configuration,
+                        iceServers: iceServers
+                    )
+                } else {
+                    await model.connect(
+                        configuration: configuration,
+                        iceServers: iceServers
+                    )
+                }
                 if model.connectionState == .ready {
                     savedDisplayName = cleanName
                     savedRelayAddress = relayAddressToSave
@@ -640,6 +689,7 @@ private struct CreateSpaceSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var scope: NoctCordIdentityScope = .isolated
+    @State private var relayPreferenceID: UUID?
 
     var body: some View {
         NoctCordSheetShell(
@@ -684,12 +734,32 @@ private struct CreateSpaceSheet: View {
                     )
                 }
 
+                if !model.relayProfiles.isEmpty {
+                    VStack(alignment: .leading, spacing: 9) {
+                        Text("RELAY FOR THIS COMMUNITY")
+                            .font(.system(size: 10, weight: .bold))
+                            .tracking(0.8)
+                            .foregroundStyle(NoctCordTheme.secondaryText)
+                        ForEach(model.relayProfiles) { relay in
+                            relayOption(relay)
+                        }
+                        Text("This choice applies only to the new community. Your other communities keep their own relay routes.")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(NoctCordTheme.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
                 HStack {
                     Button("Cancel") { dismiss() }
                         .buttonStyle(NoctCordSecondaryButtonStyle())
                     Spacer()
                     Button("Create space") {
-                        model.createSpace(name: name, identityScope: scope)
+                        model.createSpace(
+                            name: name,
+                            identityScope: scope,
+                            relayPreferenceID: relayPreferenceID
+                        )
                         dismiss()
                     }
                     .buttonStyle(NoctCordPrimaryButtonStyle())
@@ -697,6 +767,45 @@ private struct CreateSpaceSheet: View {
                 }
             }
         }
+        .onAppear {
+            if relayPreferenceID == nil {
+                relayPreferenceID = model.relayProfiles.first?.id
+            }
+        }
+    }
+
+    private func relayOption(_ relay: NoctCordRelayProfile) -> some View {
+        let selected = relayPreferenceID == relay.id
+        return Button {
+            relayPreferenceID = relay.id
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: relay.endpoint.useTLS ? "lock.shield.fill" : "network")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(selected ? NoctCordTheme.mutedCoral : NoctCordTheme.secondaryText)
+                    .frame(width: 34, height: 34)
+                    .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(relay.name)
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Text(relay.address)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(NoctCordTheme.secondaryText)
+                }
+                Spacer()
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(selected ? NoctCordTheme.mutedCoral : NoctCordTheme.secondaryText)
+            }
+            .padding(12)
+            .background(
+                selected ? NoctCordTheme.mutedCoral.opacity(0.10) : NoctCordTheme.surface,
+                in: RoundedRectangle(cornerRadius: 14)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 14).stroke(NoctCordTheme.border)
+            }
+        }
+        .buttonStyle(.plain)
     }
 
     private func identityOption(

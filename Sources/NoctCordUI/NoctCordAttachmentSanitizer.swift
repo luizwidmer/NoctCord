@@ -75,6 +75,16 @@ public enum NoctCordAttachmentSanitizer {
         defer {
             if accessed { url.stopAccessingSecurityScopedResource() }
         }
+        do {
+            try NoctCordSecureFileIO.validateBoundedRegularFile(
+                at: url,
+                maximumBytes: maximumSourceAVBytes
+            )
+        } catch NoctCordSecureFileError.tooLarge {
+            throw NoctCordAttachmentSanitizerError.tooLarge
+        } catch {
+            throw NoctCordAttachmentSanitizerError.inaccessible
+        }
         guard let type = UTType(filenameExtension: url.pathExtension.lowercased()) else {
             throw NoctCordAttachmentSanitizerError.unsupportedType
         }

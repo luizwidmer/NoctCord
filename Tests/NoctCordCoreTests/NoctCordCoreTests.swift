@@ -250,6 +250,58 @@ final class NoctCordCoreTests: XCTestCase {
         )
     }
 
+    func testNewerSignedIdentityBindingUpdatesDisplayName() throws {
+        let owner = handle(1)
+        let key = try NoctCordIdentityKeyV1.generate(scope: .isolated)
+        let firstProfile = try key.publicProfile(
+            displayName: "Luna",
+            createdAt: timestamp
+        )
+        let firstBinding = try key.bind(
+            profile: firstProfile,
+            to: spaceID,
+            memberHandle: owner,
+            issuedAt: timestamp.addingTimeInterval(1)
+        )
+        let renamedProfile = try key.publicProfile(
+            displayName: "River",
+            createdAt: timestamp.addingTimeInterval(2)
+        )
+        let renamedBinding = try key.bind(
+            profile: renamedProfile,
+            to: spaceID,
+            memberHandle: owner,
+            issuedAt: timestamp.addingTimeInterval(2)
+        )
+
+        let result = project(
+            [
+                makeEvent(
+                    author: owner,
+                    clock: 1,
+                    operation: .bindIdentity(firstBinding)
+                ),
+                makeEvent(
+                    author: owner,
+                    clock: 2,
+                    operation: .bindIdentity(renamedBinding)
+                ),
+            ],
+            owner: owner,
+            members: [owner]
+        )
+
+        XCTAssertTrue(result.rejectedEvents.isEmpty)
+        XCTAssertEqual(
+            result.projection.identityBindings[owner]?.profile.displayName,
+            "River"
+        )
+        XCTAssertEqual(
+            result.projection.identityBindings[owner]?.profile.identityID,
+            firstProfile.identityID
+        )
+    }
+
     func testOwnerBootstrapRestoresConfigurationAfterJoinRequest() throws {
         let owner = handle(1)
         let member = handle(2)

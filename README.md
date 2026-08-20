@@ -44,6 +44,27 @@ relay plaintext application authority.
   Channel creation, messages, edits, reactions, pins, roles, and voice-room
   state are versioned Noct Cord events. The coordinator publishes through
   `HeadlessMessagingClient` and reloads events with the group sync API.
+- **Relay-independent communities.** One encrypted client state can retain
+  communities on different relays. Joining an invitation registers its relay
+  without moving existing communities, saved relays can be selected when a new
+  community is created, and each community's sync, attachments, calls, and
+  relay assessment use its own stored route. An outage on the setup relay does
+  not prevent the app from opening already stored communities.
+- **Authenticated community exit.** A member can leave by publishing a signed
+  self-removal epoch that removes every active credential scoped to that
+  membership. The owner can instead destroy the community with an
+  owner-authorized terminal tombstone delivered to current members. Left and
+  destroyed communities disappear from the active UI, while their encrypted
+  terminal records remain locally to reject stale epochs and replayed traffic;
+  relay-retained ciphertext remains governed by the operator's retention
+  policy.
+- **Local profile and privacy controls.** The profile menu is separate from
+  community administration. A member can publish a newly signed display name
+  to one or every local community, choose isolated or intentionally portable
+  identity scope per community, hide content when the app is unfocused, ask
+  macOS to exclude the window from ordinary capture APIs, and disable typing
+  assistance in the composer. These controls do not create a global account or
+  claim protection from a compromised operating system.
 - **Roles and channel access.** Ordered roles provide bounded community
   capabilities, while per-channel everyone/role overrides control viewing,
   sending, attachments, reactions, moderation, and application commands.
@@ -154,11 +175,15 @@ Scripts/build-macos-app.sh debug
 open "dist/Noct Cord.app"
 ```
 
-The packaging script creates an App Sandbox and hardened-runtime bundle. It
-uses ad-hoc signing by default; set `NOCTCORD_CODESIGN_IDENTITY` to a suitable
-Developer ID identity for distribution signing. The sandbox permits relay and
-WebRTC networking, microphone capture, and read-only access to files the user
-selects. Existing pre-sandbox local state is not imported automatically.
+The packaging script creates an App Sandbox bundle. It uses launchable ad-hoc
+signing by default; set `NOCTCORD_CODESIGN_IDENTITY` to a suitable Developer ID
+identity to enable the hardened runtime, secure timestamping, and distribution
+signing. The sandbox permits relay and WebRTC networking, microphone capture,
+and read-only access to files the user selects. Existing pre-sandbox local state
+is not imported automatically. Sandboxed bundles and local `swift run` builds
+use separate Keychain rollback-anchor scopes; a mismatch inside either scope
+fails before relay I/O and can be cleared only through the explicit destructive
+reset shown by the setup flow.
 
 For local UI inspection, a debug bundle can start with deterministic sample
 spaces by launching its executable with `NOCTCORD_PREVIEW_DATA=1`. Release

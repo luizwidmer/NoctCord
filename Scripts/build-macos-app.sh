@@ -47,11 +47,11 @@ if [[ -f "$repository_dir/Resources/NoctCordIcon.icns" ]]; then
     cp "$repository_dir/Resources/NoctCordIcon.icns" "$contents_path/Resources/NoctCordIcon.icns"
 fi
 chmod 755 "$contents_path/MacOS/NoctCordApp"
-signing_options=(--force --options runtime --sign "$codesign_identity")
+signing_options=(--force --sign "$codesign_identity")
 if [[ "$codesign_identity" == "-" ]]; then
     signing_options+=(--timestamp=none)
 else
-    signing_options+=(--timestamp)
+    signing_options+=(--options runtime --timestamp)
 fi
 codesign "${signing_options[@]}" "$contents_path/Frameworks/WebRTC.framework"
 codesign \

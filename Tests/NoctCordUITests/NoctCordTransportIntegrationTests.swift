@@ -7,6 +7,70 @@ import NoctCordMedia
 import XCTest
 
 final class NoctCordTransportIntegrationTests: XCTestCase {
+    func testCommunitiesCanUseDifferentRelaysInOneClientState() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctcord-multi-relay-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let firstServer = RelayServer(
+            store: RelayStore(),
+            opaqueRouteStore: OpaqueRouteRelayStoreV2()
+        )
+        let secondServer = RelayServer(
+            store: RelayStore(),
+            opaqueRouteStore: OpaqueRouteRelayStoreV2()
+        )
+        let firstEndpoint = try await startOnEphemeralLoopbackPort(firstServer)
+        let secondEndpoint = try await startOnEphemeralLoopbackPort(secondServer)
+        defer {
+            firstServer.stop()
+            secondServer.stop()
+        }
+
+        let client = try await makeClient(name: "multi-relay", root: root)
+        let transport = try NoctCordTransportCoordinator(
+            client: client,
+            relay: firstEndpoint
+        )
+        let secondProfile = try await transport.addRelay(
+            endpoint: secondEndpoint,
+            name: "Second relay",
+            accessPassword: nil
+        )
+        let first = try await transport.createSpace(name: "First relay space")
+        let second = try await transport.createSpace(
+            name: "Second relay space",
+            relayPreferenceID: secondProfile.id
+        )
+        let firstResolvedRelay = try await transport.relayEndpoint(for: first.spaceID)
+        let secondResolvedRelay = try await transport.relayEndpoint(for: second.spaceID)
+        let firstSnapshot = try await transport.storedSpaceSnapshot(
+            spaceID: first.spaceID
+        )
+        let secondSnapshot = try await transport.storedSpaceSnapshot(
+            spaceID: second.spaceID
+        )
+
+        XCTAssertEqual(firstResolvedRelay, firstEndpoint)
+        XCTAssertEqual(secondResolvedRelay, secondEndpoint)
+        XCTAssertEqual(firstSnapshot.relay, firstEndpoint)
+        XCTAssertEqual(secondSnapshot.relay, secondEndpoint)
+
+        firstServer.stop()
+        let publication = try await transport.publishOperation(
+            spaceID: second.spaceID,
+            operation: .postMessage(
+                id: UUID(),
+                channelID: second.generalChannelID,
+                text: "The other community relay is offline"
+            )
+        )
+        XCTAssertTrue(publication.complete)
+    }
+
     func testRelayAdvertisedCoturnIsDiscoveredWithTemporaryCredentials() async throws {
         let relayPassword = "correct horse battery staple"
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -166,6 +230,116 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         XCTAssertTrue(ownerAfterReply.events.contains {
             $0.operation.messageID == memberMessageID
         })
+    }
+
+    func testMembersLeaveAndOwnersDestroyWithRetainedTerminalRecords() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctcord-community-lifecycle-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let server = RelayServer(
+            store: RelayStore(),
+            opaqueRouteStore: OpaqueRouteRelayStoreV2()
+        )
+        let endpoint = try await startOnEphemeralLoopbackPort(server)
+        defer { server.stop() }
+
+        let owner = try await makeClient(name: "lifecycle-owner", root: root)
+        let member = try await makeClient(name: "lifecycle-member", root: root)
+        let ownerTransport = try NoctCordTransportCoordinator(client: owner, relay: endpoint)
+        let memberTransport = try NoctCordTransportCoordinator(client: member, relay: endpoint)
+        let startedAt = NoctweaveRendezvousV2.canonicalTimestamp(
+            Date().addingTimeInterval(-30)
+        )
+
+        let leaveGroupID = UUID()
+        _ = try await owner.createGroup(
+            groupID: leaveGroupID,
+            relay: endpoint,
+            contentTypes: NoctCordCodec.contentCapabilities,
+            createdAt: startedAt
+        )
+        try await admit(
+            member,
+            to: leaveGroupID,
+            owner: owner,
+            relay: endpoint,
+            existingMembers: [],
+            seed: 0x61,
+            startedAt: startedAt.addingTimeInterval(2)
+        )
+
+        do {
+            _ = try await ownerTransport.leaveCommunity(spaceID: leaveGroupID)
+            XCTFail("the owner must not be able to orphan a community")
+        } catch {
+            XCTAssertEqual(error as? NoctCordTransportError, .ownerCannotLeave)
+        }
+        do {
+            _ = try await memberTransport.destroyCommunity(spaceID: leaveGroupID)
+            XCTFail("a non-owner must not be able to destroy a community")
+        } catch {
+            XCTAssertEqual(error as? NoctCordTransportError, .communityOwnerRequired)
+        }
+
+        let leaveResult = try await memberTransport.leaveCommunity(
+            spaceID: leaveGroupID
+        )
+        XCTAssertTrue(leaveResult.complete)
+        XCTAssertEqual(leaveResult.action, .leave)
+        let removedMemberRuntime = await (try member.openGroupRuntime(
+            groupID: leaveGroupID
+        )).snapshot()
+        XCTAssertNotNil(removedMemberRuntime.localRemoval)
+        let memberActiveGroupsAfterLeave = await memberTransport.storedSpaceIDs()
+        XCTAssertFalse(memberActiveGroupsAfterLeave.contains(leaveGroupID))
+
+        _ = try await ownerTransport.synchronize(spaceID: leaveGroupID)
+        let ownerAfterLeave = try await ownerTransport.storedSpaceSnapshot(
+            spaceID: leaveGroupID
+        )
+        XCTAssertEqual(ownerAfterLeave.members.map(\.handle), [ownerAfterLeave.currentMember])
+
+        let destroyGroupID = UUID()
+        _ = try await owner.createGroup(
+            groupID: destroyGroupID,
+            relay: endpoint,
+            contentTypes: NoctCordCodec.contentCapabilities,
+            createdAt: startedAt.addingTimeInterval(10)
+        )
+        try await admit(
+            member,
+            to: destroyGroupID,
+            owner: owner,
+            relay: endpoint,
+            existingMembers: [],
+            seed: 0x71,
+            startedAt: startedAt.addingTimeInterval(12)
+        )
+
+        let destruction = try await ownerTransport.destroyCommunity(
+            spaceID: destroyGroupID
+        )
+        XCTAssertTrue(destruction.complete)
+        XCTAssertEqual(destruction.action, .destroy)
+        let ownerActiveGroupsAfterDestroy = await ownerTransport.storedSpaceIDs()
+        XCTAssertFalse(ownerActiveGroupsAfterDestroy.contains(destroyGroupID))
+
+        _ = try await memberTransport.synchronize(spaceID: destroyGroupID)
+        let destroyedMemberRuntime = await (try member.openGroupRuntime(
+            groupID: destroyGroupID
+        )).snapshot()
+        XCTAssertNotNil(destroyedMemberRuntime.deletionState)
+        let memberActiveGroupsAfterDestroy = await memberTransport.storedSpaceIDs()
+        XCTAssertFalse(memberActiveGroupsAfterDestroy.contains(destroyGroupID))
+
+        let retainedOwnerGroups = await owner.snapshot().activePersona.groupRuntimes
+        let retainedMemberGroups = await member.snapshot().activePersona.groupRuntimes
+        XCTAssertTrue(retainedOwnerGroups.contains { $0.groupId == destroyGroupID })
+        XCTAssertTrue(retainedMemberGroups.contains { $0.groupId == leaveGroupID })
     }
 
     func testSingleMemberRoomCanPublishAndReadRealtimeSignal() async throws {

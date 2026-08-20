@@ -19,6 +19,34 @@ public enum NoctCordConnectionState: Equatable, Sendable {
     case failed(String)
 }
 
+struct NoctCordConnectionFailurePresentation: Equatable {
+    let message: String
+    let permitsLocalStateReset: Bool
+
+    init(error: Error) {
+        guard let storeError = error as? ClientStateStoreError else {
+            message = error.localizedDescription
+            permitsLocalStateReset = false
+            return
+        }
+        permitsLocalStateReset = storeError == .rollbackDetected
+        switch storeError {
+        case .encryptionFailed:
+            message = "Noct Cord could not decrypt its protected local transport state. No relay request was sent."
+        case .stateTooLarge:
+            message = "The protected local transport state exceeds the safe size limit. No relay request was sent."
+        case .rollbackAnchorUnavailable:
+            message = "The Keychain rollback anchor is unavailable. Unlock Keychain access and try again."
+        case .rollbackDetected:
+            message = "Protected local transport state does not match its Keychain rollback anchor. No relay request was sent. Restore the matching app data, or explicitly reset local transport state."
+        case .concurrentUpdate:
+            message = "Another Noct Cord process changed local transport state. Close the other copy and try again."
+        case .storageUnavailable:
+            message = "Protected local transport storage is unavailable. No relay request was sent."
+        }
+    }
+}
+
 public struct NoctCordMemberViewState: Identifiable, Equatable {
     public let id: GroupScopedMemberHandleV2
     public let displayName: String
@@ -134,6 +162,10 @@ public struct NoctCordSpaceSession: Identifiable, Equatable {
     public var canManageBots: Bool {
         projection.permissions(for: currentMember).contains(.manageBots)
     }
+
+    public var isCurrentUserOwner: Bool {
+        currentMember == projection.owner
+    }
 }
 
 @MainActor
@@ -150,8 +182,14 @@ public final class NoctCordAppModel: ObservableObject {
     @Published public var stagedInvitationCode = ""
     @Published public var showsCreateChannel = false
     @Published public var showsCommunitySettings = false
+    @Published public var showsUserSettings = false
     @Published public var appearance: NoctCordAppearance = .system
+    @Published public private(set) var privacySettings = PrivacySettings()
+    @Published public private(set) var relayProfiles: [NoctCordRelayProfile] = []
+    @Published public private(set) var userDisplayName: String
+    @Published public private(set) var settingsNotice: String?
     @Published public private(set) var connectionState: NoctCordConnectionState
+    @Published public private(set) var permitsLocalStateReset = false
     @Published public private(set) var activityMessage: String?
     @Published public private(set) var cachedAttachments: [UUID: NoctCordDownloadedAttachment] = [:]
     @Published public var showsAttachmentImporter = false
@@ -159,6 +197,7 @@ public final class NoctCordAppModel: ObservableObject {
     @Published public var showsCreateVoiceRoom = false
     @Published public private(set) var callSnapshot: NoctCordMediaRoomSnapshot?
     @Published public private(set) var composerNotice: String?
+    @Published public private(set) var communityLifecycleOperationSpaceID: UUID?
     @Published public private(set) var callConnectivityDescription =
         "Call traversal will be discovered from the relay when available."
 
@@ -166,6 +205,7 @@ public final class NoctCordAppModel: ObservableObject {
     private let identityVault: NoctCordIdentityVault
     private var transport: NoctCordTransportCoordinator?
     private var refreshTask: Task<Void, Never>?
+    private var communityLifecycleRecoveryTask: Task<Void, Never>?
     private var identityScopes: [UUID: NoctCordIdentityScope] = [:]
     private var mediaRoom: NoctCordMediaRoom?
     private var mediaRefreshTask: Task<Void, Never>?
@@ -173,10 +213,14 @@ public final class NoctCordAppModel: ObservableObject {
     private var iceServers: [NoctCordMediaICEServer] = []
     private var usesRelayDiscoveredICE = true
     private var relayICECredentialExpiresAt: Date?
-    private var localDisplayName = "Member"
 
     public init(seedPreviewData: Bool = false) {
         previewMode = seedPreviewData
+        let savedName = UserDefaults.standard.string(forKey: "NoctCord.displayName")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        userDisplayName = seedPreviewData
+            ? "You"
+            : (savedName.isEmpty ? "Member" : savedName)
         if seedPreviewData {
             identityVault = NoctCordIdentityVault(
                 fileURL: FileManager.default.temporaryDirectory
@@ -204,6 +248,7 @@ public final class NoctCordAppModel: ObservableObject {
 
     deinit {
         refreshTask?.cancel()
+        communityLifecycleRecoveryTask?.cancel()
         mediaRefreshTask?.cancel()
     }
 
@@ -277,7 +322,11 @@ public final class NoctCordAppModel: ObservableObject {
 
     public var canInviteToSelectedSpace: Bool {
         guard let space = selectedSpace else { return false }
-        return space.currentMember == space.projection.owner
+        return space.isCurrentUserOwner
+    }
+
+    public var isSelectedCommunityLifecycleOperationInFlight: Bool {
+        communityLifecycleOperationSpaceID == selectedSpaceID
     }
 
     public var availableBotCommands: [(bot: NoctCordBotApplication, command: NoctCordBotCommand)] {
@@ -314,6 +363,7 @@ public final class NoctCordAppModel: ObservableObject {
         iceServers: [NoctCordMediaICEServer] = []
     ) async {
         refreshTask?.cancel()
+        permitsLocalStateReset = false
         connectionState = .connecting
         activityMessage = "Connecting to the relay…"
         do {
@@ -325,25 +375,80 @@ public final class NoctCordAppModel: ObservableObject {
             let coordinator = try await NoctCordTransportCoordinator.open(
                 configuration: configuration
             )
-            try await coordinator.testRelay()
+            // A setup relay is only a bootstrap default. Once local community
+            // state exists, an outage on that relay must not lock the user out
+            // of communities whose independent relays are still reachable.
+            let storedSpaceIDs = await coordinator.storedSpaceIDs()
+            let hasStoredCommunities = !storedSpaceIDs.isEmpty
+            if !hasStoredCommunities {
+                try await coordinator.testRelay()
+            }
             transport = coordinator
-            localDisplayName = configuration.displayName
+            userDisplayName = configuration.displayName
+            UserDefaults.standard.set(
+                configuration.displayName,
+                forKey: "NoctCord.displayName"
+            )
+            privacySettings = await coordinator.privacySettings()
+            relayProfiles = await coordinator.relayProfiles()
             usesRelayDiscoveredICE = iceServers.isEmpty
             if iceServers.isEmpty {
-                await refreshRelayCallConnectivity(using: coordinator)
+                if hasStoredCommunities {
+                    self.iceServers = []
+                    relayICECredentialExpiresAt = nil
+                    callConnectivityDescription =
+                        "Call traversal will refresh from this community's relay."
+                } else {
+                    await refreshRelayCallConnectivity(using: coordinator)
+                }
             } else {
                 self.iceServers = iceServers
                 relayICECredentialExpiresAt = nil
                 callConnectivityDescription =
                     "Using your manual ICE override for this session."
             }
-            try await reloadAllSpaces()
+            try await reloadAllSpaces(
+                using: coordinator,
+                synchronize: false,
+                assessRelays: false
+            )
             connectionState = .ready
             activityMessage = nil
             beginAutomaticRefresh()
+            if usesRelayDiscoveredICE, let selectedSpaceID {
+                Task {
+                    await refreshRelayCallConnectivity(
+                        using: coordinator,
+                        for: selectedSpaceID
+                    )
+                }
+            }
         } catch {
             transport = nil
-            connectionState = .failed(error.localizedDescription)
+            let presentation = NoctCordConnectionFailurePresentation(error: error)
+            permitsLocalStateReset = presentation.permitsLocalStateReset
+            connectionState = .failed(presentation.message)
+            activityMessage = nil
+        }
+    }
+
+    public func resetLocalStateAndConnect(
+        configuration: NoctCordTransportConfiguration,
+        iceServers: [NoctCordMediaICEServer] = []
+    ) async {
+        refreshTask?.cancel()
+        connectionState = .connecting
+        activityMessage = "Resetting protected local transport state…"
+        do {
+            try await NoctCordTransportCoordinator.eraseLocalState(
+                configuration: configuration
+            )
+            permitsLocalStateReset = false
+            await connect(configuration: configuration, iceServers: iceServers)
+        } catch {
+            let presentation = NoctCordConnectionFailurePresentation(error: error)
+            permitsLocalStateReset = presentation.permitsLocalStateReset
+            connectionState = .failed(presentation.message)
             activityMessage = nil
         }
     }
@@ -370,6 +475,11 @@ public final class NoctCordAppModel: ObservableObject {
         selectedSpaceID = id
         selectedChannelID = spaces.first { $0.id == id }?.textChannels.first?.id
         searchQuery = ""
+        if !previewMode, usesRelayDiscoveredICE, let transport {
+            Task {
+                await refreshRelayCallConnectivity(using: transport, for: id)
+            }
+        }
     }
 
     public func selectChannel(_ id: UUID) {
@@ -467,7 +577,11 @@ public final class NoctCordAppModel: ObservableObject {
         }
     }
 
-    public func createSpace(name: String, identityScope: NoctCordIdentityScope) {
+    public func createSpace(
+        name: String,
+        identityScope: NoctCordIdentityScope,
+        relayPreferenceID: UUID? = nil
+    ) {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanName.isEmpty else { return }
         if !previewMode {
@@ -479,12 +593,15 @@ public final class NoctCordAppModel: ObservableObject {
             activityMessage = "Creating encrypted space…"
             Task {
                 do {
-                    let bootstrap = try await transport.createSpace(name: cleanName)
+                    let bootstrap = try await transport.createSpace(
+                        name: cleanName,
+                        relayPreferenceID: relayPreferenceID
+                    )
                     identityScopes[bootstrap.spaceID] = identityScope
                     do {
                         let binding = try await identityVault.binding(
                             scope: identityScope,
-                            displayName: localDisplayName,
+                            displayName: userDisplayName,
                             spaceID: bootstrap.spaceID,
                             memberHandle: bootstrap.owner
                         )
@@ -593,6 +710,7 @@ public final class NoctCordAppModel: ObservableObject {
         let prepared = try await transport.prepareCommunityAdmission(
             invitation: invitation
         )
+        relayProfiles = await transport.relayProfiles()
         identityScopes[invitation.spaceID] = identityScope
         return prepared
     }
@@ -631,7 +749,7 @@ public final class NoctCordAppModel: ObservableObject {
         do {
             let binding = try await identityVault.binding(
                 scope: scope,
-                displayName: localDisplayName,
+                displayName: userDisplayName,
                 spaceID: spaceID,
                 memberHandle: snapshot.currentMember
             )
@@ -651,6 +769,31 @@ public final class NoctCordAppModel: ObservableObject {
         selectedChannelID = spaces.first { $0.id == spaceID }?.textChannels.first?.id
         connectionState = .ready
         return spaceID
+    }
+
+    /// Publishes a signed self-removal epoch and then removes the community
+    /// from the active UI. The transport keeps its encrypted terminal record
+    /// so old ciphertext cannot silently recreate membership.
+    public func leaveSelectedCommunity() async throws {
+        guard let space = selectedSpace else {
+            throw NoctCordTransportError.spaceNotFound
+        }
+        guard !space.isCurrentUserOwner else {
+            throw NoctCordTransportError.ownerCannotLeave
+        }
+        try await performCommunityLifecycle(.leave, spaceID: space.id)
+    }
+
+    /// Publishes the owner's terminal group tombstone and removes the
+    /// community from the active UI only after relay acknowledgement.
+    public func destroySelectedCommunity() async throws {
+        guard let space = selectedSpace else {
+            throw NoctCordTransportError.spaceNotFound
+        }
+        guard space.isCurrentUserOwner else {
+            throw NoctCordTransportError.communityOwnerRequired
+        }
+        try await performCommunityLifecycle(.destroy, spaceID: space.id)
     }
 
     public func createChannel(name: String) {
@@ -730,7 +873,7 @@ public final class NoctCordAppModel: ObservableObject {
             Task {
                 activityMessage = "Creating realtime voice route…"
                 do {
-                    let route = try await transport.createRealtimeRoute()
+                    let route = try await transport.createRealtimeRoute(for: space.id)
                     await publishAndRefresh(
                         .createVoiceRoom(
                             id: roomID,
@@ -904,6 +1047,139 @@ public final class NoctCordAppModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    public func updateDisplayName(
+        _ value: String,
+        acrossAllCommunities: Bool
+    ) async -> Bool {
+        let cleanName = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty, cleanName.utf8.count <= 128 else {
+            settingsNotice = "Enter a display name of 128 bytes or fewer."
+            return false
+        }
+
+        userDisplayName = cleanName
+        if !previewMode {
+            UserDefaults.standard.set(cleanName, forKey: "NoctCord.displayName")
+        }
+        let targetIDs: [UUID]
+        if acrossAllCommunities {
+            targetIDs = spaces.map(\.id)
+        } else if let selectedSpaceID {
+            targetIDs = [selectedSpaceID]
+        } else {
+            targetIDs = []
+        }
+
+        if previewMode {
+            let targets = Set(targetIDs)
+            for index in spaces.indices where targets.contains(spaces[index].id) {
+                let currentMember = spaces[index].currentMember
+                spaces[index].members = spaces[index].members.map { member in
+                    guard member.id == currentMember else { return member }
+                    return NoctCordMemberViewState(
+                        id: member.id,
+                        displayName: cleanName,
+                        roleName: member.roleName,
+                        presence: member.presence,
+                        isBot: member.isBot
+                    )
+                }
+            }
+            settingsNotice = targetIDs.isEmpty
+                ? "Your default display name was saved."
+                : "Your display name was updated."
+            return true
+        }
+
+        guard let transport else {
+            settingsNotice = "Connect at least one relay before publishing a community profile."
+            return targetIDs.isEmpty
+        }
+        var updated = 0
+        var firstFailure: Error?
+        for spaceID in targetIDs {
+            guard let space = spaces.first(where: { $0.id == spaceID }) else { continue }
+            do {
+                let binding = try await identityVault.binding(
+                    scope: space.identityScope,
+                    displayName: cleanName,
+                    spaceID: spaceID,
+                    memberHandle: space.currentMember
+                )
+                let publication = try await transport.publishOperation(
+                    spaceID: spaceID,
+                    operation: .bindIdentity(binding)
+                )
+                if !publication.complete {
+                    try await transport.maintain(spaceID: spaceID)
+                }
+                try await reloadSpace(spaceID, using: transport)
+                updated += 1
+            } catch {
+                if firstFailure == nil { firstFailure = error }
+            }
+        }
+        if let firstFailure {
+            settingsNotice = updated == 0
+                ? "The local default was saved, but the community profile could not be updated: \(firstFailure.localizedDescription)"
+                : "Updated \(updated) communities. At least one community could not be reached: \(firstFailure.localizedDescription)"
+        } else {
+            settingsNotice = targetIDs.isEmpty
+                ? "Your default display name was saved."
+                : "Your display name was updated in \(updated) \(updated == 1 ? "community" : "communities")."
+        }
+        return firstFailure == nil
+    }
+
+    public func setPrivacySettings(_ settings: PrivacySettings) {
+        let previous = privacySettings
+        privacySettings = settings
+        guard !previewMode, let transport else {
+            settingsNotice = "Privacy preferences are active on this device."
+            return
+        }
+        Task {
+            do {
+                try await transport.updatePrivacySettings(settings)
+                settingsNotice = "Privacy preferences saved locally."
+            } catch {
+                privacySettings = previous
+                settingsNotice = "Privacy preferences were not saved: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    @discardableResult
+    public func addRelay(
+        address: String,
+        name: String,
+        accessPassword: String
+    ) async -> Bool {
+        guard let transport else {
+            settingsNotice = "Finish initial setup before adding another relay."
+            return false
+        }
+        do {
+            let endpoint = try RelayEndpointParser.parse(address)
+            let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            activityMessage = "Verifying the relay…"
+            _ = try await transport.addRelay(
+                endpoint: endpoint,
+                name: cleanName.isEmpty ? endpoint.host : cleanName,
+                accessPassword: accessPassword.isEmpty ? nil : accessPassword
+            )
+            relayProfiles = await transport.relayProfiles()
+            activityMessage = nil
+            settingsNotice = "Relay saved. New communities can use it independently."
+            return true
+        } catch {
+            activityMessage = nil
+            settingsNotice = error.localizedDescription
+            return false
+        }
+    }
+
     public func setIdentityScope(_ scope: NoctCordIdentityScope) {
         if previewMode {
             updateSelectedSpace { $0.identityScope = scope }
@@ -915,7 +1191,7 @@ public final class NoctCordAppModel: ObservableObject {
             do {
                 let binding = try await identityVault.binding(
                     scope: scope,
-                    displayName: localDisplayName,
+                    displayName: userDisplayName,
                     spaceID: selectedSpaceID,
                     memberHandle: space.currentMember
                 )
@@ -1025,7 +1301,7 @@ public final class NoctCordAppModel: ObservableObject {
             do {
                 let sanitized = try await NoctCordAttachmentSanitizer.sanitize(url: url)
                 activityMessage = "Encrypting and uploading…"
-                let transfer = await transport.attachmentTransfer()
+                let transfer = try await transport.attachmentTransfer(for: spaceID)
                 let uploaded = try await transfer.upload(
                     sanitized,
                     spaceID: spaceID,
@@ -1071,7 +1347,7 @@ public final class NoctCordAppModel: ObservableObject {
         activityMessage = "Downloading encrypted attachment…"
         Task {
             do {
-                let transfer = await transport.attachmentTransfer()
+                let transfer = try await transport.attachmentTransfer(for: space.id)
                 let downloaded = try await transfer.download(
                     manifest: manifest,
                     spaceID: space.id,
@@ -1112,7 +1388,7 @@ public final class NoctCordAppModel: ObservableObject {
                     throw NoctCordTransportError.voiceRouteExpired
                 }
                 activityMessage = "Renewing the encrypted voice route…"
-                let route = try await transport.createRealtimeRoute()
+                let route = try await transport.createRealtimeRoute(for: space.id)
                 let rotatedKey = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
                 let renewal = try await transport.publishOperation(
                     spaceID: spaceID,
@@ -1216,10 +1492,16 @@ public final class NoctCordAppModel: ObservableObject {
     }
 
     private func refreshRelayCallConnectivity(
-        using coordinator: NoctCordTransportCoordinator
+        using coordinator: NoctCordTransportCoordinator,
+        for spaceID: UUID? = nil
     ) async {
         do {
-            let discovered = try await coordinator.discoverCallConnectivity()
+            let discovered: NoctCordRelayICEConfiguration
+            if let spaceID {
+                discovered = try await coordinator.discoverCallConnectivity(for: spaceID)
+            } else {
+                discovered = try await coordinator.discoverCallConnectivity()
+            }
             iceServers = discovered.servers
             relayICECredentialExpiresAt = discovered.credentialExpiresAt
             if discovered.servers.contains(where: { $0.credential != nil }) {
@@ -1268,7 +1550,7 @@ public final class NoctCordAppModel: ObservableObject {
             guard publication.complete else {
                 throw NoctCordTransportError.transportIncomplete
             }
-            await transport.closeRealtimeRoom(roomID: roomID)
+            await transport.closeRealtimeRoom(spaceID: spaceID, roomID: roomID)
             try await reloadSpace(spaceID, using: transport)
             activityMessage = nil
         } catch {
@@ -1411,14 +1693,24 @@ public final class NoctCordAppModel: ObservableObject {
         try await reloadAllSpaces(using: transport)
     }
 
-    private func reloadAllSpaces(using transport: NoctCordTransportCoordinator) async throws {
+    private func reloadAllSpaces(
+        using transport: NoctCordTransportCoordinator,
+        synchronize: Bool = true,
+        assessRelays: Bool = true
+    ) async throws {
         let previousSpaceID = selectedSpaceID
         let previousChannelID = selectedChannelID
         var loaded: [NoctCordSpaceSession] = []
         for spaceID in await transport.storedSpaceIDs() {
-            _ = try? await transport.synchronize(spaceID: spaceID)
-            _ = try? await transport.ensureCommunityBootstrap(spaceID: spaceID)
-            loaded.append(try await makeSession(spaceID: spaceID, using: transport))
+            if synchronize {
+                _ = try? await transport.synchronize(spaceID: spaceID)
+                _ = try? await transport.ensureCommunityBootstrap(spaceID: spaceID)
+            }
+            loaded.append(try await makeSession(
+                spaceID: spaceID,
+                using: transport,
+                assessRelay: assessRelays
+            ))
         }
         spaces = loaded.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
@@ -1433,6 +1725,96 @@ public final class NoctCordAppModel: ObservableObject {
             selectedChannelID = previousChannelID
         } else {
             selectedChannelID = selectedSpace?.textChannels.first?.id
+        }
+        resumePendingCommunityLifecycleOperations(using: transport)
+    }
+
+    private func resumePendingCommunityLifecycleOperations(
+        using transport: NoctCordTransportCoordinator
+    ) {
+        guard communityLifecycleRecoveryTask == nil else { return }
+        communityLifecycleRecoveryTask = Task { [weak self] in
+            await transport.maintainAllStoredCommunities()
+            guard !Task.isCancelled else { return }
+            self?.communityLifecycleRecoveryTask = nil
+        }
+    }
+
+    private func performCommunityLifecycle(
+        _ action: NoctCordCommunityLifecycleAction,
+        spaceID: UUID
+    ) async throws {
+        guard communityLifecycleOperationSpaceID == nil else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        communityLifecycleOperationSpaceID = spaceID
+        activityMessage = action == .leave
+            ? "Leaving community securely…"
+            : "Destroying community securely…"
+        defer {
+            communityLifecycleOperationSpaceID = nil
+            activityMessage = nil
+        }
+
+        if previewMode {
+            await removeCommunityFromActiveUI(spaceID)
+            return
+        }
+        guard let transport else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        switch action {
+        case .leave:
+            let result = try await transport.leaveCommunity(spaceID: spaceID)
+            guard result.complete else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+        case .destroy:
+            let result = try await transport.destroyCommunity(spaceID: spaceID)
+            guard result.complete else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+        }
+        await removeCommunityFromActiveUI(spaceID)
+    }
+
+    private func removeCommunityFromActiveUI(_ spaceID: UUID) async {
+        guard let departingSpace = spaces.first(where: { $0.id == spaceID }) else {
+            return
+        }
+        if selectedSpaceID == spaceID {
+            mediaRefreshTask?.cancel()
+            mediaRefreshTask = nil
+            if let mediaRoom {
+                await mediaRoom.leave()
+            }
+            mediaRoom = nil
+            callSnapshot = nil
+            processedCallSignalIDs.removeAll()
+        }
+
+        let attachmentIDs = Set(departingSpace.projection.attachments.keys)
+        cachedAttachments = cachedAttachments.filter { !attachmentIDs.contains($0.key) }
+        if let selectedAttachmentID, attachmentIDs.contains(selectedAttachmentID) {
+            self.selectedAttachmentID = nil
+        }
+        identityScopes.removeValue(forKey: spaceID)
+        spaces.removeAll { $0.id == spaceID }
+
+        if selectedSpaceID == spaceID {
+            selectedSpaceID = spaces.first?.id
+            selectedChannelID = selectedSpace?.textChannels.first?.id
+            composerText = ""
+            searchQuery = ""
+        }
+        showsCommunitySettings = false
+        showsInvitationExchange = false
+
+        if !previewMode,
+           usesRelayDiscoveredICE,
+           let transport,
+           let selectedSpaceID {
+            await refreshRelayCallConnectivity(using: transport, for: selectedSpaceID)
         }
     }
 
@@ -1458,9 +1840,13 @@ public final class NoctCordAppModel: ObservableObject {
 
     private func makeSession(
         spaceID: UUID,
-        using transport: NoctCordTransportCoordinator
+        using transport: NoctCordTransportCoordinator,
+        assessRelay: Bool = true
     ) async throws -> NoctCordSpaceSession {
-        let snapshot = try await transport.storedSpaceSnapshot(spaceID: spaceID)
+        let snapshot = try await transport.storedSpaceSnapshot(
+            spaceID: spaceID,
+            assessRelay: assessRelay
+        )
         let activeMembers = Set(snapshot.members.map(\.handle))
         let projection = NoctCordSpaceProjection.project(
             spaceID: spaceID,
@@ -1504,7 +1890,6 @@ public final class NoctCordAppModel: ObservableObject {
         let activeVoiceRoomID = projection.voiceParticipants.first(where: { _, participants in
             participants[snapshot.currentMember]?.isJoined == true
         })?.key
-        let relay = await transport.relayEndpoint()
         return NoctCordSpaceSession(
             id: spaceID,
             shortName: Self.shortName(projection.name ?? "Space"),
@@ -1518,7 +1903,7 @@ public final class NoctCordAppModel: ObservableObject {
             unreadByChannel: spaces.first(where: { $0.id == spaceID })?.unreadByChannel ?? [:],
             voiceRooms: voiceRooms,
             activeVoiceRoomID: activeVoiceRoomID,
-            relayName: relay.host,
+            relayName: snapshot.relayName,
             relayAssessment: snapshot.relayAssessment
         )
     }

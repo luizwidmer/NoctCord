@@ -6,6 +6,8 @@ let noctweaveDependency: Package.Dependency
 let noctweavePackageIdentity: String
 let webRTCPackageIdentity = "WebRTC"
 
+// Local protocol work can override the immutable public revision without
+// changing the checked-in dependency graph.
 if let localPath = ProcessInfo.processInfo.environment["NOCTWEAVE_PACKAGE_PATH"],
    !localPath.isEmpty {
     noctweaveDependency = .package(path: localPath)

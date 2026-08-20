@@ -5,10 +5,10 @@ import NoctCordCore
 struct NoctCordCommunitySettingsSheet: View {
     @ObservedObject var model: NoctCordAppModel
     @Environment(\.dismiss) private var dismiss
-    @State private var section: Section = .identity
+    @State private var section: Section = .overview
 
     private enum Section: String, CaseIterable, Identifiable {
-        case identity = "Identity"
+        case overview = "Overview"
         case roles = "Roles"
         case channels = "Channel access"
         case applications = "Apps & bots"
@@ -17,7 +17,7 @@ struct NoctCordCommunitySettingsSheet: View {
 
         var symbol: String {
             switch self {
-            case .identity: "person.text.rectangle.fill"
+            case .overview: "rectangle.3.group.fill"
             case .roles: "person.3.sequence.fill"
             case .channels: "number.square.fill"
             case .applications: "puzzlepiece.extension.fill"
@@ -112,7 +112,7 @@ struct NoctCordCommunitySettingsSheet: View {
 
     private var sectionSubtitle: String {
         switch section {
-        case .identity: "Choose how this community profile is correlated."
+        case .overview: "Community identity, relay, and encrypted delivery context."
         case .roles: "Create a hierarchy and assign community-wide capabilities."
         case .channels: "Override role permissions for a specific channel."
         case .applications: "Manage encrypted bot principals and slash commands."
@@ -122,8 +122,8 @@ struct NoctCordCommunitySettingsSheet: View {
     @ViewBuilder
     private var sectionContent: some View {
         switch section {
-        case .identity:
-            CommunityIdentitySettings(model: model)
+        case .overview:
+            CommunityOverviewSettings(model: model)
         case .roles:
             CommunityRoleSettings(model: model)
         case .channels:
@@ -134,81 +134,178 @@ struct NoctCordCommunitySettingsSheet: View {
     }
 }
 
-private struct CommunityIdentitySettings: View {
+private struct CommunityOverviewSettings: View {
     @ObservedObject var model: NoctCordAppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var lifecycleAlert: CommunityLifecycleAlert?
+
+    private enum CommunityLifecycleAlert: Identifiable {
+        case confirmLeave
+        case confirmDestroy
+        case failure(String)
+
+        var id: String {
+            switch self {
+            case .confirmLeave: "confirm-leave"
+            case .confirmDestroy: "confirm-destroy"
+            case .failure(let message): "failure-\(message)"
+            }
+        }
+    }
 
     var body: some View {
-        VStack(spacing: 12) {
-            identityCard(
-                .portable,
-                title: "Portable identity",
-                description: "Present the same ML-DSA profile in multiple communities. This is convenient and intentionally linkable.",
-                symbol: "link"
-            )
-            identityCard(
-                .isolated,
-                title: "Isolated identity",
-                description: "Use a profile unique to this community. No portable identity proof is published.",
-                symbol: "eye.slash.fill"
-            )
+        VStack(alignment: .leading, spacing: 14) {
+            if let space = model.selectedSpace {
+                VStack(alignment: .leading, spacing: 14) {
+                    Text(space.name)
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                    settingsRow(
+                        symbol: "network",
+                        title: "Community relay",
+                        value: space.relayName
+                    )
+                    settingsRow(
+                        symbol: "lock.shield.fill",
+                        title: "Delivery",
+                        value: "End-to-end encrypted"
+                    )
+                    settingsRow(
+                        symbol: "person.crop.circle",
+                        title: "Your membership",
+                        value: space.identityScope == .portable
+                            ? "Portable profile"
+                            : "Isolated profile"
+                    )
+                }
+                .padding(18)
+                .background(NoctCordTheme.surface, in: RoundedRectangle(cornerRadius: 17))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 17).stroke(NoctCordTheme.border)
+                }
+            }
 
             NoctCordSettingsNotice(
-                symbol: "exclamationmark.triangle.fill",
-                text: "Changing to isolated mode cannot erase portable bindings that community members have already observed.",
-                color: NoctCordTheme.warning
+                symbol: "person.crop.circle.badge.checkmark",
+                text: "Your display name, identity correlation, privacy protections, relays, and appearance are managed from your profile menu at the bottom of the channel sidebar.",
+                color: NoctCordTheme.mutedCoral
+            )
+
+            if let space = model.selectedSpace {
+                communityLifecycleCard(space)
+            }
+        }
+        .alert(item: $lifecycleAlert) { alert in
+            lifecycleAlert(for: alert)
+        }
+    }
+
+    private func communityLifecycleCard(_ space: NoctCordSpaceSession) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: space.isCurrentUserOwner ? "trash.slash.fill" : "rectangle.portrait.and.arrow.right")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(NoctCordTheme.mutedCoral)
+                .frame(width: 38, height: 38)
+                .background(
+                    NoctCordTheme.mutedCoral.opacity(0.12),
+                    in: RoundedRectangle(cornerRadius: 11)
+                )
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(space.isCurrentUserOwner ? "Destroy community" : "Leave community")
+                    .font(.system(size: 13, weight: .bold))
+                Text(space.isCurrentUserOwner
+                    ? "Permanently close this encrypted community for every member. Relay-retained ciphertext remains subject to the relay operator's retention policy."
+                    : "Remove this membership and stop receiving new community traffic. A new invitation is required to return."
+                )
+                .font(.system(size: 10.5))
+                .foregroundStyle(NoctCordTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 12)
+
+            if model.isSelectedCommunityLifecycleOperationInFlight {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 116, height: 34)
+            } else {
+                Button(role: .destructive) {
+                    lifecycleAlert = space.isCurrentUserOwner
+                        ? .confirmDestroy
+                        : .confirmLeave
+                } label: {
+                    Text(space.isCurrentUserOwner ? "Destroy…" : "Leave…")
+                        .font(.system(size: 11.5, weight: .bold))
+                        .frame(minWidth: 86)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(NoctCordTheme.deepWine)
+            }
+        }
+        .padding(16)
+        .background(NoctCordTheme.surface, in: RoundedRectangle(cornerRadius: 16))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(NoctCordTheme.mutedCoral.opacity(0.42))
+        }
+    }
+
+    private func lifecycleAlert(for alert: CommunityLifecycleAlert) -> Alert {
+        let name = model.selectedSpace?.name ?? "this community"
+        switch alert {
+        case .confirmLeave:
+            return Alert(
+                title: Text("Leave \(name)?"),
+                message: Text("Your membership credential will be removed in a signed epoch update. This device keeps a protected terminal record to reject replays, and you will need a new invitation to return."),
+                primaryButton: .destructive(Text("Leave Community")) {
+                    Task { await performLifecycleAction(.leave) }
+                },
+                secondaryButton: .cancel()
+            )
+        case .confirmDestroy:
+            return Alert(
+                title: Text("Destroy \(name) for everyone?"),
+                message: Text("Only the owner can do this. A signed terminal tombstone will close the community for every current member. It cannot accept new messages or be restored."),
+                primaryButton: .destructive(Text("Destroy Community")) {
+                    Task { await performLifecycleAction(.destroy) }
+                },
+                secondaryButton: .cancel()
+            )
+        case .failure(let message):
+            return Alert(
+                title: Text("Action Couldn’t Be Completed"),
+                message: Text(message),
+                dismissButton: .default(Text("OK"))
             )
         }
     }
 
-    private func identityCard(
-        _ scope: NoctCordIdentityScope,
-        title: String,
-        description: String,
-        symbol: String
-    ) -> some View {
-        let isSelected = model.selectedSpace?.identityScope == scope
-        return Button {
-            model.setIdentityScope(scope)
-        } label: {
-            HStack(alignment: .top, spacing: 13) {
-                Image(systemName: symbol)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(
-                        isSelected ? NoctCordTheme.mutedCoral : NoctCordTheme.secondaryText
-                    )
-                    .frame(width: 38, height: 38)
-                    .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 11))
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(title)
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(description)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(NoctCordTheme.secondaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer()
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(
-                        isSelected ? NoctCordTheme.mutedCoral : NoctCordTheme.secondaryText
-                    )
+    private func performLifecycleAction(_ action: NoctCordCommunityLifecycleAction) async {
+        do {
+            switch action {
+            case .leave:
+                try await model.leaveSelectedCommunity()
+            case .destroy:
+                try await model.destroySelectedCommunity()
             }
-            .foregroundStyle(NoctCordTheme.primaryText)
-            .padding(14)
-            .background(
-                isSelected ? NoctCordTheme.mutedCoral.opacity(0.10) : NoctCordTheme.surface,
-                in: RoundedRectangle(cornerRadius: 15)
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: 15)
-                    .stroke(
-                        isSelected
-                            ? NoctCordTheme.mutedCoral.opacity(0.45)
-                            : NoctCordTheme.border
-                    )
-            }
-            .contentShape(RoundedRectangle(cornerRadius: 15))
+            dismiss()
+        } catch {
+            lifecycleAlert = .failure(error.localizedDescription)
         }
-        .buttonStyle(.plain)
+    }
+
+    private func settingsRow(symbol: String, title: String, value: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .foregroundStyle(NoctCordTheme.mutedCoral)
+                .frame(width: 24)
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+            Spacer()
+            Text(value)
+                .font(.system(size: 11))
+                .foregroundStyle(NoctCordTheme.secondaryText)
+        }
     }
 }
 
