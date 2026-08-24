@@ -54,6 +54,7 @@ public struct NoctCordTransportConfiguration: Sendable {
     public let relay: RelayEndpoint
     public let relayName: String
     public let relayAccessPassword: String?
+    public let usesInsecurePlaintextStateForTesting: Bool
 
     public init(
         stateURL: URL,
@@ -61,7 +62,8 @@ public struct NoctCordTransportConfiguration: Sendable {
         displayName: String,
         relay: RelayEndpoint,
         relayName: String,
-        relayAccessPassword: String? = nil
+        relayAccessPassword: String? = nil,
+        usesInsecurePlaintextStateForTesting: Bool = false
     ) {
         self.stateURL = stateURL
         self.storageScopeIdentifier = storageScopeIdentifier
@@ -70,7 +72,25 @@ public struct NoctCordTransportConfiguration: Sendable {
         self.relay = relay
         self.relayName = relayName
         self.relayAccessPassword = relayAccessPassword
+        self.usesInsecurePlaintextStateForTesting = usesInsecurePlaintextStateForTesting
     }
+
+    #if DEBUG
+    public static func liveUITest(
+        stateURL: URL,
+        displayName: String,
+        relayPort: UInt16
+    ) -> NoctCordTransportConfiguration {
+        NoctCordTransportConfiguration(
+            stateURL: stateURL,
+            storageScopeIdentifier: "org.noctcord.live-ui-test.\(displayName.lowercased())",
+            displayName: displayName,
+            relay: RelayEndpoint(host: "127.0.0.1", port: relayPort, transport: .tcp),
+            relayName: "Local live UI-test relay",
+            usesInsecurePlaintextStateForTesting: true
+        )
+    }
+    #endif
 
     /// The sandboxed app and local `swift run` builds have different storage
     /// containers. They must not share one Keychain rollback anchor because a
@@ -223,9 +243,20 @@ public actor NoctCordTransportCoordinator {
         guard configuration.isStructurallyValid else {
             throw NoctCordTransportError.invalidConfiguration
         }
+        #if DEBUG
+        let protection: ClientStateStoreProtection = configuration
+            .usesInsecurePlaintextStateForTesting
+            ? .insecurePlaintextForTesting
+            : .encrypted
+        #else
+        guard !configuration.usesInsecurePlaintextStateForTesting else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        let protection: ClientStateStoreProtection = .encrypted
+        #endif
         let store = ClientStateStore(
             fileURL: configuration.stateURL,
-            protection: .encrypted,
+            protection: protection,
             storageScopeIdentifier: configuration.storageScopeIdentifier
         )
         let client = try await HeadlessMessagingClient.open(
@@ -1095,7 +1126,7 @@ public actor NoctCordTransportCoordinator {
         let endpoint = try await relayEndpoint(for: spaceID)
         return NoctCordAttachmentTransfer(
             relay: endpoint,
-            accessPassword: await relayPreference(for: endpoint)?.accessPassword
+            accessPassword: await resolvedAccessPassword(for: endpoint)
         )
     }
 
@@ -1314,10 +1345,15 @@ public actor NoctCordTransportCoordinator {
     }
 
     private func relayClient(for endpoint: RelayEndpoint) async -> RelayClient {
-        RelayClient(
+        return RelayClient(
             endpoint: endpoint,
-            authToken: await relayPreference(for: endpoint)?.accessPassword
+            authToken: await resolvedAccessPassword(for: endpoint)
         )
+    }
+
+    private func resolvedAccessPassword(for endpoint: RelayEndpoint) async -> String? {
+        await relayPreference(for: endpoint)?.accessPassword
+            ?? (endpoint == relay ? relayAccessPassword : nil)
     }
 
     private func relayPreference(

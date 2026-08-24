@@ -85,22 +85,28 @@ public enum NoctCordAttachmentSanitizer {
         } catch {
             throw NoctCordAttachmentSanitizerError.inaccessible
         }
-        guard let type = UTType(filenameExtension: url.pathExtension.lowercased()) else {
-            throw NoctCordAttachmentSanitizerError.unsupportedType
+        let fileExtension = url.pathExtension.lowercased()
+        if let type = UTType(filenameExtension: fileExtension) {
+            if type.conforms(to: .image) {
+                return try sanitizeImage(data: boundedData(at: url))
+            }
+            if type.conforms(to: .movie) || type.conforms(to: .video) {
+                return try await sanitizeStagedAVAsset(at: url, kind: .video)
+            }
+            if type.conforms(to: .audio) {
+                return try await sanitizeStagedAVAsset(at: url, kind: .audio)
+            }
+            if type.conforms(to: .pdf) {
+                return try sanitizePDF(data: boundedData(at: url))
+            }
+            if type.conforms(to: .plainText) || type.conforms(to: .text) || type == .json {
+                return try sanitizeText(data: boundedData(at: url))
+            }
         }
-        if type.conforms(to: .image) {
-            return try sanitizeImage(data: boundedData(at: url))
-        }
-        if type.conforms(to: .movie) || type.conforms(to: .video) {
-            return try await sanitizeStagedAVAsset(at: url, kind: .video)
-        }
-        if type.conforms(to: .audio) {
-            return try await sanitizeStagedAVAsset(at: url, kind: .audio)
-        }
-        if type.conforms(to: .pdf) {
-            return try sanitizePDF(data: boundedData(at: url))
-        }
-        if type.conforms(to: .plainText) || type.conforms(to: .text) || type == .json {
+        // LaunchServices can return a dynamic UTI for otherwise ordinary text
+        // files in unsigned development builds. Keep the fallback narrow and
+        // still require strict UTF-8 decoding plus control-character filtering.
+        if ["txt", "md", "markdown", "json", "csv", "log"].contains(fileExtension) {
             return try sanitizeText(data: boundedData(at: url))
         }
         throw NoctCordAttachmentSanitizerError.unsupportedType
@@ -268,13 +274,14 @@ public enum NoctCordAttachmentSanitizer {
         try requireBoundedOutput(bytes)
         var width: Int?
         var height: Int?
+        let sanitizedAsset = AVURLAsset(url: outputURL)
         if kind == .video,
-           let track = try await asset.loadTracks(withMediaType: .video).first {
+           let track = try await sanitizedAsset.loadTracks(withMediaType: .video).first {
             let size = try await track.load(.naturalSize)
             let transform = try await track.load(.preferredTransform)
             let transformed = size.applying(transform)
-            width = Int(abs(transformed.width).rounded())
-            height = Int(abs(transformed.height).rounded())
+            width = try validatedVideoPixelDimension(transformed.width)
+            height = try validatedVideoPixelDimension(transformed.height)
         }
         return NoctCordSanitizedAttachment(
             bytes: bytes,
@@ -284,6 +291,17 @@ public enum NoctCordAttachmentSanitizer {
             pixelHeight: height,
             durationMilliseconds: UInt64((duration * 1_000).rounded())
         )
+    }
+
+    static func validatedVideoPixelDimension(_ value: CGFloat) throws -> Int {
+        let rounded = abs(value).rounded()
+        guard rounded.isFinite,
+              rounded > 0,
+              rounded <= CGFloat(maximumImageDimension),
+              let dimension = Int(exactly: rounded) else {
+            throw NoctCordAttachmentSanitizerError.unsafeDimensions
+        }
+        return dimension
     }
 
     private static func sanitizeStagedAVAsset(

@@ -563,7 +563,9 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         XCTAssertEqual(secondProjection.messages[memberMessage]?.text, "member to everyone")
 
         let cleartext = Data("sanitized channel attachment".utf8)
-        let attachmentTransfer = await firstTransport.attachmentTransfer()
+        let attachmentTransfer = try await firstTransport.attachmentTransfer(
+            for: groupID
+        )
         let uploaded = try await attachmentTransfer.upload(
             NoctCordSanitizedAttachment(
                 bytes: cleartext,
@@ -584,7 +586,10 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         )
         XCTAssertTrue(attachmentPublication.complete)
         _ = try await secondTransport.synchronize(spaceID: groupID)
-        let downloaded = try await (await secondTransport.attachmentTransfer()).download(
+        let secondAttachmentTransfer = try await secondTransport.attachmentTransfer(
+            for: groupID
+        )
+        let downloaded = try await secondAttachmentTransfer.download(
             manifest: uploaded.manifest,
             spaceID: groupID,
             channelID: channelID
@@ -663,6 +668,97 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         XCTAssertEqual(received.map(\.author), [ownerHandle])
         XCTAssertEqual(received.map(\.signal), [signal])
         mark("realtime-signal-received")
+    }
+
+    func testLiveBuiltAppExchangeHarness() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["NOCTCORD_RUN_LIVE_APP_SCENARIO"] == "1" else {
+            throw XCTSkip("The built-app exchange harness is opt-in.")
+        }
+        let rootPath = try XCTUnwrap(environment["NOCTCORD_LIVE_APP_ROOT"])
+        let port = try XCTUnwrap(UInt16(environment["NOCTCORD_LIVE_APP_PORT"] ?? ""))
+        let root = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+        let ownerStateURL = root.appendingPathComponent("sender.json")
+        let memberStateURL = root.appendingPathComponent("receiver.json")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ownerStateURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: memberStateURL.path))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: root.path
+        )
+
+        let server = RelayServer(
+            store: RelayStore(),
+            opaqueRouteStore: OpaqueRouteRelayStoreV2()
+        )
+        try server.start(host: "127.0.0.1", port: port)
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 250_000_000)
+        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
+
+        let owner = try await makeClient(name: "sender", root: root)
+        let member = try await makeClient(name: "receiver", root: root)
+        let ownerTransport = try NoctCordTransportCoordinator(client: owner, relay: endpoint)
+        let memberTransport = try NoctCordTransportCoordinator(client: member, relay: endpoint)
+        let groupID = UUID()
+        let startedAt = NoctweaveRendezvousV2.canonicalTimestamp(
+            Date().addingTimeInterval(-30)
+        )
+        _ = try await owner.createGroup(
+            groupID: groupID,
+            relay: endpoint,
+            contentTypes: NoctCordCodec.contentCapabilities,
+            createdAt: startedAt
+        )
+        try await admit(
+            member,
+            to: groupID,
+            owner: owner,
+            relay: endpoint,
+            existingMembers: [],
+            seed: 0x71,
+            startedAt: startedAt.addingTimeInterval(2)
+        )
+
+        let channelID = UUID()
+        let spaceCreation = try await ownerTransport.publishOperation(
+            spaceID: groupID,
+            operation: .createSpace(name: "Live Exchange")
+        )
+        XCTAssertTrue(spaceCreation.complete)
+        let channelCreation = try await ownerTransport.publishOperation(
+            spaceID: groupID,
+            operation: .createChannel(id: channelID, name: "verification")
+        )
+        XCTAssertTrue(channelCreation.complete)
+        _ = try await memberTransport.synchronize(spaceID: groupID)
+
+        let readyURL = root.appendingPathComponent("ready.json")
+        let metadata: [String: Any] = [
+            "relayPort": Int(port),
+            "spaceID": groupID.uuidString,
+            "channelID": channelID.uuidString,
+            "senderState": ownerStateURL.path,
+            "receiverState": memberStateURL.path,
+        ]
+        let readyData = try JSONSerialization.data(
+            withJSONObject: metadata,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try readyData.write(to: readyURL, options: .atomic)
+        mark("live-app-harness-ready \(readyURL.path)")
+
+        let stopURL = root.appendingPathComponent("stop")
+        let deadline = Date().addingTimeInterval(15 * 60)
+        while Date() < deadline,
+              !FileManager.default.fileExists(atPath: stopURL.path) {
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: stopURL.path),
+            "The built-app exchange harness timed out before its stop marker arrived."
+        )
     }
 
     private func startOnEphemeralLoopbackPort(

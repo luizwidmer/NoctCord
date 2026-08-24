@@ -60,6 +60,33 @@ final class NoctCordAppModelTests: XCTestCase {
         XCTAssertTrue(model.composerText.isEmpty)
     }
 
+    func testPreviewAttachmentPickerSanitizesAndProjectsSelectedFile() async throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let originalAttachmentCount = model.selectedAttachments.count
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("noctcord-preview-attachment-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try Data("preview attachment\r\n".utf8).write(to: fileURL, options: .atomic)
+
+        model.sendAttachment(at: fileURL)
+
+        for _ in 0..<100 where model.selectedAttachments.count == originalAttachmentCount {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNil(model.composerNotice, model.composerNotice ?? "Unexpected attachment error")
+        if case .failed(let message) = model.connectionState {
+            XCTFail(message)
+        }
+        let attachment = try XCTUnwrap(model.selectedAttachments.last)
+        XCTAssertEqual(model.selectedAttachments.count, originalAttachmentCount + 1)
+        XCTAssertEqual(attachment.mediaType, "text/plain")
+        XCTAssertTrue(attachment.isAvailableLocally)
+        XCTAssertNotNil(model.cachedAttachments[attachment.id])
+        XCTAssertEqual(model.selectedSpace?.events.last?.operation.kind, .attachmentAdded)
+        XCTAssertNil(model.activityMessage)
+        XCTAssertNil(model.composerNotice)
+    }
+
     func testPreviewSpaceCreationDefaultsToOneProjectedGeneralChannel() {
         let model = NoctCordAppModel(seedPreviewData: true)
         let originalSpaceCount = model.spaces.count

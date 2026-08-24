@@ -69,6 +69,10 @@ private actor NoctCordRawSignalingCoordinator {
         _ signal: NoctCordMediaSignal,
         to recipient: NoctCordMediaParticipantID?
     ) async throws -> NoctCordMediaSignalEnvelope {
+        let (followingSequence, overflow) = nextSequence.addingReportingOverflow(1)
+        guard !overflow else {
+            throw NoctCordMediaError.invalidState("signaling sequence is exhausted")
+        }
         let envelope = try NoctCordMediaSignalEnvelope(
             roomID: roomID,
             sender: sender,
@@ -77,7 +81,7 @@ private actor NoctCordRawSignalingCoordinator {
             timestampMilliseconds: Int64(Date().timeIntervalSince1970 * 1_000),
             signal: signal
         )
-        nextSequence += 1
+        nextSequence = followingSequence
         try await sink.send(envelope)
         return envelope
     }

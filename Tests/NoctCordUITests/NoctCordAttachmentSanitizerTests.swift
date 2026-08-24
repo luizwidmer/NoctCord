@@ -42,6 +42,28 @@ final class NoctCordAttachmentSanitizerTests: XCTestCase {
         }
     }
 
+    func testVideoDimensionsRejectNonFiniteAndOutOfRangeMetadata() throws {
+        XCTAssertEqual(
+            try NoctCordAttachmentSanitizer.validatedVideoPixelDimension(-720.4),
+            720
+        )
+        for value in [
+            CGFloat.zero,
+            CGFloat.nan,
+            CGFloat.infinity,
+            CGFloat(NoctCordAttachmentSanitizer.maximumImageDimension + 1),
+        ] {
+            XCTAssertThrowsError(
+                try NoctCordAttachmentSanitizer.validatedVideoPixelDimension(value)
+            ) { error in
+                XCTAssertEqual(
+                    error as? NoctCordAttachmentSanitizerError,
+                    .unsafeDimensions
+                )
+            }
+        }
+    }
+
     func testSymlinkedInputIsRejected() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             "noctcord-attachment-symlink-\(UUID().uuidString)",

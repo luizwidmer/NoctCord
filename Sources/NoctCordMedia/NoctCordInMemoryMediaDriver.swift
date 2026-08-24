@@ -123,6 +123,10 @@ private actor NoctCordInMemoryMediaSession: NoctCordMediaDriverSession {
 
     func send(_ signal: NoctCordMediaSignal, to recipient: NoctCordMediaParticipantID?) async throws -> NoctCordMediaSignalEnvelope {
         guard joined else { throw NoctCordMediaError.invalidState("session is not joined") }
+        let (followingSequence, overflow) = nextSequence.addingReportingOverflow(1)
+        guard !overflow else {
+            throw NoctCordMediaError.invalidState("signaling sequence is exhausted")
+        }
         let envelope = try NoctCordMediaSignalEnvelope(
             roomID: configuration.roomID,
             sender: configuration.participant.id,
@@ -131,7 +135,7 @@ private actor NoctCordInMemoryMediaSession: NoctCordMediaDriverSession {
             timestampMilliseconds: Int64(Date().timeIntervalSince1970 * 1_000),
             signal: signal
         )
-        nextSequence += 1
+        nextSequence = followingSequence
         try await signalingSink.send(envelope)
         try await network.send(roomID: configuration.roomID, sender: configuration.participant.id, envelope: envelope)
         return envelope

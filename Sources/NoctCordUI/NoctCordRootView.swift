@@ -8,9 +8,15 @@ public struct NoctCordRootView: View {
     @StateObject private var model: NoctCordAppModel
     @Environment(\.scenePhase) private var scenePhase
 
-    public init(seedPreviewData: Bool = false) {
+    public init(
+        seedPreviewData: Bool = false,
+        liveUITestConfiguration: NoctCordTransportConfiguration? = nil
+    ) {
         _model = StateObject(
-            wrappedValue: NoctCordAppModel(seedPreviewData: seedPreviewData)
+            wrappedValue: NoctCordAppModel(
+                seedPreviewData: seedPreviewData,
+                liveUITestConfiguration: liveUITestConfiguration
+            )
         )
     }
 

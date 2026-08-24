@@ -214,14 +214,28 @@ public final class NoctCordAppModel: ObservableObject {
     private var usesRelayDiscoveredICE = true
     private var relayICECredentialExpiresAt: Date?
 
-    public init(seedPreviewData: Bool = false) {
-        previewMode = seedPreviewData
+    public init(
+        seedPreviewData: Bool = false,
+        liveUITestConfiguration: NoctCordTransportConfiguration? = nil
+    ) {
+        #if DEBUG
+        let liveConfiguration = liveUITestConfiguration
+        #else
+        let liveConfiguration: NoctCordTransportConfiguration? = nil
+        #endif
+        let usesPreview = seedPreviewData && liveConfiguration == nil
+        previewMode = usesPreview
         let savedName = UserDefaults.standard.string(forKey: "NoctCord.displayName")?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        userDisplayName = seedPreviewData
-            ? "You"
-            : (savedName.isEmpty ? "Member" : savedName)
-        if seedPreviewData {
+        userDisplayName = liveConfiguration?.displayName
+            ?? (usesPreview ? "You" : (savedName.isEmpty ? "Member" : savedName))
+        if let liveConfiguration {
+            identityVault = NoctCordIdentityVault(
+                fileURL: liveConfiguration.stateURL
+                    .appendingPathExtension("identity-vault"),
+                encryptionKey: SymmetricKey(data: Data(repeating: 0x43, count: 32))
+            )
+        } else if usesPreview {
             identityVault = NoctCordIdentityVault(
                 fileURL: FileManager.default.temporaryDirectory
                     .appendingPathComponent("noctcord-preview-\(UUID().uuidString).vault"),
@@ -240,10 +254,17 @@ public final class NoctCordAppModel: ObservableObject {
                     .appendingPathComponent("identity-vault.noctcord")
             )
         }
-        spaces = seedPreviewData ? Self.previewSpaces() : []
-        connectionState = seedPreviewData ? .preview : .needsSetup
+        spaces = usesPreview ? Self.previewSpaces() : []
+        connectionState = usesPreview
+            ? .preview
+            : (liveConfiguration == nil ? .needsSetup : .connecting)
         selectedSpaceID = spaces.first?.id
         selectedChannelID = spaces.first?.textChannels.first?.id
+        if let liveConfiguration {
+            Task { [weak self] in
+                await self?.connect(configuration: liveConfiguration)
+            }
+        }
     }
 
     deinit {
@@ -389,7 +410,17 @@ public final class NoctCordAppModel: ObservableObject {
                 configuration.displayName,
                 forKey: "NoctCord.displayName"
             )
-            privacySettings = await coordinator.privacySettings()
+            var loadedPrivacySettings = await coordinator.privacySettings()
+            #if DEBUG
+            if configuration.usesInsecurePlaintextStateForTesting {
+                // Live UI evidence must remain inspectable while the two test
+                // windows trade focus. Production capture and focus shielding
+                // stay enabled by their persisted settings.
+                loadedPrivacySettings.hideSensitiveWhenUnfocused = false
+                loadedPrivacySettings.macBlockWindowCapture = false
+            }
+            #endif
+            privacySettings = loadedPrivacySettings
             relayProfiles = await coordinator.relayProfiles()
             usesRelayDiscoveredICE = iceServers.isEmpty
             if iceServers.isEmpty {
@@ -1292,14 +1323,52 @@ public final class NoctCordAppModel: ObservableObject {
     }
 
     public func sendAttachment(at url: URL) {
-        guard !previewMode,
-              let transport,
-              let spaceID = selectedSpaceID,
+        guard let spaceID = selectedSpaceID,
               let channelID = selectedChannelID else { return }
         activityMessage = "Sanitizing attachment…"
         Task {
             do {
                 let sanitized = try await NoctCordAttachmentSanitizer.sanitize(url: url)
+                if previewMode {
+                    let attachmentID = UUID()
+                    let keyMaterial = SymmetricKey(size: .bits256)
+                        .withUnsafeBytes { Data($0) }
+                    let nonceMaterial = SymmetricKey(size: .bits256)
+                        .withUnsafeBytes { Data($0) }
+                    let manifest = NoctCordAttachmentManifestV1(
+                        blobID: Data(attachmentID.uuidString.lowercased().utf8),
+                        blobCapability: SymmetricKey(size: .bits256)
+                            .withUnsafeBytes { Data($0) },
+                        mediaType: sanitized.mimeType,
+                        size: UInt64(sanitized.bytes.count),
+                        digest: Data(SHA256.hash(data: sanitized.bytes)),
+                        expiresAt: Date().addingTimeInterval(24 * 60 * 60),
+                        encryption: NoctCordAttachmentEncryptionMetadataV1(
+                            keyID: Data(UUID().uuidString.lowercased().utf8),
+                            contentKey: keyMaterial,
+                            nonce: Data(nonceMaterial.prefix(12))
+                        )
+                    )
+                    cachedAttachments[attachmentID] = NoctCordDownloadedAttachment(
+                        id: attachmentID,
+                        bytes: sanitized.bytes,
+                        mediaType: sanitized.mimeType
+                    )
+                    perform(
+                        .addAttachment(
+                            id: attachmentID,
+                            channelID: channelID,
+                            manifest: manifest
+                        ),
+                        spaceID: spaceID
+                    )
+                    activityMessage = nil
+                    return
+                }
+
+                guard let transport else {
+                    throw NoctCordTransportError.invalidConfiguration
+                }
                 activityMessage = "Encrypting and uploading…"
                 let transfer = try await transport.attachmentTransfer(for: spaceID)
                 let uploaded = try await transfer.upload(
@@ -1332,7 +1401,11 @@ public final class NoctCordAppModel: ObservableObject {
                 activityMessage = nil
             } catch {
                 activityMessage = nil
-                connectionState = .failed(error.localizedDescription)
+                if previewMode {
+                    composerNotice = "The attachment could not be sanitized: \(error.localizedDescription)"
+                } else {
+                    connectionState = .failed(error.localizedDescription)
+                }
             }
         }
     }
