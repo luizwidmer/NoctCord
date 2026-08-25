@@ -835,7 +835,7 @@ public struct NoctCordWebRTCMediaDriver: NoctCordMediaDriver {
         _ = eventHandler
         _ = signalingSink
         throw NoctCordMediaError.runtimeUnavailable(
-            "stasel/WebRTC 150.0.0 is unavailable for this target"
+            "stasel/WebRTC 151.0.0 is unavailable for this target"
         )
     }
 }

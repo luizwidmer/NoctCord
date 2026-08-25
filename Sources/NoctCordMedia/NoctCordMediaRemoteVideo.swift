@@ -62,7 +62,7 @@ public final class NoctCordMediaRemoteVideoTrack: @unchecked Sendable, Equatable
 #else
         _ = renderer
         throw NoctCordMediaError.runtimeUnavailable(
-            "stasel/WebRTC 150.0.0 is unavailable for this target"
+            "stasel/WebRTC 151.0.0 is unavailable for this target"
         )
 #endif
     }
@@ -81,7 +81,7 @@ public final class NoctCordMediaRemoteVideoTrack: @unchecked Sendable, Equatable
 #else
         _ = renderer
         throw NoctCordMediaError.runtimeUnavailable(
-            "stasel/WebRTC 150.0.0 is unavailable for this target"
+            "stasel/WebRTC 151.0.0 is unavailable for this target"
         )
 #endif
     }

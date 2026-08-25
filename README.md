@@ -86,7 +86,7 @@ relay plaintext application authority.
   8 MiB after sanitization; the relay module permits up to 32 MiB in total.
 - **Voice rooms.** A permitted member can join a room created by a member with
   channel-management permission. The native media layer uses raw WebRTC from
-  `stasel/WebRTC` 150.0.0 and creates a peer mesh for audio and renegotiation.
+  `stasel/WebRTC` 151.0.0 and creates a peer mesh for audio and renegotiation.
   The current client caps rooms at eight participants so uplink and CPU use do
   not grow without an explicit media-forwarding design.
 - **Authenticated custom signaling.** SDP, ICE candidates, join/leave state,
@@ -149,7 +149,7 @@ entitlements to its platform bundle.
 
 Requirements: Swift 6, macOS 14 or later for the desktop app, iOS 17 or later
 for the package's iOS surface, and the Swift package dependency
-`stasel/WebRTC` 150.0.0. By default, Noct Cord resolves Noctweave from its
+`stasel/WebRTC` 151.0.0. By default, Noct Cord resolves Noctweave from its
 public package URL. For local protocol development, point it at a checkout:
 
 ```sh

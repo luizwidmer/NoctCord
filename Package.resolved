@@ -1,12 +1,12 @@
 {
-  "originHash" : "8ed1cc6e2fcaab678523f3bc69034b854e5d9abe46b4caae0a23172081633d27",
+  "originHash" : "b76f952c8f5d7d9d7c798e735fd3017e8521319f316cd0a35213bb708c4c5a63",
   "pins" : [
     {
       "identity" : "noctweave",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/luizwidmer/Noctweave.git",
       "state" : {
-        "revision" : "4104f8c84a367035a48b99a6310fca3998cde9c7"
+        "revision" : "f8351b0412ec7f46c8fd18b4a5034d7a72f18d8f"
       }
     },
     {
@@ -14,8 +14,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/stasel/WebRTC.git",
       "state" : {
-        "revision" : "6ed87f05368632f71dc95c89c14c051561710925",
-        "version" : "150.0.0"
+        "revision" : "19aa8c1fc7120d50df987b7111f42d5024df3d54",
+        "version" : "151.0.0"
       }
     }
   ],

@@ -45,7 +45,7 @@ and a `NoctCordRealtimeRouteV1` containing route, append, and read capabilities
 plus an expiry. Members join by publishing a group-scoped join event and then
 opening a `NoctCordMediaRoom`.
 
-The current native driver uses `stasel/WebRTC` 150.0.0 and a peer mesh capped
+The current native driver uses `stasel/WebRTC` 151.0.0 and a peer mesh capped
 by the client at eight participants. Each
 peer exchanges microphone, offer, answer, ICE, join/leave, mute/deafen, and
 screen-share control messages through the custom signaling sink. Media samples
