@@ -383,10 +383,6 @@ private struct NoctCordSetupView: View {
     private var relayStage: some View {
         VStack(alignment: .leading, spacing: 13) {
             setupField("RELAY", placeholder: "https://relay.example", text: $relayAddress)
-            Text("The relay is checked before anything is saved. Calls use the relay's advertised STUN/TURN service when available.")
-                .font(.system(size: 10.5))
-                .foregroundStyle(NoctCordTheme.secondaryText)
-                .fixedSize(horizontal: false, vertical: true)
             DisclosureGroup(isExpanded: $showsRelayAccessOptions) {
                 setupField(
                     "RELAY PASSWORD",

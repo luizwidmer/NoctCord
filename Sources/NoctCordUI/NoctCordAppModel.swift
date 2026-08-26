@@ -175,7 +175,7 @@ public final class NoctCordAppModel: ObservableObject {
     @Published public var selectedChannelID: UUID?
     @Published public var composerText = ""
     @Published public var searchQuery = ""
-    @Published public var showsMemberInspector = true
+    @Published public var showsMemberInspector = false
     @Published public var showsCreateSpace = false
     @Published public var showsJoinSpace = false
     @Published public var showsInvitationExchange = false

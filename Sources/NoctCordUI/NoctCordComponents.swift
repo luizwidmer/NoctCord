@@ -165,19 +165,29 @@ struct NoctCordChannelSidebar: View {
                             .foregroundStyle(NoctCordTheme.primaryText)
                             .lineLimit(1)
                         Spacer()
-                        if model.canInviteToSelectedSpace {
-                            Button {
-                                model.showsInvitationExchange = true
-                            } label: {
-                                Image(systemName: "person.crop.circle.badge.plus")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .frame(width: 30, height: 30)
-                                    .background(NoctCordTheme.surface, in: Circle())
+                        Menu {
+                            if space.canManageChannels {
+                                Button("New text channel", systemImage: "number") {
+                                    model.showsCreateChannel = true
+                                }
+                                Button("New voice room", systemImage: "waveform") {
+                                    model.showsCreateVoiceRoom = true
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(NoctCordTheme.secondaryText)
-                            .help("Invite a member")
+                            if model.canInviteToSelectedSpace {
+                                Button("Invite a member", systemImage: "person.crop.circle.badge.plus") {
+                                    model.showsInvitationExchange = true
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "plus")
+                                .font(.system(size: 13, weight: .semibold))
+                                .frame(width: 30, height: 30)
+                                .background(NoctCordTheme.surface, in: Circle())
                         }
+                        .menuStyle(.borderlessButton)
+                        .foregroundStyle(NoctCordTheme.secondaryText)
+                        .help("Add to this community")
                         Button {
                             model.showsCommunitySettings = true
                         } label: {
@@ -210,7 +220,9 @@ struct NoctCordChannelSidebar: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 22) {
                         channelSection(space)
-                        voiceSection(space)
+                        if !space.voiceRooms.isEmpty {
+                            voiceSection(space)
+                        }
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 18)
@@ -267,20 +279,12 @@ struct NoctCordChannelSidebar: View {
                     ? { model.showsCreateVoiceRoom = true }
                     : nil
             )
-            if space.voiceRooms.isEmpty {
-                Text("No rooms yet")
-                    .font(.system(size: 12))
-                    .foregroundStyle(NoctCordTheme.secondaryText.opacity(0.72))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-            } else {
-                ForEach(space.voiceRooms) { room in
-                    VoiceRoomRow(
-                        room: room,
-                        isActive: space.activeVoiceRoomID == room.id
-                    ) {
-                        model.joinVoiceRoom(room.id)
-                    }
+            ForEach(space.voiceRooms) { room in
+                VoiceRoomRow(
+                    room: room,
+                    isActive: space.activeVoiceRoomID == room.id
+                ) {
+                    model.joinVoiceRoom(room.id)
                 }
             }
         }
@@ -1000,41 +1004,53 @@ private struct AttachmentRow: View {
     @State private var isHovered = false
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                preview
-                    .frame(width: 64, height: 52)
-                    .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 11))
-                    .clipShape(RoundedRectangle(cornerRadius: 11))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(typeLabel)
-                        .font(.system(size: 12.5, weight: .semibold))
-                    Text("\(ByteCountFormatter.string(fromByteCount: Int64(attachment.byteCount), countStyle: .file)) · encrypted")
+        HStack(spacing: 8) {
+            Button(action: action) {
+                HStack(spacing: 12) {
+                    preview
+                        .frame(width: 64, height: 52)
+                        .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 11))
+                        .clipShape(RoundedRectangle(cornerRadius: 11))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(typeLabel)
+                            .font(.system(size: 12.5, weight: .semibold))
+                        Label(
+                            attachment.isExpired ? "Encrypted · relay copy expired" : "Encrypted · relay copy available",
+                            systemImage: attachment.isExpired ? "clock.badge.exclamationmark" : "lock.fill"
+                        )
                         .font(.system(size: 10.5))
-                        .foregroundStyle(NoctCordTheme.secondaryText)
-                    Text(attachment.isExpired ? "Relay copy expired" : "Available until \(attachment.expiresAt.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.system(size: 9.5))
                         .foregroundStyle(attachment.isExpired ? NoctCordTheme.warning : NoctCordTheme.secondaryText)
+                    }
+                    Spacer()
+                    Image(systemName: attachment.isAvailableLocally ? "eye" : "arrow.down.circle")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(NoctCordTheme.mutedCoral)
+                        .frame(width: 34, height: 34)
+                        .background(NoctCordTheme.mutedCoral.opacity(0.10), in: Circle())
                 }
-                Spacer()
-                Image(systemName: attachment.isAvailableLocally ? "eye" : "arrow.down.circle")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(NoctCordTheme.mutedCoral)
-                    .frame(width: 34, height: 34)
-                    .background(NoctCordTheme.mutedCoral.opacity(0.10), in: Circle())
+                .contentShape(Rectangle())
             }
-            .foregroundStyle(NoctCordTheme.primaryText)
-            .padding(10)
-            .frame(maxWidth: 430)
-            .background(
-                isHovered ? NoctCordTheme.elevated : NoctCordTheme.surface,
-                in: RoundedRectangle(cornerRadius: 15)
-            )
-            .overlay { RoundedRectangle(cornerRadius: 15).stroke(NoctCordTheme.border) }
-            .contentShape(RoundedRectangle(cornerRadius: 15))
+            .buttonStyle(.plain)
+            .disabled(attachment.isExpired && !attachment.isAvailableLocally)
+
+            Menu {
+                Text(ByteCountFormatter.string(fromByteCount: Int64(attachment.byteCount), countStyle: .file))
+                Text(attachment.isExpired ? "Relay copy expired" : "Available until \(attachment.expiresAt.formatted(date: .abbreviated, time: .shortened))")
+            } label: {
+                Image(systemName: "info.circle")
+                    .frame(width: 30, height: 30)
+            }
+            .menuStyle(.borderlessButton)
+            .help("Attachment details")
         }
-        .buttonStyle(.plain)
-        .disabled(attachment.isExpired && !attachment.isAvailableLocally)
+        .foregroundStyle(NoctCordTheme.primaryText)
+        .padding(10)
+        .frame(maxWidth: 430)
+        .background(
+            isHovered ? NoctCordTheme.elevated : NoctCordTheme.surface,
+            in: RoundedRectangle(cornerRadius: 15)
+        )
+        .overlay { RoundedRectangle(cornerRadius: 15).stroke(NoctCordTheme.border) }
         .noctCordOnHover { isHovered = $0 }
         .padding(.vertical, 4)
     }
