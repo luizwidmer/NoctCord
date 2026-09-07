@@ -496,7 +496,7 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
             relay: endpoint,
             existingMembers: [],
             seed: 0x31,
-            startedAt: startedAt.addingTimeInterval(2)
+            startedAt: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         mark("member-one-admitted")
         try await admit(
@@ -506,7 +506,9 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
             relay: endpoint,
             existingMembers: [memberOne],
             seed: 0x41,
-            startedAt: startedAt.addingTimeInterval(7)
+            // Group admission performs real PQ work. Use the current time so a
+            // slow first admission cannot expire the second route's proof.
+            startedAt: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         mark("member-two-admitted")
 
