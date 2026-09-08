@@ -366,6 +366,7 @@ struct NoctCordUserSettingsSheet: View {
                 Toggle("", isOn: privacyBinding(keyPath))
                     .labelsHidden()
                     .toggleStyle(.switch)
+                    .tint(NoctCordTheme.mutedCoral)
             }
         }
     }

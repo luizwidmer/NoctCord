@@ -533,7 +533,9 @@ private struct VoiceRoomRow: View {
 
 struct NoctCordConversationHeader: View {
     @ObservedObject var model: NoctCordAppModel
+    @Environment(\.scenePhase) private var scenePhase
     let compact: Bool
+    @State private var showsCompactMembers = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -544,15 +546,15 @@ struct NoctCordConversationHeader: View {
                 Text(model.selectedChannel?.name ?? "Select a channel")
                     .font(.system(size: 16, weight: .bold, design: .rounded))
                     .foregroundStyle(NoctCordTheme.primaryText)
-                if !compact {
-                    Text("Encrypted community channel")
-                        .font(.system(size: 10))
-                        .foregroundStyle(NoctCordTheme.secondaryText)
-                }
+                    .lineLimit(1)
+                Text("Encrypted community channel")
+                    .font(.system(size: 10))
+                    .foregroundStyle(NoctCordTheme.secondaryText)
+                    .lineLimit(1)
             }
             Spacer(minLength: 8)
 
-            if !compact {
+            Group {
                 HStack(spacing: 7) {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 11, weight: .medium))
@@ -562,30 +564,53 @@ struct NoctCordConversationHeader: View {
                 }
                 .foregroundStyle(NoctCordTheme.secondaryText)
                 .padding(.horizontal, 11)
-                .frame(width: 176, height: 32)
-                .background(NoctCordTheme.input, in: Capsule())
-                .overlay { Capsule().stroke(NoctCordTheme.border, lineWidth: 1) }
+                .frame(width: compact ? 140 : 176, height: 36)
+                .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(NoctCordTheme.border, lineWidth: 1) }
             }
 
-            if !compact {
+            Group {
                 HeaderIconButton(
-                    symbol: model.showsMemberInspector ? "person.2.fill" : "person.2",
+                    symbol: membersVisible ? "person.2.fill" : "person.2",
                     help: "Toggle member list",
-                    isActive: model.showsMemberInspector
+                    isActive: membersVisible
                 ) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        model.showsMemberInspector.toggle()
+                    if compact {
+                        showsCompactMembers.toggle()
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            model.showsMemberInspector.toggle()
+                        }
                     }
+                }
+                .popover(isPresented: $showsCompactMembers, arrowEdge: .bottom) {
+                    NoctCordMemberInspector(model: model, compact: true, onClose: { showsCompactMembers = false })
+                        .frame(height: 420)
+                        .background {
+                            NoctCordWindowCaptureProtection(blocked: model.privacySettings.macBlockWindowCapture)
+                                .frame(width: 0, height: 0)
+                        }
                 }
             }
         }
+        .frame(height: 44)
         .padding(.horizontal, 22)
-        .padding(.bottom, 13)
+        .padding(.bottom, 15)
         .frame(height: NoctCordTheme.headerHeight, alignment: .bottom)
         .background(NoctCordTheme.surface.opacity(0.88))
         .overlay(alignment: .bottom) {
             Rectangle().fill(NoctCordTheme.border).frame(height: 1)
         }
+        .onChange(of: compact) { _, _ in showsCompactMembers = false }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active && model.privacySettings.hideSensitiveWhenUnfocused {
+                showsCompactMembers = false
+            }
+        }
+    }
+
+    private var membersVisible: Bool {
+        compact ? showsCompactMembers : model.showsMemberInspector
     }
 }
 
@@ -1199,6 +1224,8 @@ struct NoctCordAttachmentViewer: View {
 
 struct NoctCordMemberInspector: View {
     @ObservedObject var model: NoctCordAppModel
+    var compact = false
+    var onClose: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1214,8 +1241,12 @@ struct NoctCordMemberInspector: View {
                     }
                     Spacer()
                     Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            model.showsMemberInspector = false
+                        if let onClose {
+                            onClose()
+                        } else {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                model.showsMemberInspector = false
+                            }
                         }
                     } label: {
                         Image(systemName: "xmark")
@@ -1228,11 +1259,11 @@ struct NoctCordMemberInspector: View {
                 }
                 .padding(.horizontal, 17)
                 .padding(.bottom, 16)
-                .frame(height: NoctCordTheme.headerHeight, alignment: .bottom)
+                .frame(height: compact ? 64 : NoctCordTheme.headerHeight, alignment: .bottom)
 
                 Divider().overlay(NoctCordTheme.border)
 
-                ScrollView(.vertical, showsIndicators: false) {
+                ScrollView(.vertical, showsIndicators: compact) {
                     VStack(alignment: .leading, spacing: 20) {
                         memberSection("Active", members: space.members.filter { $0.presence == .active })
                         memberSection("Away", members: space.members.filter { $0.presence == .away })
