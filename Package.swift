@@ -15,7 +15,7 @@ if let localPath = ProcessInfo.processInfo.environment["NOCTWEAVE_PACKAGE_PATH"]
 } else {
     noctweaveDependency = .package(
         url: "https://github.com/luizwidmer/Noctweave.git",
-        revision: "f8351b0412ec7f46c8fd18b4a5034d7a72f18d8f"
+        revision: "7ffaff6b74d8ede577a130f1d88275a3066d0fd3"
     )
     noctweavePackageIdentity = "Noctweave"
 }
@@ -37,7 +37,8 @@ let package = Package(
         noctweaveDependency,
         .package(
             url: "https://github.com/stasel/WebRTC.git",
-            exact: "151.0.0"
+            // M152 includes matching distribution symbols. Pin the source and binary checksum.
+            revision: "1d04692697cb642bfebf6ad2dd99fe52649c3d6d"
         ),
     ],
     targets: [

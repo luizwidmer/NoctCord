@@ -307,6 +307,12 @@ public actor NoctCordTransportCoordinator {
         self.relayAccessPassword = relayAccessPassword
     }
 
+    /// Called after polling tasks stop. Full local reset must work offline and
+    /// does not need to wait for remote unsubscribe acknowledgements.
+    public func discardRealtimeRooms() {
+        realtimeSubscriptions.removeAll()
+    }
+
     public func storedSpaceIDs() async -> [UUID] {
         await client.snapshot().activePersona.groupRuntimes
             .filter { $0.localRemoval == nil && $0.deletionState == nil }

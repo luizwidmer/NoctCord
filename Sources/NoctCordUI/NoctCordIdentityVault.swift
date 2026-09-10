@@ -46,11 +46,14 @@ actor NoctCordIdentityVault {
     }
 
     private let fileURL: URL
-    private let suppliedKey: SymmetricKey?
+    private var suppliedKey: SymmetricKey?
+    private let usesSuppliedKey: Bool
+    private var isRetired = false
 
     init(fileURL: URL, encryptionKey: SymmetricKey? = nil) {
         self.fileURL = fileURL.standardizedFileURL
         suppliedKey = encryptionKey
+        usesSuppliedKey = encryptionKey != nil
     }
 
     func binding(
@@ -60,6 +63,7 @@ actor NoctCordIdentityVault {
         memberHandle: GroupScopedMemberHandleV2,
         issuedAt: Date = Date()
     ) throws -> NoctCordCommunityIdentityBindingV1 {
+        guard !isRetired else { throw NoctCordIdentityVaultError.unavailable }
         var state = try load()
         let key: NoctCordIdentityKeyV1
         switch scope {
@@ -93,6 +97,24 @@ actor NoctCordIdentityVault {
         )
         try save(state)
         return binding
+    }
+
+    /// Terminal for this instance; a new session must create a new vault.
+    func purge() throws {
+        isRetired = true
+        suppliedKey = nil
+        var failure: Error?
+        if !usesSuppliedKey {
+            let account = Data(SHA256.hash(data: Data(fileURL.path.utf8))).base64EncodedString()
+            do { try SecureStorageKeyProvider.shared.destroyKey(service: Self.keychainService, account: account) }
+            catch { failure = error }
+        }
+        do {
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try FileManager.default.removeItem(at: fileURL)
+            }
+        } catch { failure = error }
+        if let failure { throw failure }
     }
 
     private func load() throws -> State {

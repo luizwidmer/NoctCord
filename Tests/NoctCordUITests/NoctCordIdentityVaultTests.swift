@@ -64,6 +64,15 @@ final class NoctCordIdentityVaultTests: XCTestCase {
         )
         XCTAssertEqual(isolatedOne.profile.identityID, isolatedAgain.profile.identityID)
         XCTAssertTrue(try isolatedAgain.verify())
+        try await firstVault.purge()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        do {
+            _ = try await firstVault.binding(scope: .portable, displayName: "Late writer", spaceID: firstSpace, memberHandle: firstMember)
+            XCTFail("A retired vault recreated its key")
+        } catch is NoctCordIdentityVaultError {}
+        let fresh = NoctCordIdentityVault(fileURL: fileURL, encryptionKey: encryptionKey)
+        let freshBinding = try await fresh.binding(scope: .portable, displayName: "Fresh", spaceID: firstSpace, memberHandle: firstMember)
+        XCTAssertNotEqual(freshBinding.profile.identityID, portableOne.profile.identityID)
     }
 
     func testVaultRejectsSymlinkedStorage() async throws {

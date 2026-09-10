@@ -14,22 +14,38 @@ final class NoctCordAppDelegate: NSObject, NSApplicationDelegate {
 
 @main
 struct NoctCordApplication: App {
+    @StateObject private var support = AppSupportStore.shared
+
     #if os(macOS)
     @NSApplicationDelegateAdaptor(NoctCordAppDelegate.self) private var appDelegate
     #endif
 
+    @StateObject private var session = NoctCordApplicationSession()
+
     var body: some Scene {
         WindowGroup("Noct Cord") {
-            NoctCordRootView(
-                seedPreviewData: previewDataEnabled && liveUITestConfiguration == nil,
-                liveUITestConfiguration: liveUITestConfiguration
-            )
+            NoctCordRootView(model: session.model)
+                .id(ObjectIdentifier(session.model))
                 .frame(minWidth: 980, minHeight: 680)
         }
         #if os(macOS)
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1_330, height: 820)
         #endif
+    }
+
+}
+
+@MainActor
+private final class NoctCordApplicationSession: ObservableObject {
+    @Published private(set) var model: NoctCordAppModel!
+
+    init() { replace(afterReset: false) }
+
+    private func replace(afterReset: Bool) {
+        model = NoctCordAppModel(seedPreviewData: previewDataEnabled && liveUITestConfiguration == nil,
+            liveUITestConfiguration: liveUITestConfiguration, afterReset: afterReset)
+        model.onResetCompleted = { [weak self] in self?.replace(afterReset: true) }
     }
 
     private var previewDataEnabled: Bool {

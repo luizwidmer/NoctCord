@@ -201,6 +201,17 @@ public final class NoctCordAppModel: ObservableObject {
     @Published public private(set) var callConnectivityDescription =
         "Call traversal will be discovered from the relay when available."
 
+    @Published public private(set) var isResetting = false
+    @Published public private(set) var resetIsPending = false
+    public var onResetCompleted: (() -> Void)?
+    private var operations: [UUID: Task<Void, Never>] = [:]
+    private var directOperations = 0
+    private var resetWaiters: [CheckedContinuation<Void, Never>] = []
+    private let resetStateURL: URL
+    private let resetScope: String
+    private let resetUsesPlaintext: Bool
+    private let isolatedStorage: Bool
+    private var resetMarkerURL: URL { resetStateURL.appendingPathExtension("purge-pending-v1") }
     private let previewMode: Bool
     private let identityVault: NoctCordIdentityVault
     private var transport: NoctCordTransportCoordinator?
@@ -216,7 +227,8 @@ public final class NoctCordAppModel: ObservableObject {
 
     public init(
         seedPreviewData: Bool = false,
-        liveUITestConfiguration: NoctCordTransportConfiguration? = nil
+        liveUITestConfiguration: NoctCordTransportConfiguration? = nil,
+        afterReset: Bool = false
     ) {
         #if DEBUG
         let liveConfiguration = liveUITestConfiguration
@@ -225,6 +237,15 @@ public final class NoctCordAppModel: ObservableObject {
         #endif
         let usesPreview = seedPreviewData && liveConfiguration == nil
         previewMode = usesPreview
+        isolatedStorage = usesPreview || liveConfiguration != nil
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("NoctCord", isDirectory: true)
+        resetStateURL = liveConfiguration?.stateURL ?? (usesPreview
+            ? FileManager.default.temporaryDirectory.appendingPathComponent("noctcord-reset-preview-\(UUID())", isDirectory: true).appendingPathComponent("state")
+            : support.appendingPathComponent("client-state.noctcord"))
+        resetScope = liveConfiguration?.storageScopeIdentifier
+            ?? NoctCordTransportConfiguration.defaultStorageScopeIdentifier(for: resetStateURL)
+        resetUsesPlaintext = usesPreview || liveConfiguration?.usesInsecurePlaintextStateForTesting == true
         let savedName = UserDefaults.standard.string(forKey: "NoctCord.displayName")?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         userDisplayName = liveConfiguration?.displayName
@@ -237,8 +258,7 @@ public final class NoctCordAppModel: ObservableObject {
             )
         } else if usesPreview {
             identityVault = NoctCordIdentityVault(
-                fileURL: FileManager.default.temporaryDirectory
-                    .appendingPathComponent("noctcord-preview-\(UUID().uuidString).vault"),
+                fileURL: resetStateURL.deletingLastPathComponent().appendingPathComponent("identity-vault"),
                 encryptionKey: SymmetricKey(size: .bits256)
             )
         } else {
@@ -254,16 +274,90 @@ public final class NoctCordAppModel: ObservableObject {
                     .appendingPathComponent("identity-vault.noctcord")
             )
         }
-        spaces = usesPreview ? Self.previewSpaces() : []
-        connectionState = usesPreview
+        spaces = usesPreview && !afterReset ? Self.previewSpaces() : []
+        connectionState = usesPreview && !afterReset
             ? .preview
             : (liveConfiguration == nil ? .needsSetup : .connecting)
         selectedSpaceID = spaces.first?.id
         selectedChannelID = spaces.first?.textChannels.first?.id
-        if let liveConfiguration {
-            Task { [weak self] in
-                await self?.connect(configuration: liveConfiguration)
+        if FileManager.default.fileExists(atPath: resetMarkerURL.path) {
+            resetIsPending = true
+            Task { [weak self] in await self?.purgeAndReset() }
+        } else if let liveConfiguration, !afterReset {
+            runOperation { [weak self] in await self?.connect(configuration: liveConfiguration) }
+        }
+    }
+
+    @discardableResult
+    private func runOperation(_ body: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
+        let id = UUID()
+        let task = Task { [weak self] in
+            defer { self?.operations[id] = nil }
+            guard !Task.isCancelled, self?.resetIsPending == false else { return }
+            await body()
+        }
+        operations[id] = task
+        return task
+    }
+
+    private func endDirectOperation() {
+        directOperations -= 1
+        if directOperations == 0 {
+            let waiters = resetWaiters; resetWaiters = []
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    public func purgeAndReset() async {
+        guard !isResetting else { return }
+        isResetting = true
+        defer { isResetting = false }
+        do {
+            try NoctCordSecureFileIO.writeAtomicPrivateFile(Data("purge-v1".utf8), to: resetMarkerURL, maximumBytes: 64)
+            resetIsPending = true
+            showsUserSettings = false
+            let pending = Array(operations.values)
+            pending.forEach { $0.cancel() }
+            refreshTask?.cancel(); mediaRefreshTask?.cancel(); communityLifecycleRecoveryTask?.cancel()
+            for operation in pending { await operation.value }
+            if directOperations > 0 { await withCheckedContinuation { resetWaiters.append($0) } }
+            if let mediaRoom { await mediaRoom.leave() }
+            mediaRoom = nil
+            if let transport { await transport.discardRealtimeRooms() }
+            transport = nil
+            try await identityVault.purge()
+            let store = ClientStateStore(fileURL: resetStateURL,
+                protection: resetUsesPlaintext ? .insecurePlaintextForTesting : .encrypted,
+                storageScopeIdentifier: resetScope)
+            if resetUsesPlaintext { try await store.eraseAllLocalState() }
+            else { try await store.destroyLocalEncryptionMaterial(preservingCiphertext: false) }
+            spaces = []; cachedAttachments = [:]; identityScopes = [:]
+            callSnapshot = nil; processedCallSignalIDs = []; iceServers = []
+            relayICECredentialExpiresAt = nil; relayProfiles = []; privacySettings = PrivacySettings()
+            composerText = ""; searchQuery = ""; stagedInvitationCode = ""
+            selectedSpaceID = nil; selectedChannelID = nil; selectedAttachmentID = nil
+            connectionState = .needsSetup; activityMessage = nil; settingsNotice = nil
+            if !isolatedStorage {
+                for file in try FileManager.default.contentsOfDirectory(at: resetStateURL.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+                    where file.standardizedFileURL != resetMarkerURL.standardizedFileURL {
+                    try FileManager.default.removeItem(at: file)
+                }
             }
+            if !isolatedStorage, let domain = Bundle.main.bundleIdentifier {
+                UserDefaults.standard.removePersistentDomain(forName: domain)
+                URLCache.shared.removeAllCachedResponses()
+                let temporary = FileManager.default.temporaryDirectory
+                for file in try FileManager.default.contentsOfDirectory(at: temporary, includingPropertiesForKeys: nil)
+                    where file.lastPathComponent.hasPrefix("noctcord-media-") || file.lastPathComponent.hasPrefix("noctcord-source-") {
+                    try FileManager.default.removeItem(at: file)
+                }
+            }
+            try FileManager.default.removeItem(at: resetMarkerURL)
+            if previewMode { try FileManager.default.removeItem(at: resetStateURL.deletingLastPathComponent()) }
+            // Keep this instance retired until the containing session replaces it.
+            onResetCompleted?()
+        } catch {
+            connectionState = .failed("Reset could not finish. Retry to complete removal: \(error.localizedDescription)")
         }
     }
 
@@ -383,6 +477,9 @@ public final class NoctCordAppModel: ObservableObject {
         configuration: NoctCordTransportConfiguration,
         iceServers: [NoctCordMediaICEServer] = []
     ) async {
+        guard !resetIsPending else { return }
+        directOperations += 1
+        defer { endDirectOperation() }
         refreshTask?.cancel()
         permitsLocalStateReset = false
         connectionState = .connecting
@@ -447,7 +544,7 @@ public final class NoctCordAppModel: ObservableObject {
             activityMessage = nil
             beginAutomaticRefresh()
             if usesRelayDiscoveredICE, let selectedSpaceID {
-                Task {
+                runOperation { [self] in
                     await refreshRelayCallConnectivity(
                         using: coordinator,
                         for: selectedSpaceID
@@ -467,6 +564,9 @@ public final class NoctCordAppModel: ObservableObject {
         configuration: NoctCordTransportConfiguration,
         iceServers: [NoctCordMediaICEServer] = []
     ) async {
+        guard !resetIsPending else { return }
+        directOperations += 1
+        defer { endDirectOperation() }
         refreshTask?.cancel()
         connectionState = .connecting
         activityMessage = "Resetting protected local transport state…"
@@ -485,6 +585,9 @@ public final class NoctCordAppModel: ObservableObject {
     }
 
     public func retryConnection() async {
+        guard !resetIsPending else { return }
+        directOperations += 1
+        defer { endDirectOperation() }
         guard let transport else { return }
         connectionState = .connecting
         do {
@@ -501,13 +604,13 @@ public final class NoctCordAppModel: ObservableObject {
            current.id != id,
            let roomID = current.activeVoiceRoomID,
            !previewMode {
-            Task { await leaveVoiceRoom(spaceID: current.id, roomID: roomID) }
+            runOperation { [self] in await leaveVoiceRoom(spaceID: current.id, roomID: roomID) }
         }
         selectedSpaceID = id
         selectedChannelID = spaces.first { $0.id == id }?.textChannels.first?.id
         searchQuery = ""
         if !previewMode, usesRelayDiscoveredICE, let transport {
-            Task {
+            runOperation { [self] in
                 await refreshRelayCallConnectivity(using: transport, for: id)
             }
         }
@@ -590,7 +693,7 @@ public final class NoctCordAppModel: ObservableObject {
             ? .removeReaction(value, from: messageID)
             : .addReaction(value, to: messageID)
         if !previewMode {
-            Task {
+            runOperation { [self] in
                 await publishAndRefresh(operation, spaceID: space.id)
             }
             return
@@ -622,7 +725,7 @@ public final class NoctCordAppModel: ObservableObject {
             }
             showsCreateSpace = false
             activityMessage = "Creating encrypted space…"
-            Task {
+            runOperation { [self] in
                 do {
                     let bootstrap = try await transport.createSpace(
                         name: cleanName,
@@ -712,6 +815,9 @@ public final class NoctCordAppModel: ObservableObject {
     public func makeCommunityInvitation(
         lifetime: TimeInterval = 60 * 60
     ) async throws -> String {
+        guard !resetIsPending else { throw CancellationError() }
+        directOperations += 1
+        defer { endDirectOperation() }
         guard let transport, let space = selectedSpace else {
             throw NoctCordTransportError.invalidConfiguration
         }
@@ -732,6 +838,9 @@ public final class NoctCordAppModel: ObservableObject {
         invitationCode: String,
         identityScope: NoctCordIdentityScope
     ) async throws -> NoctCordPreparedCommunityAdmission {
+        guard !resetIsPending else { throw CancellationError() }
+        directOperations += 1
+        defer { endDirectOperation() }
         guard let transport else {
             throw NoctCordTransportError.invalidConfiguration
         }
@@ -749,6 +858,9 @@ public final class NoctCordAppModel: ObservableObject {
     public func approveCommunityAdmissionRequest(
         _ requestCode: String
     ) async throws -> String {
+        guard !resetIsPending else { throw CancellationError() }
+        directOperations += 1
+        defer { endDirectOperation() }
         guard let transport, let spaceID = selectedSpaceID else {
             throw NoctCordTransportError.invalidConfiguration
         }
@@ -769,6 +881,9 @@ public final class NoctCordAppModel: ObservableObject {
     public func acceptCommunityAdmissionResponse(
         _ responseCode: String
     ) async throws -> UUID {
+        guard !resetIsPending else { throw CancellationError() }
+        directOperations += 1
+        defer { endDirectOperation() }
         guard let transport else {
             throw NoctCordTransportError.invalidConfiguration
         }
@@ -806,6 +921,9 @@ public final class NoctCordAppModel: ObservableObject {
     /// from the active UI. The transport keeps its encrypted terminal record
     /// so old ciphertext cannot silently recreate membership.
     public func leaveSelectedCommunity() async throws {
+        guard !resetIsPending else { throw CancellationError() }
+        directOperations += 1
+        defer { endDirectOperation() }
         guard let space = selectedSpace else {
             throw NoctCordTransportError.spaceNotFound
         }
@@ -818,6 +936,9 @@ public final class NoctCordAppModel: ObservableObject {
     /// Publishes the owner's terminal group tombstone and removes the
     /// community from the active UI only after relay acknowledgement.
     public func destroySelectedCommunity() async throws {
+        guard !resetIsPending else { throw CancellationError() }
+        directOperations += 1
+        defer { endDirectOperation() }
         guard let space = selectedSpace else {
             throw NoctCordTransportError.spaceNotFound
         }
@@ -840,7 +961,7 @@ public final class NoctCordAppModel: ObservableObject {
         let channelID = UUID()
         if !previewMode, let spaceID = selectedSpaceID {
             showsCreateChannel = false
-            Task {
+            runOperation { [self] in
                 await publishAndRefresh(
                     .createChannel(id: channelID, name: cleanName),
                     spaceID: spaceID,
@@ -873,7 +994,7 @@ public final class NoctCordAppModel: ObservableObject {
         guard let space = selectedSpace else { return }
         if !previewMode {
             let isLeaving = space.activeVoiceRoomID == id
-            Task {
+            runOperation { [self] in
                 if isLeaving {
                     await leaveVoiceRoom(spaceID: space.id, roomID: id)
                 } else {
@@ -901,7 +1022,7 @@ public final class NoctCordAppModel: ObservableObject {
         showsCreateVoiceRoom = false
         if !previewMode {
             guard let transport else { return }
-            Task {
+            runOperation { [self] in
                 activityMessage = "Creating realtime voice route…"
                 do {
                     let route = try await transport.createRealtimeRoute(for: space.id)
@@ -963,7 +1084,7 @@ public final class NoctCordAppModel: ObservableObject {
         guard let mediaRoom,
               let space = selectedSpace,
               let roomID = space.activeVoiceRoomID else { return }
-        Task {
+        runOperation { [self] in
             do {
                 try await mediaRoom.setMicrophoneMuted(muted)
                 let snapshot = await mediaRoom.snapshot()
@@ -990,7 +1111,7 @@ public final class NoctCordAppModel: ObservableObject {
         guard let mediaRoom,
               let space = selectedSpace,
               let roomID = space.activeVoiceRoomID else { return }
-        Task {
+        runOperation { [self] in
             do {
                 try await mediaRoom.setDeafened(deafened)
                 let snapshot = await mediaRoom.snapshot()
@@ -1018,7 +1139,7 @@ public final class NoctCordAppModel: ObservableObject {
               let space = selectedSpace,
               let roomID = space.activeVoiceRoomID,
               let projectedRoom = space.projection.voiceRooms[roomID] else { return }
-        Task {
+        runOperation { [self] in
             do {
                 #if os(macOS)
                 try await mediaRoom.startScreenShare(using: NoctCordMacScreenCaptureKitSource())
@@ -1059,7 +1180,7 @@ public final class NoctCordAppModel: ObservableObject {
         let shares = space.projection.activeScreenShares.values.filter {
             $0.roomID == roomID && $0.descriptor.presenter == space.currentMember
         }
-        Task {
+        runOperation { [self] in
             do {
                 try await mediaRoom.stopScreenShare()
                 callSnapshot = await mediaRoom.snapshot()
@@ -1083,6 +1204,9 @@ public final class NoctCordAppModel: ObservableObject {
         _ value: String,
         acrossAllCommunities: Bool
     ) async -> Bool {
+        guard !resetIsPending else { return false }
+        directOperations += 1
+        defer { endDirectOperation() }
         let cleanName = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanName.isEmpty, cleanName.utf8.count <= 128 else {
             settingsNotice = "Enter a display name of 128 bytes or fewer."
@@ -1170,7 +1294,7 @@ public final class NoctCordAppModel: ObservableObject {
             settingsNotice = "Privacy preferences are active on this device."
             return
         }
-        Task {
+        runOperation { [self] in
             do {
                 try await transport.updatePrivacySettings(settings)
                 settingsNotice = "Privacy preferences saved locally."
@@ -1187,6 +1311,9 @@ public final class NoctCordAppModel: ObservableObject {
         name: String,
         accessPassword: String
     ) async -> Bool {
+        guard !resetIsPending else { return false }
+        directOperations += 1
+        defer { endDirectOperation() }
         guard let transport else {
             settingsNotice = "Finish initial setup before adding another relay."
             return false
@@ -1218,7 +1345,7 @@ public final class NoctCordAppModel: ObservableObject {
         }
         guard let selectedSpaceID, let transport, let space = selectedSpace else { return }
         activityMessage = "Updating the community profile…"
-        Task {
+        runOperation { [self] in
             do {
                 let binding = try await identityVault.binding(
                     scope: scope,
@@ -1326,7 +1453,7 @@ public final class NoctCordAppModel: ObservableObject {
         guard let spaceID = selectedSpaceID,
               let channelID = selectedChannelID else { return }
         activityMessage = "Sanitizing attachment…"
-        Task {
+        runOperation { [self] in
             do {
                 let sanitized = try await NoctCordAttachmentSanitizer.sanitize(url: url)
                 if previewMode {
@@ -1418,7 +1545,7 @@ public final class NoctCordAppModel: ObservableObject {
               let channelID = selectedChannelID,
               let manifest = space.projection.attachments[id] else { return }
         activityMessage = "Downloading encrypted attachment…"
-        Task {
+        runOperation { [self] in
             do {
                 let transfer = try await transport.attachmentTransfer(for: space.id)
                 let downloaded = try await transfer.download(
@@ -1640,7 +1767,7 @@ public final class NoctCordAppModel: ObservableObject {
         localMember: GroupScopedMemberHandleV2
     ) {
         mediaRefreshTask?.cancel()
-        mediaRefreshTask = Task { [weak self] in
+        mediaRefreshTask = runOperation { [weak self] in
             while !Task.isCancelled {
                 if let realtime = try? await coordinator.synchronizeRealtimeCallSignals(
                     spaceID: spaceID,
@@ -1720,7 +1847,7 @@ public final class NoctCordAppModel: ObservableObject {
         activity: String? = nil
     ) {
         if !previewMode {
-            Task {
+            runOperation { [self] in
                 await publishAndRefresh(operation, spaceID: spaceID, activity: activity)
             }
             return
@@ -1747,7 +1874,7 @@ public final class NoctCordAppModel: ObservableObject {
 
     private func beginAutomaticRefresh() {
         refreshTask?.cancel()
-        refreshTask = Task { [weak self] in
+        refreshTask = runOperation { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled, let self, let transport = self.transport else { return }
@@ -1806,7 +1933,7 @@ public final class NoctCordAppModel: ObservableObject {
         using transport: NoctCordTransportCoordinator
     ) {
         guard communityLifecycleRecoveryTask == nil else { return }
-        communityLifecycleRecoveryTask = Task { [weak self] in
+        communityLifecycleRecoveryTask = runOperation { [weak self] in
             await transport.maintainAllStoredCommunities()
             guard !Task.isCancelled else { return }
             self?.communityLifecycleRecoveryTask = nil

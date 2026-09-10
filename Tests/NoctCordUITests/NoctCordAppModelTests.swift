@@ -5,6 +5,27 @@ import XCTest
 
 @MainActor
 final class NoctCordAppModelTests: XCTestCase {
+    func testPurgeDrainsPendingPreviewWorkAndReturnsToSetup() async throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("noctcord-reset-input-\(UUID()).txt")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data("private attachment".utf8).write(to: file)
+        model.sendAttachment(at: file)
+        model.composerText = "unsent draft"
+        model.searchQuery = "private search"
+        var resetCompleted = false
+        model.onResetCompleted = { resetCompleted = true }
+        await model.purgeAndReset()
+        XCTAssertTrue(resetCompleted)
+        XCTAssertFalse(model.isResetting)
+        XCTAssertTrue(model.spaces.isEmpty)
+        XCTAssertTrue(model.cachedAttachments.isEmpty)
+        XCTAssertTrue(model.composerText.isEmpty)
+        XCTAssertTrue(model.searchQuery.isEmpty)
+        XCTAssertEqual(model.connectionState, .needsSetup)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    }
+
     func testStateScopesSeparateSandboxedAppFromDevelopmentRuns() {
         let sandboxed = URL(fileURLWithPath:
             "/Users/member/Library/Containers/org.noctweave.noctcord/Data/Library/Application Support/NoctCord/client-state.noctcord"

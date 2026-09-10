@@ -20,9 +20,25 @@ public struct NoctCordRootView: View {
         )
     }
 
+    public init(model: NoctCordAppModel) {
+        _model = StateObject(wrappedValue: model)
+    }
+
     public var body: some View {
         Group {
-            if shouldShowSetup {
+            if model.resetIsPending {
+                VStack(spacing: 18) {
+                    Image(systemName: "arrow.counterclockwise").font(.largeTitle)
+                    Text("Finish resetting Noct Cord").font(.title2)
+                    if model.isResetting { ProgressView("Removing local data…") }
+                    else {
+                        if case .failed(let message) = model.connectionState {
+                            Text(message).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        }
+                        Button("Retry Reset", role: .destructive) { Task { await model.purgeAndReset() } }
+                    }
+                }.padding(40).frame(maxWidth: 600)
+            } else if shouldShowSetup {
                 NoctCordSetupView(model: model)
             } else {
                 GeometryReader { proxy in

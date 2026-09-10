@@ -9,11 +9,16 @@ struct NoctCordUserSettingsSheet: View {
     @State private var displayName = ""
     @State private var updateEveryCommunity = true
 
+    @State private var showsReset = false
+    @State private var resetConfirmation = ""
+
     private enum Section: String, CaseIterable, Identifiable {
         case profile = "Profile"
         case privacy = "Privacy"
         case relays = "Relays"
         case appearance = "Appearance"
+        case support = "Support & feedback"
+        case reset = "Reset app"
 
         var id: String { rawValue }
 
@@ -23,6 +28,8 @@ struct NoctCordUserSettingsSheet: View {
             case .privacy: "hand.raised.fill"
             case .relays: "network"
             case .appearance: "paintbrush.fill"
+            case .support: "heart"
+            case .reset: "trash"
             }
         }
 
@@ -32,6 +39,8 @@ struct NoctCordUserSettingsSheet: View {
             case .privacy: "Device protections with explicit limits."
             case .relays: "Use different relays for different communities."
             case .appearance: "Choose how Noct Cord looks on this device."
+            case .support: "Optional ways to support continued development."
+            case .reset: "Permanently remove data from this device."
             }
         }
     }
@@ -53,6 +62,15 @@ struct NoctCordUserSettingsSheet: View {
         }
         .foregroundStyle(NoctCordTheme.primaryText)
         .background(NoctCordTheme.canvas)
+        .alert("Purge and reset Noct Cord?", isPresented: $showsReset) {
+            TextField("Type RESET to confirm", text: $resetConfirmation)
+            Button("Cancel", role: .cancel) {}
+            Button("Purge and Reset", role: .destructive) {
+                Task { await model.purgeAndReset() }
+            }.disabled(resetConfirmation != "RESET")
+        } message: {
+            Text("All local communities, messages, profiles, keys, and settings will be removed. Active calls will end. Copies on other devices, relays, and backups remain. This cannot be undone. Type RESET to continue.")
+        }
         .onAppear {
             displayName = model.userDisplayName
         }
@@ -139,6 +157,20 @@ struct NoctCordUserSettingsSheet: View {
             NoctCordRelaySettings(model: model)
         case .appearance:
             appearanceSection
+        case .support:
+            AppSupportCard()
+        case .reset:
+            settingsCard {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Start again").font(.headline)
+                    Text("Remove all local communities, chats, profiles, encryption keys, cached attachments, and settings. Active calls end. Other members keep their copies; this does not destroy a community for everyone.")
+                        .font(.callout).foregroundStyle(NoctCordTheme.secondaryText)
+                    Button("Purge and Reset App…", role: .destructive) {
+                        resetConfirmation = ""; showsReset = true
+                    }.accessibilityIdentifier("app.purgeAndReset")
+                        .disabled(model.isResetting)
+                }
+            }
         }
     }
 
