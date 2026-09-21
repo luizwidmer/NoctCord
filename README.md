@@ -1,24 +1,94 @@
 <p align="center">
-  <img src="docs/assets/noct-cord-icon.png" width="104" alt="Noct Cord application icon">
+  <img src="docs/assets/noct-cord-icon.png" alt="Noct Cord icon" width="112">
 </p>
 
-# Noct Cord
+<a id="noct-cord"></a>
 
-[![License: AGPL v3 or later](https://img.shields.io/badge/license-AGPL--3.0--or--later-6757d9.svg)](LICENSE)
+<h1 align="center">Noct Cord</h1>
 
-Noct Cord is a native macOS/iOS community-chat client built on the Noctweave
-transport. It provides encrypted spaces, channels, roles, durable message
-history, sanitized attachments, and multi-member voice rooms without giving a
-relay plaintext application authority.
+<p align="center"><strong>Encrypted communities, channels, and calls.</strong></p>
 
-> Status: pre-1.0. The relay, attachment, signaling, and native media paths
-> described below are implemented and covered by local interoperability tests,
-> but this is not a security-audited or production-certified release. Signed
-> device, hostile-network, and deployment validation remain release gates.
+<p align="center">
+  <a href="#overview">Overview</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#security-and-privacy">Security</a> ·
+  <a href="#documentation">Documentation</a>
+</p>
+
+## Overview
+
+Noct Cord is a native community chat app built on Noctweave. Create encrypted
+spaces with channels, roles, durable messages, sanitized attachments, and
+small voice rooms. Relays provide transport and availability; application
+authority stays with the clients.
+
+| Detail | At a glance |
+| --- | --- |
+| Platform | macOS app · iOS libraries |
+| Built with | Swift 6 · SwiftUI · NoctweaveCore · WebRTC |
+| License | [AGPL-3.0-or-later](LICENSE) |
+
+> **Status:** Pre-1.0. Local tests and internal application reviews do not replace an independent audit or signed-device and deployment validation.
+
+<a id="build-and-run-locally"></a>
+
+## Quick start
+
+Run commands from this repository.
+
+Requirements: Swift 6, macOS 14 or later for the desktop app, iOS 17 or later
+for the package's iOS surface, and the Swift package dependency
+`stasel/WebRTC` M152 (pinned revision). By default, Noct Cord resolves Noctweave from its
+public package URL. Start from a source checkout; these commands use the pinned public dependency:
+
+```sh
+swift build
+swift test
+swift run NoctCordDemo
+swift run NoctCordApp
+```
+
+For local protocol development, set `NOCTWEAVE_PACKAGE_PATH` to the absolute
+path of a `NoctweaveCore` checkout before running these commands.
+
+`NoctCordDemo` is deterministic projection/codec smoke coverage. `NoctCordApp`
+starts with a full-screen setup flow: review the security boundary, choose the
+local display name, optionally paste a community invitation, and connect to a
+reachable relay with **Test relay and continue**. It does not create a local
+relay or insert a third-party relay. Community admission is available from the
+empty state and the community menu after setup.
+
+To build a launchable macOS bundle:
+
+```sh
+Scripts/build-macos-app.sh debug
+open "dist/Noct Cord.app"
+```
+
+The packaging script creates an App Sandbox bundle. It uses launchable ad-hoc
+signing by default; set `NOCTCORD_CODESIGN_IDENTITY` to a suitable Developer ID
+identity to enable the hardened runtime, secure timestamping, and distribution
+signing. The sandbox permits relay and WebRTC networking, microphone capture,
+and read-only access to files the user selects. Existing pre-sandbox local state
+is not imported automatically. Sandboxed bundles and local `swift run` builds
+use separate Keychain rollback-anchor scopes; a mismatch inside either scope
+fails before relay I/O and can be cleared only through the explicit destructive
+reset shown by the setup flow.
+
+For local UI inspection, a debug bundle can start with deterministic sample
+spaces by launching its executable with `NOCTCORD_PREVIEW_DATA=1`. Release
+builds always ignore this environment variable.
+
+The package exposes `NoctCordCore`, `NoctCordMedia`, and `NoctCordUI` libraries.
+An iOS host application must embed the UI/media libraries, configure signing
+and permission declarations, and supply the same relay configuration.
+
+<a id="current-capabilities"></a>
+
+## Features
 
 ![Noct Cord macOS interface](docs/assets/noct-cord-macos.jpeg)
-
-## Current capabilities
 
 - **Complete first-run and community admission flow.** Setup explains the
   trust boundary, creates a local display profile, verifies a real relay, and
@@ -127,7 +197,25 @@ negotiation. A TURN operator can observe traffic metadata, but this repository
 does not claim an independently audited application-level E2EE layer over the
 WebRTC media plane.
 
-## ICE, permissions, and privacy choices
+## Relay requirements
+
+For text and ordinary group sync, the client requires Noctweave core plus
+`nw.opaque-route@2` or `nw.realtime-route@1`, with temporal bucketing disabled.
+For current attachment uploads, the relay must advertise
+`nw.media-blobs@1`. Voice-room signaling requires a standard relay advertising
+`nw.realtime-route@1`; it is not supported by passthrough or host-only relay
+roles. The client reads the relay capability manifest and reports missing
+modules instead of silently assuming support.
+
+`nw.shared-log@1` and `nw.ephemeral-presence@1` are provisional relay modules.
+Noct Cord does not yet require presence, and channel history currently remains on
+the encrypted group event path. Do not describe a relay as Noct Cord-ready
+unless its advertised capabilities and the relevant interoperability tests
+match the feature being enabled.
+
+## Security and privacy
+
+### ICE, permissions, and privacy choices
 
 `NoctCordMediaICEServer` accepts only explicit `stun:`, `stuns:`, `turn:`, or
 `turns:` URLs. The client first checks the connected relay's optional
@@ -145,71 +233,7 @@ Broadcast Upload Extension and does not promise background screen capture.
 The application host must add the appropriate usage descriptions and
 entitlements to its platform bundle.
 
-## Build and run locally
-
-Requirements: Swift 6, macOS 14 or later for the desktop app, iOS 17 or later
-for the package's iOS surface, and the Swift package dependency
-`stasel/WebRTC` M152 (pinned revision). By default, Noct Cord resolves Noctweave from its
-public package URL. For local protocol development, point it at a checkout:
-
-```sh
-export NOCTWEAVE_PACKAGE_PATH="/path/to/NoctweaveCore"
-swift build
-swift test
-swift run NoctCordDemo
-swift run NoctCordApp
-```
-
-`NoctCordDemo` is deterministic projection/codec smoke coverage. `NoctCordApp`
-starts with a full-screen setup flow: review the security boundary, choose the
-local display name, optionally paste a community invitation, and connect to a
-reachable relay with **Test relay and continue**. It does not create a local
-relay or insert a third-party relay. Community admission is available from the
-empty state and the community menu after setup.
-
-To build a launchable macOS bundle:
-
-```sh
-export NOCTWEAVE_PACKAGE_PATH="/path/to/NoctweaveCore"
-Scripts/build-macos-app.sh debug
-open "dist/Noct Cord.app"
-```
-
-The packaging script creates an App Sandbox bundle. It uses launchable ad-hoc
-signing by default; set `NOCTCORD_CODESIGN_IDENTITY` to a suitable Developer ID
-identity to enable the hardened runtime, secure timestamping, and distribution
-signing. The sandbox permits relay and WebRTC networking, microphone capture,
-and read-only access to files the user selects. Existing pre-sandbox local state
-is not imported automatically. Sandboxed bundles and local `swift run` builds
-use separate Keychain rollback-anchor scopes; a mismatch inside either scope
-fails before relay I/O and can be cleared only through the explicit destructive
-reset shown by the setup flow.
-
-For local UI inspection, a debug bundle can start with deterministic sample
-spaces by launching its executable with `NOCTCORD_PREVIEW_DATA=1`. Release
-builds always ignore this environment variable.
-
-The package exposes `NoctCordCore`, `NoctCordMedia`, and `NoctCordUI` libraries.
-An iOS host application must embed the UI/media libraries, configure signing
-and permission declarations, and supply the same relay configuration.
-
-## Relay requirements
-
-For text and ordinary group sync, the client requires Noctweave core plus
-`nw.opaque-route@2` or `nw.realtime-route@1`, with temporal bucketing disabled.
-For current attachment uploads, the relay must advertise
-`nw.media-blobs@1`. Voice-room signaling requires a standard relay advertising
-`nw.realtime-route@1`; it is not supported by passthrough or host-only relay
-roles. The client reads the relay capability manifest and reports missing
-modules instead of silently assuming support.
-
-`nw.shared-log@1` and `nw.ephemeral-presence@1` are provisional relay modules.
-Noct Cord does not yet require presence, and channel history currently remains on
-the encrypted group event path. Do not describe a relay as Noct Cord-ready
-unless its advertised capabilities and the relevant interoperability tests
-match the feature being enabled.
-
-## Known limitations
+### Known limitations
 
 - Pre-1.0 code has no external cryptographic audit or formal proof of the full
   application protocol.
@@ -228,16 +252,21 @@ match the feature being enabled.
 - Final iOS host packaging, ReplayKit behavior, and platform permission flows
   still require signed-device validation.
 
-See [onboarding and community admission](docs/onboarding.md),
-[identity design](docs/identity.md),
-[roles, channel access, and applications](docs/roles-channels-and-bots.md),
-[relay extensions](docs/relay-extension.md),
-[media and calls](docs/media-and-calls.md), and
-[ADR 0001](docs/adr/0001-application-boundary.md) and
-[ADR 0002](docs/adr/0002-relay-hosting-and-noctweb-discovery.md) for the detailed
-boundaries.
+## Documentation
 
-## Contributing and security
+| Read | For |
+| --- | --- |
+| [Onboarding and admission](docs/onboarding.md) | Relay setup, invitations, and bootstrap |
+| [Identity](docs/identity.md) | Community-scoped identity and local profiles |
+| [Roles, channels, and bots](docs/roles-channels-and-bots.md) | Authorization and application semantics |
+| [Relay extensions](docs/relay-extension.md) | Capabilities required by each feature |
+| [Media and calls](docs/media-and-calls.md) | Attachments, signaling, and media limits |
+| [Architecture decisions](docs/adr/) | Application and relay-hosting boundaries |
+| [Application audit](https://github.com/luizwidmer/Noctweave/blob/main/NoctweaveDocumentation/app_security_audit_2026-09-21.md) | September 2026 findings and verification limits |
+
+<a id="contributing-and-security"></a>
+
+## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. Report
 vulnerabilities privately using [SECURITY.md](SECURITY.md).
