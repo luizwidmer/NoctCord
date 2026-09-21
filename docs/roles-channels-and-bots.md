@@ -37,6 +37,23 @@ they consume relay capacity. Received events are projected through the same
 rules, so a modified client cannot make a compliant peer accept an
 unauthorized event merely by uploading it.
 
+Assignment checks both role rank and the permissions being delegated, including
+roles originally created by the owner. A role manager cannot assign an existing
+administrator role or a role with permissions they lack. Editing a message
+requires current Send Messages permission; retraction remains available for
+removing existing content.
+
+Ordinary events may advance the last accepted application clock by at most
+1,024. Larger jumps are rejected instead of letting a member exhaust the clock
+and prevent future publications. Local publications derive their next clock
+from accepted projection state, not the raw signed event log. The owner's
+configuration bootstrap may bridge a larger gap for a newly admitted member.
+Bootstrap planning uses only accepted events: rejected configuration cannot be
+republished by the owner, and a forged bootstrap acknowledgement cannot suppress
+a real request. This uses the exact authorized outer events, excluding events
+that reuse an ID already applied inside a bootstrap. Bootstrap batches apply
+atomically, so a rejected nested event leaves the projection unchanged.
+
 ## Privacy boundary for channels
 
 Channel access is policy inside one Noctweave encrypted group. Members denied

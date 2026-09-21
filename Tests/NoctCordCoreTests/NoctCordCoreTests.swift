@@ -598,6 +598,96 @@ final class NoctCordCoreTests: XCTestCase {
         )
     }
 
+    func testRoleManagerCannotGrantExistingLowerRoleWithUnownedPermissions() {
+        let owner = handle(1)
+        let manager = handle(2)
+        let accomplice = handle(3)
+        let managerRole = NoctCordRole(id: UUID(), name: "Manager", position: 20,
+                                       permissions: [.manageRoles])
+        for forbiddenPermissions: Set<NoctCordPermission> in [[.manageSpace], [.manageChannels]] {
+            let powerfulRole = NoctCordRole(id: UUID(), name: "Restricted", position: 10,
+                                           permissions: forbiddenPermissions)
+            let events = [
+                makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+                makeEvent(author: owner, clock: 2, operation: .defineRole(managerRole)),
+                makeEvent(author: owner, clock: 3, operation: .grantRole(id: managerRole.id, to: manager)),
+                makeEvent(author: owner, clock: 4, operation: .defineRole(powerfulRole)),
+                makeEvent(author: manager, clock: 5, operation: .grantRole(id: powerfulRole.id, to: accomplice)),
+            ]
+            let result = project(events, owner: owner, members: [owner, manager, accomplice])
+            XCTAssertEqual(result.rejectedEvents.count, 1)
+            XCTAssertFalse(result.projection.roleAssignments[accomplice, default: []].contains(powerfulRole.id))
+            XCTAssertTrue(result.projection.permissions(for: accomplice).isDisjoint(with: forbiddenPermissions))
+        }
+    }
+
+    func testReadOnlyMemberCannotEditPreviouslySentMessage() {
+        let owner = handle(1)
+        let member = handle(2)
+        let messageID = UUID()
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(author: owner, clock: 2, operation: .createChannel(id: channelID, name: "general")),
+            makeEvent(author: member, clock: 3,
+                      operation: .postMessage(id: messageID, channelID: channelID, text: "original")),
+            makeEvent(author: owner, clock: 4,
+                      operation: .setChannelPermissions(channelID: channelID, roleID: nil,
+                                                       allow: [], deny: [.sendMessages])),
+            makeEvent(author: member, clock: 5, operation: .editMessage(id: messageID, text: "bypass")),
+        ]
+        let result = project(events, owner: owner, members: [owner, member])
+        XCTAssertEqual(result.rejectedEvents.count, 1)
+        XCTAssertEqual(result.projection.messages[messageID]?.text, "original")
+    }
+
+    func testMemberCannotExhaustCommunityClockWithAuthenticatedEvent() throws {
+        let owner = handle(1)
+        let member = handle(2)
+        let poisoned = NoctCordEvent(spaceID: spaceID, author: member,
+                                     logicalClock: 9_007_199_254_740_991,
+                                     createdAt: timestamp, operation: .requestBootstrap())
+        XCTAssertTrue(poisoned.isStructurallyValid)
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(author: owner, clock: 2, operation: .createChannel(id: channelID, name: "general")),
+            poisoned,
+        ]
+        let result = project(events, owner: owner, members: [owner, member])
+        XCTAssertEqual(result.rejectedEvents.map(\.eventID), [poisoned.id])
+        XCTAssertFalse(result.projection.appliedEventIDs.contains(poisoned.id))
+        XCTAssertEqual(try result.projection.nextLogicalClock(), 3)
+    }
+
+    func testClockGapLimitAllowsNormalEventsAndOwnerBootstrap() throws {
+        let owner = handle(1)
+        let member = handle(2)
+        let created = makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Community"))
+        let withinLimit = makeEvent(author: member, clock: 1_025, operation: .requestBootstrap())
+        let outsideLimit = makeEvent(author: member, clock: 2_050, operation: .requestBootstrap())
+        let bootstrap = makeEvent(author: owner, clock: 5_000, operation: .applyBootstrap([created]))
+        let result = project([created, withinLimit, outsideLimit, bootstrap],
+                             owner: owner, members: [owner, member])
+        XCTAssertEqual(result.rejectedEvents.map(\.eventID), [outsideLimit.id])
+        XCTAssertTrue(result.projection.appliedEventIDs.contains(withinLimit.id))
+        XCTAssertTrue(result.projection.appliedEventIDs.contains(bootstrap.id))
+        XCTAssertEqual(try result.projection.nextLogicalClock(), 5_001)
+    }
+
+    func testRejectedBootstrapDoesNotPartiallyMutateProjection() {
+        let owner = handle(1)
+        let member = handle(2)
+        let created = makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Community"))
+        let channel = makeEvent(author: owner, clock: 2,
+                                operation: .createChannel(id: channelID, name: "uncommitted"))
+        let invalid = makeEvent(author: member, clock: 3, operation: .renameSpace("forged"))
+        let batch = makeEvent(author: owner, clock: 4, operation: .applyBootstrap([channel, invalid]))
+        XCTAssertTrue(batch.isStructurallyValid)
+        let result = project([created, batch], owner: owner, members: [owner, member])
+        XCTAssertEqual(result.rejectedEvents.map(\.eventID), [batch.id])
+        XCTAssertNil(result.projection.channels[channelID])
+        XCTAssertFalse(result.projection.appliedEventIDs.contains(channel.id))
+    }
+
     func testChannelAttachmentAndReactionPermissionsAreEnforced() {
         let owner = handle(1)
         let member = handle(2)

@@ -142,7 +142,7 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         XCTAssertNil(configuration.credentialExpiresAt)
     }
 
-    func testInvitationAdmissionJoinsAndExchangesMessagesBothWays() async throws {
+    func testInvitationAdmissionSurvivesMaliciousMemberHistoryAndExchangesMessagesBothWays() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             "noctcord-admission-\(UUID().uuidString)",
             isDirectory: true
@@ -183,7 +183,40 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         let joinedSpaceID = try await memberTransport.acceptCommunityAdmissionResponse(response)
         mark("admission-response-accepted")
         XCTAssertEqual(joinedSpaceID, created.spaceID)
+
+        // Bypass the compliant app's preflight, as a modified member client
+        // would. These are correctly signed and group-encrypted transport
+        // events; their application operations still lack authority.
+        let memberRuntime = try await prospectiveMember.openGroupRuntime(groupID: created.spaceID)
+        let memberRuntimeState = await memberRuntime.snapshot()
+        let bootstrapRequest = try XCTUnwrap(memberRuntimeState.events.compactMap {
+            try? NoctCordCodec.unwrap($0)
+        }.first { $0.operation.kind == .bootstrapRequested })
+        let ownerHistory = try await ownerTransport.allStoredEvents(spaceID: created.spaceID)
+        let originalCreation = try XCTUnwrap(ownerHistory.first { $0.operation.kind == .spaceCreated })
+        let attacks: [(UInt64, NoctCordOperation)] = [
+            (3, .defineRole(NoctCordRole(id: UUID(), name: "Injected administrator",
+                                        position: 10, permissions: [.manageSpace]))),
+            (4, .applyBootstrap([originalCreation], satisfying: [bootstrapRequest.id])),
+            (NoctCordEvent.maximumLogicalClock, .requestBootstrap()),
+        ]
+        var attackIDs: [UUID] = []
+        for (clock, operation) in attacks {
+            let event = NoctCordEvent(spaceID: created.spaceID,
+                                      author: memberRuntimeState.localCredential.memberHandle,
+                                      logicalClock: clock, operation: operation)
+            let wrapped = try NoctCordCodec.wrap(event,
+                credential: memberRuntimeState.localCredential.credentialHandle)
+            let prepared = try await prospectiveMember.prepareGroupApplication(wrapped, at: event.createdAt)
+            let delivery = try XCTUnwrap(prepared.transportOperation)
+            let resumed = try await prospectiveMember.resumeGroupTransport(
+                groupID: created.spaceID, operationID: delivery.id, at: event.createdAt)
+            XCTAssertTrue(resumed.complete)
+            attackIDs.append(event.id)
+        }
         _ = try await ownerTransport.synchronize(spaceID: created.spaceID)
+        let receivedHistory = try await ownerTransport.allStoredEvents(spaceID: created.spaceID)
+        XCTAssertTrue(Set(attackIDs).isSubset(of: Set(receivedHistory.map(\.id))))
         let publishedBootstrap = try await ownerTransport.ensureCommunityBootstrap(
             spaceID: created.spaceID
         )

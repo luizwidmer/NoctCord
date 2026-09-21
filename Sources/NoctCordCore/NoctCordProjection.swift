@@ -70,6 +70,9 @@ public struct NoctCordRejectedEvent: Equatable, Sendable {
 
 public struct NoctCordProjectionResult: Equatable, Sendable {
     public let projection: NoctCordSpaceProjection
+    /// Exact outer events authorized during replay, excluding duplicate IDs
+    /// already applied directly or through an owner bootstrap.
+    public let acceptedEvents: [NoctCordEvent]
     public let rejectedEvents: [NoctCordRejectedEvent]
 }
 
@@ -133,13 +136,16 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
             owner: owner,
             activeMembers: activeMembers.union(historicalMembers)
         )
+        var accepted: [NoctCordEvent] = []
         var rejected: [NoctCordRejectedEvent] = []
         for event in events.sorted(by: canonicalOrder) {
             do {
+                let wasAlreadyApplied = projection.appliedEventIDs.contains(event.id)
                 try projection.apply(
                     event,
                     permittingHistoricalAuthor: historicalMembers.contains(event.author)
                 )
+                if !wasAlreadyApplied { accepted.append(event) }
             } catch {
                 rejected.append(
                     NoctCordRejectedEvent(eventID: event.id, reason: String(describing: error))
@@ -147,7 +153,9 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
             }
         }
         projection.reconcileMembership(activeMembers)
-        return NoctCordProjectionResult(projection: projection, rejectedEvents: rejected)
+        return NoctCordProjectionResult(
+            projection: projection, acceptedEvents: accepted, rejectedEvents: rejected
+        )
     }
 
     public static func project(
@@ -238,6 +246,17 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
         try apply(event, permittingHistoricalAuthor: false, enforcingOrder: true)
     }
 
+    /// Rejected events never contribute to the next local clock. Only the
+    /// owner's configuration bootstrap may bridge an arbitrarily large gap
+    /// for a new member that did not receive the preceding group history.
+    public func nextLogicalClock() throws -> UInt64 {
+        let previous = lastOrder?.logicalClock ?? 0
+        guard previous < NoctCordEvent.maximumLogicalClock else {
+            throw NoctCordProjectionError.invalidEvent
+        }
+        return previous + 1
+    }
+
     private mutating func apply(
         _ event: NoctCordEvent,
         permittingHistoricalAuthor: Bool,
@@ -252,6 +271,14 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
         let order = EventOrder(event)
         if enforcingOrder, let lastOrder, order < lastOrder {
             throw NoctCordProjectionError.outOfOrder
+        }
+        if enforcingOrder,
+           !(event.author == owner && event.operation.kind == .bootstrapApplied) {
+            let previous = lastOrder?.logicalClock ?? 0
+            guard event.logicalClock <= previous
+                    || event.logicalClock - previous <= 1_024 else {
+                throw NoctCordProjectionError.outOfOrder
+            }
         }
 
         switch event.operation.kind {
@@ -343,7 +370,9 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
                   activeMembers.contains(member) else {
                 throw NoctCordProjectionError.missingDependency
             }
-            try requireManageable(role, actor: event.author)
+            // Rank alone is insufficient: an owner-created lower role may
+            // contain administrator or other permissions the actor lacks.
+            try requireRoleMutation(role, existing: nil, actor: event.author)
             try requireManageable(member: member, actor: event.author)
             roleAssignments[member, default: []].insert(roleID)
 
@@ -420,6 +449,7 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
                 throw NoctCordProjectionError.missingDependency
             }
             try require(.readMessages, for: event.author, in: message.channelID)
+            try require(.sendMessages, for: event.author, in: message.channelID)
             try requireMessageOwnershipOrModeration(message, actor: event.author)
             message.text = text
             message.editedAt = event.createdAt
@@ -728,13 +758,15 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
                   let events = event.operation.bootstrapEvents else {
                 throw NoctCordProjectionError.permissionDenied(.manageSpace)
             }
+            var candidate = self
             for nested in events.sorted(by: canonicalOrder) {
-                try apply(
+                try candidate.apply(
                     nested,
                     permittingHistoricalAuthor: true,
                     enforcingOrder: false
                 )
             }
+            self = candidate
         }
 
         appliedEventIDs.insert(event.id)

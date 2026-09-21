@@ -633,6 +633,7 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
 
 public struct NoctCordEvent: Codable, Equatable, Identifiable, Sendable {
     public static let version = 1
+    public static let maximumLogicalClock: UInt64 = 9_007_199_254_740_991
 
     public let version: Int
     public let id: UUID
@@ -668,7 +669,7 @@ public struct NoctCordEvent: Codable, Equatable, Identifiable, Sendable {
         version == Self.version
             && author.isStructurallyValid
             && logicalClock > 0
-            && logicalClock <= 9_007_199_254_740_991
+            && logicalClock <= Self.maximumLogicalClock
             && createdAt.timeIntervalSince1970.isFinite
             && createdAt >= Date(timeIntervalSince1970: 1_577_836_800)
             && createdAt <= Date(timeIntervalSince1970: 4_102_444_800)

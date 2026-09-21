@@ -663,7 +663,14 @@ public actor NoctCordTransportCoordinator {
                 })?.id else {
             return false
         }
-        let events = snapshot.events.compactMap { try? NoctCordCodec.unwrap($0) }
+        let events = Self.acceptedBootstrapHistory(
+            spaceID: spaceID,
+            owner: snapshot.localCredential.memberHandle,
+            activeMembers: Set(snapshot.signedState.members.filter {
+                $0.isActive(at: snapshot.signedState.epoch)
+            }.map(\.id)),
+            events: snapshot.events.compactMap { try? NoctCordCodec.unwrap($0) }
+        )
         let fulfilled = Set(events.flatMap {
             $0.operation.kind == .bootstrapApplied
                 ? ($0.operation.bootstrapRequestIDs ?? [])
@@ -791,10 +798,24 @@ public actor NoctCordTransportCoordinator {
         let runtime = try await client.openGroupRuntime(groupID: spaceID)
         let snapshot = await runtime.snapshot()
         let existing = snapshot.events.compactMap { try? NoctCordCodec.unwrap($0) }
+        guard let owner = snapshot.signedState.members.first(where: {
+            $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
+        })?.id else {
+            throw NoctCordTransportError.eventRejected
+        }
+        let projection = NoctCordSpaceProjection.project(
+            spaceID: spaceID,
+            owner: owner,
+            activeMembers: Set(snapshot.signedState.members.filter {
+                $0.isActive(at: snapshot.signedState.epoch)
+            }.map(\.id)),
+            historicalMembers: Set(existing.map(\.author)),
+            events: existing
+        ).projection
         let event = NoctCordEvent(
             spaceID: spaceID,
             author: snapshot.localCredential.memberHandle,
-            logicalClock: (existing.map(\.logicalClock).max() ?? 0) + 1,
+            logicalClock: try projection.nextLogicalClock(),
             createdAt: date,
             operation: operation
         )
@@ -1587,6 +1608,21 @@ public actor NoctCordTransportCoordinator {
         }
         if !current.isEmpty { result.append(current) }
         return result
+    }
+
+    /// A group signature establishes membership, not application authority.
+    /// Rejected configuration and forged bootstrap acknowledgements must not
+    /// be republished by the owner or suppress another member's admission.
+    static func acceptedBootstrapHistory(
+        spaceID: UUID,
+        owner: GroupScopedMemberHandleV2,
+        activeMembers: Set<GroupScopedMemberHandleV2>,
+        events: [NoctCordEvent]
+    ) -> [NoctCordEvent] {
+        NoctCordSpaceProjection.project(
+            spaceID: spaceID, owner: owner, activeMembers: activeMembers,
+            historicalMembers: Set(events.map(\.author)), events: events
+        ).acceptedEvents
     }
 
     private static func isBootstrapStateEvent(_ kind: NoctCordEventKind) -> Bool {
