@@ -1223,8 +1223,11 @@ public actor NoctCordTransportCoordinator {
     ) async throws {
         let runtime = try await client.openGroupRuntime(groupID: spaceID)
         let snapshot = await runtime.snapshot()
-        let room = try Self.projectedRoom(roomID, from: snapshot)
-        guard signal.callID == roomID,
+        let projection = try Self.projectedSpace(from: snapshot)
+        guard let room = projection.voiceRooms[roomID], !room.isArchived,
+              projection.permissions(for: snapshot.localCredential.memberHandle).contains(.connectVoice),
+              projection.voiceParticipants[roomID]?[snapshot.localCredential.memberHandle]?.isJoined == true,
+              signal.callID == roomID,
               signal.keyID == room.signalingKeyID,
               room.realtimeRoute.expiresAt > date else {
             throw NoctCordTransportError.eventRejected
@@ -1275,8 +1278,11 @@ public actor NoctCordTransportCoordinator {
         now: Date = Date()
     ) async throws -> [NoctCordReceivedRealtimeSignal] {
         let runtime = try await client.openGroupRuntime(groupID: spaceID)
-        let snapshot = await runtime.snapshot()
-        let room = try Self.projectedRoom(roomID, from: snapshot)
+        var snapshot = await runtime.snapshot()
+        var projection = try Self.projectedSpace(from: snapshot)
+        guard let room = projection.voiceRooms[roomID], !room.isArchived else {
+            throw NoctCordTransportError.spaceNotFound
+        }
         guard room.realtimeRoute.expiresAt > now else {
             throw NoctCordTransportError.transportIncomplete
         }
@@ -1288,6 +1294,7 @@ public actor NoctCordTransportCoordinator {
             relayClient: communityRelayClient
         )
         var received: [NoctCordReceivedRealtimeSignal] = []
+        var refreshedMembership = false
         for _ in 0..<4 {
             let response = try await communityRelayClient.send(.syncRealtimeRouteV1(
                 RealtimeRouteSyncRequestV1(
@@ -1306,8 +1313,20 @@ public actor NoctCordTransportCoordinator {
                     record.payload,
                     room: room,
                     spaceID: spaceID
-                ),
-                Self.verifyRealtimeEnvelope(opened, state: snapshot.signedState) else {
+                ) else { continue }
+                if !Self.authorizeRealtimeEnvelope(opened, state: snapshot.signedState, projection: projection),
+                   !refreshedMembership {
+                    // A valid room join can arrive on the realtime route before
+                    // this peer has synchronized its durable membership event.
+                    // Refresh once, then fail closed; a signed group credential
+                    // alone does not authorize entering a voice room.
+                    _ = try await synchronize(spaceID: spaceID)
+                    let refreshedRuntime = try await client.openGroupRuntime(groupID: spaceID)
+                    snapshot = await refreshedRuntime.snapshot()
+                    projection = try Self.projectedSpace(from: snapshot)
+                    refreshedMembership = true
+                }
+                guard Self.authorizeRealtimeEnvelope(opened, state: snapshot.signedState, projection: projection) else {
                     continue
                 }
                 received.append(NoctCordReceivedRealtimeSignal(
@@ -1535,10 +1554,9 @@ public actor NoctCordTransportCoordinator {
         return Data(SHA256.hash(data: material))
     }
 
-    private static func projectedRoom(
-        _ roomID: UUID,
+    private static func projectedSpace(
         from snapshot: GroupRuntimeRecord
-    ) throws -> NoctCordCore.NoctCordVoiceRoom {
+    ) throws -> NoctCordSpaceProjection {
         guard let owner = snapshot.signedState.members.first(where: {
             $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
         })?.id else {
@@ -1555,10 +1573,7 @@ public actor NoctCordTransportCoordinator {
             historicalMembers: Set(events.map(\.author)),
             events: events
         ).projection
-        guard let room = projection.voiceRooms[roomID], !room.isArchived else {
-            throw NoctCordTransportError.spaceNotFound
-        }
-        return room
+        return projection
     }
 
     /// Replays only durable application configuration. Message bodies,
@@ -1644,6 +1659,20 @@ public actor NoctCordTransportCoordinator {
              .botCommandInvoked, .bootstrapRequested, .bootstrapApplied:
             false
         }
+    }
+
+    private static func authorizeRealtimeEnvelope(
+        _ envelope: NoctCordRealtimeSignedSignalEnvelopeV1,
+        state: SignedGroupStateV2,
+        projection: NoctCordSpaceProjection
+    ) -> Bool {
+        guard let room = projection.voiceRooms[envelope.body.roomID], !room.isArchived,
+              envelope.body.signal.keyID == room.signalingKeyID,
+              projection.permissions(for: envelope.body.author).contains(.connectVoice),
+              projection.voiceParticipants[room.id]?[envelope.body.author]?.isJoined == true else {
+            return false
+        }
+        return verifyRealtimeEnvelope(envelope, state: state)
     }
 
     private static func verifyRealtimeEnvelope(

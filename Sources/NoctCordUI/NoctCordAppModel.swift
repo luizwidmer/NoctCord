@@ -1553,7 +1553,7 @@ public final class NoctCordAppModel: ObservableObject {
                     spaceID: space.id,
                     channelID: channelID
                 )
-                cachedAttachments[id] = downloaded
+                cachedAttachments[id] = try NoctCordAttachmentSanitizer.prepareReceivedPreview(downloaded)
                 activityMessage = nil
             } catch {
                 activityMessage = nil

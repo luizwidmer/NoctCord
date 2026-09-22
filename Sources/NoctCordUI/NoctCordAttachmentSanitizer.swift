@@ -112,6 +112,23 @@ public enum NoctCordAttachmentSanitizer {
         throw NoctCordAttachmentSanitizerError.unsupportedType
     }
 
+    /// Authenticated peer bytes still need the local renderer's content policy.
+    static func prepareReceivedPreview(
+        _ attachment: NoctCordDownloadedAttachment
+    ) throws -> NoctCordDownloadedAttachment {
+        try requireBoundedOutput(attachment.bytes)
+        // A valid group signature, digest and AEAD tag authenticate the peer's
+        // bytes, not the peer's use of our outgoing sanitizer. Both thumbnail
+        // and full-screen image views consume this same prepared cache entry.
+        guard attachment.mediaType.hasPrefix("image/") else { return attachment }
+        let sanitized = try sanitizeImage(data: attachment.bytes)
+        return NoctCordDownloadedAttachment(
+            id: attachment.id,
+            bytes: sanitized.bytes,
+            mediaType: sanitized.mimeType
+        )
+    }
+
     public static func sanitizeImage(data: Data) throws -> NoctCordSanitizedAttachment {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               CGImageSourceGetCount(source) == 1,

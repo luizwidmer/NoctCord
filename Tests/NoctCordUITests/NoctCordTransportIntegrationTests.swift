@@ -375,6 +375,136 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         XCTAssertTrue(retainedMemberGroups.contains { $0.groupId == leaveGroupID })
     }
 
+    func testRealtimeAdmissionAcrossMembersRefreshesDurableJoin() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctcord-unjoined-realtime-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let server = RelayServer(store: RelayStore(), opaqueRouteStore: OpaqueRouteRelayStoreV2())
+        let endpoint = try await startOnEphemeralLoopbackPort(server)
+        defer { server.stop() }
+
+        let client = try await makeClient(name: "owner", root: root)
+        let transport = try NoctCordTransportCoordinator(client: client, relay: endpoint)
+        let receiver = try await makeClient(name: "receiver", root: root)
+        let receiverTransport = try NoctCordTransportCoordinator(client: receiver, relay: endpoint)
+        let spaceID = UUID()
+        _ = try await client.createGroup(
+            groupID: spaceID, relay: endpoint, contentTypes: NoctCordCodec.contentCapabilities,
+            createdAt: NoctweaveRendezvousV2.canonicalTimestamp(Date().addingTimeInterval(-30))
+        )
+        try await admit(receiver, to: spaceID, owner: client, relay: endpoint,
+                        existingMembers: [], seed: 0x51,
+                        startedAt: NoctweaveRendezvousV2.canonicalTimestamp(Date()))
+        _ = try await transport.publishOperation(spaceID: spaceID, operation: .createSpace(name: "Realtime test"))
+        let roomID = UUID()
+        let roomKey = Data(repeating: 0xC4, count: 32)
+        let route = try await transport.createRealtimeRoute(lifetime: 600)
+        let roomCreation = try await transport.publishOperation(
+            spaceID: spaceID,
+            operation: .createVoiceRoom(
+                id: roomID,
+                spec: NoctCordVoiceRoomSpecV1(
+                    name: "Call",
+                    maxParticipants: 2,
+                    signalingKey: roomKey,
+                    realtimeRoute: route
+                )
+            )
+        )
+        XCTAssertTrue(roomCreation.complete)
+        _ = try await receiverTransport.synchronize(spaceID: spaceID)
+        let receiverSnapshot = try await receiverTransport.storedSpaceSnapshot(spaceID: spaceID)
+        _ = try await receiverTransport.publishOperation(
+            spaceID: spaceID, operation: .joinVoiceRoom(
+                id: roomID, state: NoctCordVoiceParticipantStateV1(member: receiverSnapshot.currentMember, isJoined: true)
+            )
+        )
+        _ = try await transport.synchronize(spaceID: spaceID)
+        let roomSnapshot = try await transport.storedSpaceSnapshot(spaceID: spaceID)
+        let roomProjectionResult = NoctCordSpaceProjection.project(
+            spaceID: spaceID,
+            owner: roomSnapshot.owner,
+            activeMembers: Set(roomSnapshot.members.map(\.handle)),
+            events: roomSnapshot.events
+        )
+        XCTAssertNotNil(
+            roomProjectionResult.projection.voiceRooms[roomID],
+            "events=\(roomSnapshot.events.map { $0.operation.kind.rawValue }) rejected=\(roomProjectionResult.rejectedEvents)"
+        )
+
+        let room = try XCTUnwrap(roomProjectionResult.projection.voiceRooms[roomID])
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let snapshot = await runtime.snapshot()
+        let author = snapshot.localCredential.memberHandle
+        XCTAssertNil(roomProjectionResult.projection.voiceParticipants[roomID]?[author])
+        let mediaSignal = try NoctCordMediaSignalEnvelope(
+            roomID: NoctCordMediaRoomID(roomID.uuidString),
+            sender: NoctCordMediaParticipantID(NoctCordCallSignalCrypto.participantID(for: author)),
+            sequence: 1,
+            timestampMilliseconds: Int64(Date().timeIntervalSince1970 * 1_000),
+            signal: .join
+        )
+        let signal = try NoctCordCallSignalCrypto.seal(
+            mediaSignal, spaceID: spaceID, room: room,
+            author: author, recipient: nil
+        )
+        do {
+            try await transport.publishRealtimeCallSignal(
+                spaceID: spaceID, roomID: roomID,
+                signal: NoctCordCallSignalCrypto.seal(
+                    mediaSignal, spaceID: spaceID, room: room, author: author, recipient: nil
+                )
+            )
+            XCTFail("The sender must require accepted durable room membership")
+        } catch {
+            XCTAssertEqual(error as? NoctCordTransportError, .eventRejected)
+        }
+
+        // A modified, authenticated member can bypass the honest sender API.
+        // Append an actually encrypted .join and a valid group signature directly.
+        let body = NoctCordRealtimeSignedSignalBodyV1(
+            spaceID: spaceID, roomID: roomID, author: author,
+            credential: snapshot.localCredential.credentialHandle, signal: signal, createdAt: Date()
+        )
+        let envelope = NoctCordRealtimeSignedSignalEnvelopeV1(
+            body: body,
+            signature: try snapshot.localCredential.signingKey.sign(NoctCordRealtimeSignalWire.signedBytes(body))
+        )
+        let payload = try NoctCordRealtimeSignalWire.seal(envelope, room: room, spaceID: spaceID)
+        let append = try await RelayClient(endpoint: endpoint).send(.appendRealtimeRouteV1(
+            RealtimeRouteAppendRequestV1(
+                routeCapability: route.routeCapability, appendCapability: route.appendCapability,
+                recordID: signal.signalID, payload: payload
+            )
+        ))
+        XCTAssertNil(append.error)
+        let decoded = try NoctCordCallSignalCrypto.open(
+            signal, spaceID: spaceID, room: room, author: author, localMember: receiverSnapshot.currentMember
+        )
+        XCTAssertEqual(decoded.signal.kind, .join, "The attack must be valid encrypted media signaling")
+        let received = try await receiverTransport.synchronizeRealtimeCallSignals(spaceID: spaceID, roomID: roomID)
+        XCTAssertTrue(received.isEmpty, "A valid group signature must not bypass durable room admission")
+
+        _ = try await transport.publishOperation(
+            spaceID: spaceID, operation: .joinVoiceRoom(
+                id: roomID, state: NoctCordVoiceParticipantStateV1(member: author, isJoined: true)
+            )
+        )
+        // Do not manually synchronize the receiver: the realtime path must
+        // refresh a missing durable join before rejecting legitimate signaling.
+        let validSignal = try NoctCordCallSignalCrypto.seal(
+            mediaSignal, spaceID: spaceID, room: room, author: author, recipient: nil
+        )
+        try await transport.publishRealtimeCallSignal(spaceID: spaceID, roomID: roomID, signal: validSignal)
+        let accepted = try await receiverTransport.synchronizeRealtimeCallSignals(spaceID: spaceID, roomID: roomID)
+        XCTAssertEqual(accepted.map(\.author), [author])
+        XCTAssertEqual(accepted.map(\.signal), [validSignal])
+    }
+
     func testSingleMemberRoomCanPublishAndReadRealtimeSignal() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             "noctcord-single-member-\(UUID().uuidString)",
@@ -416,6 +546,14 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         XCTAssertNotNil(
             roomProjectionResult.projection.voiceRooms[roomID],
             "events=\(roomSnapshot.events.map { $0.operation.kind.rawValue }) rejected=\(roomProjectionResult.rejectedEvents)"
+        )
+
+        _ = try await transport.publishOperation(
+            spaceID: bootstrap.spaceID,
+            operation: .joinVoiceRoom(
+                id: roomID,
+                state: NoctCordVoiceParticipantStateV1(member: roomSnapshot.currentMember, isJoined: true)
+            )
         )
 
         let signal = NoctCordEncryptedCallSignalV1(

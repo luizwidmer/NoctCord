@@ -42,6 +42,53 @@ final class NoctCordAttachmentSanitizerTests: XCTestCase {
         }
     }
 
+    func testReceivedImageIsSanitizedBeforeEnteringPreviewCache() throws {
+        let id = UUID()
+        let incoming = NoctCordDownloadedAttachment(
+            id: id, bytes: try imageWithMetadata(), mediaType: "image/jpeg"
+        )
+        let preview = try NoctCordAttachmentSanitizer.prepareReceivedPreview(incoming)
+        XCTAssertEqual(preview.id, id)
+        XCTAssertEqual(preview.mediaType, "image/jpeg")
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(preview.bytes as CFData, nil))
+        let properties = try XCTUnwrap(
+            CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        )
+        XCTAssertEqual(properties[kCGImagePropertyPixelWidth] as? Int, 8)
+        XCTAssertNil(properties[kCGImagePropertyGPSDictionary])
+        XCTAssertNil((properties[kCGImagePropertyExifDictionary] as? [CFString: Any])?[kCGImagePropertyExifUserComment])
+    }
+
+    func testReceivedOversizedImageHeaderIsRejectedBeforePreviewDecode() throws {
+        var bytes = try XCTUnwrap(Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+yKxkAAAAASUVORK5CYII="
+        ))
+        // Patch only the bounded PNG header. Never allocate or decode the
+        // claimed pixel buffer when testing a hostile image's dimensions.
+        bytes.replaceSubrange(16..<20, with: [0, 0, 0x80, 1])
+        var crc: UInt32 = 0xFFFF_FFFF
+        for byte in bytes[12..<29] {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                crc = crc & 1 == 1 ? (crc >> 1) ^ 0xEDB8_8320 : crc >> 1
+            }
+        }
+        crc ^= 0xFFFF_FFFF
+        bytes.replaceSubrange(29..<33, with: [
+            UInt8(truncatingIfNeeded: crc >> 24), UInt8(truncatingIfNeeded: crc >> 16),
+            UInt8(truncatingIfNeeded: crc >> 8), UInt8(truncatingIfNeeded: crc),
+        ])
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(bytes as CFData, nil))
+        let properties = try XCTUnwrap(
+            CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        )
+        XCTAssertEqual(properties[kCGImagePropertyPixelWidth] as? Int, 32_769)
+        let incoming = NoctCordDownloadedAttachment(id: UUID(), bytes: bytes, mediaType: "image/png")
+        XCTAssertThrowsError(try NoctCordAttachmentSanitizer.prepareReceivedPreview(incoming)) {
+            XCTAssertEqual($0 as? NoctCordAttachmentSanitizerError, .unsafeDimensions)
+        }
+    }
+
     func testVideoDimensionsRejectNonFiniteAndOutOfRangeMetadata() throws {
         XCTAssertEqual(
             try NoctCordAttachmentSanitizer.validatedVideoPixelDimension(-720.4),
