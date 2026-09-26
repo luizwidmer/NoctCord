@@ -770,7 +770,9 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
         XCTAssertEqual(downloaded.bytes, cleartext)
         mark("attachment-roundtrip-complete")
 
-        let route = try await ownerTransport.createRealtimeRoute(lifetime: 600)
+        // Debug cryptographic integration can take longer than ten minutes
+        // between route creation and signaling; keep the test route valid.
+        let route = try await ownerTransport.createRealtimeRoute(lifetime: 3 * 60 * 60)
         let roomID = UUID()
         let roomKey = Data(repeating: 0xB7, count: 32)
         let roomPublication = try await ownerTransport.publishOperation(
