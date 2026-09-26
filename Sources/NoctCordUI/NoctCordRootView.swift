@@ -165,11 +165,6 @@ private struct NoctCordSetupView: View {
     }
 
     @ObservedObject var model: NoctCordAppModel
-    @AppStorage("NoctCord.displayName") private var savedDisplayName = ""
-    @AppStorage("NoctCord.relayAddress") private var savedRelayAddress = ""
-    @AppStorage("NoctCord.stunURL") private var savedSTUNURL = ""
-    @AppStorage("NoctCord.turnURL") private var savedTURNURL = ""
-    @AppStorage("NoctCord.turnUsername") private var savedTURNUsername = ""
     @State private var stage: Stage = .welcome
     @State private var displayName = ""
     @State private var relayAddress = ""
@@ -184,6 +179,7 @@ private struct NoctCordSetupView: View {
     @State private var turnCredential = ""
     @State private var validationError: String?
     @State private var showsLocalStateResetConfirmation = false
+    @State private var showsFullResetConfirmation = false
 
     var body: some View {
         ZStack {
@@ -251,17 +247,22 @@ private struct NoctCordSetupView: View {
             }
         }
         .onAppear {
-            if displayName.isEmpty { displayName = savedDisplayName }
-            if relayAddress.isEmpty { relayAddress = savedRelayAddress }
-            if stunURL.isEmpty { stunURL = savedSTUNURL }
-            if turnURL.isEmpty { turnURL = savedTURNURL }
-            if turnUsername.isEmpty { turnUsername = savedTURNUsername }
-            if !savedDisplayName.isEmpty,
-               !savedRelayAddress.isEmpty,
-               savedTURNURL.isEmpty,
-               model.connectionState == .needsSetup {
-                stage = .relay
-                connect()
+            do {
+                let saved = try NoctCordSetupPreferencesStore.live.load()
+                if displayName.isEmpty { displayName = saved.displayName }
+                if relayAddress.isEmpty { relayAddress = saved.relayAddress }
+                if stunURL.isEmpty { stunURL = saved.stunURL }
+                if turnURL.isEmpty { turnURL = saved.turnURL }
+                if turnUsername.isEmpty { turnUsername = saved.turnUsername }
+                if !saved.displayName.isEmpty,
+                   !saved.relayAddress.isEmpty,
+                   saved.turnURL.isEmpty,
+                   model.connectionState == .needsSetup {
+                    stage = .relay
+                    connect()
+                }
+            } catch {
+                validationError = error.localizedDescription
             }
         }
         .alert(
@@ -274,6 +275,14 @@ private struct NoctCordSetupView: View {
             }
         } message: {
             Text("This permanently removes Noct Cord's local encrypted community transport state from this app container. A rollback-protected tombstone is kept so old state cannot be replayed.")
+        }
+        .confirmationDialog("Permanently remove all Noct Cord data?",
+                            isPresented: $showsFullResetConfirmation) {
+            Button("Purge and Reset App", role: .destructive) {
+                Task { await model.purgeAndReset() }
+            }
+        } message: {
+            Text("Local communities, identities, and protected setup settings will be removed from this device.")
         }
     }
 
@@ -495,6 +504,11 @@ private struct NoctCordSetupView: View {
                 .foregroundStyle(NoctCordTheme.warning)
                 .fixedSize(horizontal: false, vertical: true)
         }
+        if case .failed = model.connectionState {
+            Button("Purge and Reset App", role: .destructive) {
+                showsFullResetConfirmation = true
+            }
+        }
     }
 
     private func setupFeature(_ symbol: String, title: String, text: String) -> some View {
@@ -592,6 +606,12 @@ private struct NoctCordSetupView: View {
             let stunURLToSave = stunURL.trimmingCharacters(in: .whitespacesAndNewlines)
             let turnURLToSave = turnURL.trimmingCharacters(in: .whitespacesAndNewlines)
             let turnUsernameToSave = turnUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+            try NoctCordSetupPreferencesStore.live.save(.init(
+                displayName: cleanName,
+                relayAddress: relayAddressToSave,
+                stunURL: stunURLToSave,
+                turnURL: turnURLToSave,
+                turnUsername: turnUsernameToSave))
             Task {
                 if resetLocalState {
                     await model.resetLocalStateAndConnect(
@@ -605,11 +625,6 @@ private struct NoctCordSetupView: View {
                     )
                 }
                 if model.connectionState == .ready {
-                    savedDisplayName = cleanName
-                    savedRelayAddress = relayAddressToSave
-                    savedSTUNURL = stunURLToSave
-                    savedTURNURL = turnURLToSave
-                    savedTURNUsername = turnUsernameToSave
                     if !model.stagedInvitationCode.isEmpty {
                         model.showsJoinSpace = true
                     }

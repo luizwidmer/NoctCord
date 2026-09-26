@@ -56,4 +56,75 @@ final class NoctCordApplicationSecurityTests: XCTestCase {
         XCTAssertEqual(accepted, [created, request, bootstrap])
         XCTAssertEqual(accepted.flatMap { $0.operation.bootstrapRequestIDs ?? [] }, [])
     }
+    func testBotHostDispatchesOnlyCurrentlyValidAcceptedCommands() async throws {
+        let spaceID = UUID()
+        let channelID = UUID()
+        let owner = GroupScopedMemberHandleV2(rawValue: Data(repeating: 1, count: 32).base64EncodedString())
+        let member = GroupScopedMemberHandleV2(rawValue: Data(repeating: 2, count: 32).base64EncodedString())
+        let botMember = GroupScopedMemberHandleV2(rawValue: Data(repeating: 3, count: 32).base64EncodedString())
+        func event(_ author: GroupScopedMemberHandleV2, _ clock: UInt64,
+                   _ operation: NoctCordOperation) -> NoctCordEvent {
+            NoctCordEvent(spaceID: spaceID, author: author, logicalClock: clock, operation: operation)
+        }
+
+        let bot = NoctCordBotApplication(
+            id: UUID(), memberHandle: botMember, name: "Audit bot",
+            commands: [NoctCordBotCommand(name: "status", summary: "Show status")]
+        )
+        let allowed = event(owner, 4, .invokeBot(NoctCordBotCommandInvocation(
+            botID: bot.id, channelID: channelID, commandName: "status"
+        )))
+        let rejected = event(member, 6, .invokeBot(NoctCordBotCommandInvocation(
+            botID: bot.id, channelID: channelID, commandName: "status"
+        )))
+        let history = [
+            event(owner, 1, .createSpace(name: "Community")),
+            event(owner, 2, .createChannel(id: channelID, name: "general")),
+            event(owner, 3, .installBot(bot)),
+            allowed,
+            event(owner, 5, .setChannelPermissions(
+                channelID: channelID, roleID: nil,
+                allow: [], deny: [.useApplicationCommands]
+            )),
+            rejected,
+        ]
+        XCTAssertTrue(history.allSatisfy(\.isStructurallyValid))
+        let result = NoctCordSpaceProjection.project(
+            spaceID: spaceID, owner: owner,
+            activeMembers: [owner, member, botMember], events: history
+        )
+        XCTAssertEqual(result.rejectedEvents.map(\.eventID), [rejected.id])
+        XCTAssertEqual(
+            NoctCordBotHost.dispatchableInvocations(from: result), [allowed]
+        )
+
+        let runtime = NoctCordBotRuntime(
+            botID: bot.id,
+            memberHandleRawValue: botMember.rawValue,
+            ledger: NoctCordInMemoryBotInvocationLedger()
+        ) { _ in "ok" }
+        do {
+            _ = try await runtime.prepareResponse(
+                for: rejected, projection: result.projection
+            )
+            XCTFail("Rejected group event reached the bot runtime")
+        } catch let error as NoctCordBotRuntimeError {
+            XCTAssertEqual(error, .botUnavailable)
+        }
+
+        let updated = NoctCordBotApplication(
+            id: bot.id, memberHandle: botMember, name: "Audit bot",
+            commands: [NoctCordBotCommand(name: "health", summary: "Show health")]
+        )
+        let afterCommandRemoval = NoctCordSpaceProjection.project(
+            spaceID: spaceID, owner: owner,
+            activeMembers: [owner, member, botMember],
+            events: history + [event(owner, 7, .updateBot(updated))]
+        )
+        XCTAssertTrue(afterCommandRemoval.rejectedEvents.map(\.eventID).contains(rejected.id))
+        XCTAssertTrue(NoctCordBotHost.dispatchableInvocations(
+            from: afterCommandRemoval
+        ).isEmpty)
+    }
+
 }

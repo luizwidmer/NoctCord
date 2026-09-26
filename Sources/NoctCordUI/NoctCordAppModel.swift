@@ -43,6 +43,8 @@ struct NoctCordConnectionFailurePresentation: Equatable {
             message = "Another Noct Cord process changed local transport state. Close the other copy and try again."
         case .storageUnavailable:
             message = "Protected local transport storage is unavailable. No relay request was sent."
+        case .insecureProtectionUnavailable:
+            message = "The device cannot protect local transport storage. No relay request was sent."
         }
     }
 }
@@ -246,8 +248,21 @@ public final class NoctCordAppModel: ObservableObject {
         resetScope = liveConfiguration?.storageScopeIdentifier
             ?? NoctCordTransportConfiguration.defaultStorageScopeIdentifier(for: resetStateURL)
         resetUsesPlaintext = usesPreview || liveConfiguration?.usesInsecurePlaintextStateForTesting == true
-        let savedName = UserDefaults.standard.string(forKey: "NoctCord.displayName")?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let savedName: String
+        let setupStorageFailure: String?
+        if usesPreview || liveConfiguration != nil {
+            savedName = ""
+            setupStorageFailure = nil
+        } else {
+            do {
+                savedName = try NoctCordSetupPreferencesStore.live.load().displayName
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                setupStorageFailure = nil
+            } catch {
+                savedName = ""
+                setupStorageFailure = error.localizedDescription
+            }
+        }
         userDisplayName = liveConfiguration?.displayName
             ?? (usesPreview ? "You" : (savedName.isEmpty ? "Member" : savedName))
         if let liveConfiguration {
@@ -275,9 +290,9 @@ public final class NoctCordAppModel: ObservableObject {
             )
         }
         spaces = usesPreview && !afterReset ? Self.previewSpaces() : []
-        connectionState = usesPreview && !afterReset
-            ? .preview
-            : (liveConfiguration == nil ? .needsSetup : .connecting)
+        connectionState = usesPreview && !afterReset ? .preview :
+            (setupStorageFailure.map(NoctCordConnectionState.failed)
+                ?? (liveConfiguration == nil ? .needsSetup : .connecting))
         selectedSpaceID = spaces.first?.id
         selectedChannelID = spaces.first?.textChannels.first?.id
         if FileManager.default.fileExists(atPath: resetMarkerURL.path) {
@@ -313,7 +328,8 @@ public final class NoctCordAppModel: ObservableObject {
         isResetting = true
         defer { isResetting = false }
         do {
-            try NoctCordSecureFileIO.writeAtomicPrivateFile(Data("purge-v1".utf8), to: resetMarkerURL, maximumBytes: 64)
+            try NoctCordSecureFileIO.writeAtomicPrivateFile(Data(), to: resetMarkerURL,
+                maximumBytes: 0, allowEmpty: true)
             resetIsPending = true
             showsUserSettings = false
             let pending = Array(operations.values)
@@ -344,6 +360,7 @@ public final class NoctCordAppModel: ObservableObject {
                 }
             }
             if !isolatedStorage, let domain = Bundle.main.bundleIdentifier {
+                try NoctCordSetupPreferencesStore.live.purge()
                 UserDefaults.standard.removePersistentDomain(forName: domain)
                 URLCache.shared.removeAllCachedResponses()
                 let temporary = FileManager.default.temporaryDirectory
@@ -503,10 +520,6 @@ public final class NoctCordAppModel: ObservableObject {
             }
             transport = coordinator
             userDisplayName = configuration.displayName
-            UserDefaults.standard.set(
-                configuration.displayName,
-                forKey: "NoctCord.displayName"
-            )
             var loadedPrivacySettings = await coordinator.privacySettings()
             #if DEBUG
             if configuration.usesInsecurePlaintextStateForTesting {
@@ -1213,10 +1226,14 @@ public final class NoctCordAppModel: ObservableObject {
             return false
         }
 
-        userDisplayName = cleanName
         if !previewMode {
-            UserDefaults.standard.set(cleanName, forKey: "NoctCord.displayName")
+            do { try NoctCordSetupPreferencesStore.live.updateDisplayName(cleanName) }
+            catch {
+                settingsNotice = error.localizedDescription
+                return false
+            }
         }
+        userDisplayName = cleanName
         let targetIDs: [UUID]
         if acrossAllCommunities {
             targetIDs = spaces.map(\.id)

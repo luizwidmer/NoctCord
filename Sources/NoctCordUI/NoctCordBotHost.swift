@@ -41,16 +41,15 @@ public actor NoctCordBotHost {
     public func processOnce() async throws -> NoctCordBotHostCycleResult {
         _ = try await coordinator.synchronize(spaceID: spaceID)
         let snapshot = try await coordinator.storedSpaceSnapshot(spaceID: spaceID)
-        let projection = NoctCordSpaceProjection.project(
+        let result = NoctCordSpaceProjection.project(
             spaceID: spaceID,
             owner: snapshot.owner,
             activeMembers: Set(snapshot.members.map(\.handle)),
             historicalMembers: Set(snapshot.events.map(\.author)),
             events: snapshot.events
-        ).projection
-        let invocations = snapshot.events.filter {
-            $0.operation.kind == .botCommandInvoked
-        }
+        )
+        let projection = result.projection
+        let invocations = Self.dispatchableInvocations(from: result)
         var publishedResponses = 0
 
         for event in invocations {
@@ -86,6 +85,23 @@ public actor NoctCordBotHost {
             observedInvocations: invocations.count,
             publishedResponses: publishedResponses
         )
+    }
+
+    /// Signed group delivery is not enough to authorize an application command.
+    /// A rejected event must never reach bot code or stop the processing loop.
+    static func dispatchableInvocations(
+        from result: NoctCordProjectionResult
+    ) -> [NoctCordEvent] {
+        let projection = result.projection
+        return result.acceptedEvents.filter { event in
+            guard event.operation.kind == .botCommandInvoked,
+                  let invocation = event.operation.botInvocation,
+                  projection.botInvocations[invocation.id] == invocation,
+                  let bot = projection.botApplications[invocation.botID] else {
+                return false
+            }
+            return bot.commands.contains { $0.name == invocation.commandName }
+        }
     }
 
     public func run(pollInterval: Duration = .seconds(1)) async throws {

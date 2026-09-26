@@ -177,9 +177,10 @@ enum NoctCordSecureFileIO {
     static func writeAtomicPrivateFile(
         _ data: Data,
         to fileURL: URL,
-        maximumBytes: Int
+        maximumBytes: Int,
+        allowEmpty: Bool = false
     ) throws {
-        guard !data.isEmpty, data.count <= maximumBytes else {
+        guard (allowEmpty || !data.isEmpty), data.count <= maximumBytes else {
             throw NoctCordSecureFileError.tooLarge
         }
         let directoryURL = fileURL.deletingLastPathComponent()
