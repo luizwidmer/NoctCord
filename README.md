@@ -66,6 +66,10 @@ Scripts/build-macos-app.sh debug
 open "dist/Noct Cord.app"
 ```
 
+Packaging selects the resolved WebRTC framework slice using Python 3. With
+dependencies already cached, set `NOCTWEAVE_OFFLINE=1` to require the existing
+lockfile/checkouts and prevent automatic package resolution.
+
 The packaging script creates an App Sandbox bundle. It uses launchable ad-hoc
 signing by default; set `NOCTCORD_CODESIGN_IDENTITY` to a suitable Developer ID
 identity to enable the hardened runtime, secure timestamping, and distribution

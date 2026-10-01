@@ -966,7 +966,10 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
     }
 
     private func mark(_ value: String) {
-        FileHandle.standardError.write(Data("[NoctCordIntegration] \(value)\n".utf8))
+        // Timestamp at the source: SwiftPM can buffer XCTest's output before
+        // a profiling harness receives these otherwise unchanged markers.
+        let uptime = DispatchTime.now().uptimeNanoseconds
+        FileHandle.standardError.write(Data("[NoctCordIntegration] \(value) [uptime_ns=\(uptime)]\n".utf8))
     }
 
     private func admit(
