@@ -1,10 +1,122 @@
 import NoctCordCore
+import NoctCordMedia
 @testable import NoctCordUI
 @preconcurrency import NoctweaveCore
 import XCTest
 
 @MainActor
 final class NoctCordAppModelTests: XCTestCase {
+    func testLeavingPendingMediaJoinDoesNotRestoreTheCall() async throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let requested = expectation(description: "fake microphone permission requested")
+        let permissions = NoctCordModelPermissionGate(granted: true, onRequest: { requested.fulfill() })
+        let room = try modelMediaRoom(participant: "pending", permissions: permissions)
+        let joining = Task { try await model.joinMediaRoom(room) }
+        await fulfillment(of: [requested], timeout: 2)
+
+        await model.stopMediaRoom()
+        await permissions.release()
+        _ = try? await joining.value
+
+        let snapshot = await room.snapshot()
+        XCTAssertEqual(snapshot.state, .left)
+        XCTAssertNil(model.callSnapshot)
+        await room.leave()
+        await model.stopMediaRoom()
+    }
+
+    func testStaleMediaJoinCannotReplaceOrClearANewerCall() async throws {
+        for permissionGranted in [true, false] {
+            let model = NoctCordAppModel(seedPreviewData: true)
+            let requested = expectation(description: "old fake microphone permission requested")
+            let permissions = NoctCordModelPermissionGate(
+                granted: permissionGranted, onRequest: { requested.fulfill() }
+            )
+            let oldRoom = try modelMediaRoom(participant: "old", permissions: permissions)
+            let oldJoin = Task { try await model.joinMediaRoom(oldRoom) }
+            await fulfillment(of: [requested], timeout: 2)
+            await model.stopMediaRoom()
+            let newRoom = try modelMediaRoom(participant: "new", permissions: nil)
+            try await model.joinMediaRoom(newRoom)
+
+            await permissions.release()
+            _ = try? await oldJoin.value
+
+            XCTAssertEqual(model.callSnapshot?.localParticipant.id.rawValue, "new")
+            let oldSnapshot = await oldRoom.snapshot()
+            XCTAssertEqual(oldSnapshot.state, .left)
+            await oldRoom.leave()
+            await newRoom.leave()
+            await model.stopMediaRoom()
+        }
+    }
+
+    func testOldMediaControlCompletionCannotRestoreOrFailANewerCall() async throws {
+        for controlFails in [false, true] {
+            let model = NoctCordAppModel(seedPreviewData: true)
+            let started = expectation(description: "fake driver deafen suspended")
+            let gate = NoctCordModelControlGate(fails: controlFails, onStart: { started.fulfill() })
+            let oldRoom = NoctCordMediaRoom(
+                configuration: .init(roomID: "model-room", participant: .init(id: "old"), wantsMicrophone: false),
+                driver: NoctCordModelControlDriver(gate: gate)
+            )
+            try await model.joinMediaRoom(oldRoom)
+            let control = Task {
+                await model.updateMediaRoom(oldRoom, performing: { try await $0.setDeafened(true) })
+            }
+            await fulfillment(of: [started], timeout: 2)
+            await model.stopMediaRoom()
+            let newRoom = try modelMediaRoom(participant: "new", permissions: nil)
+            try await model.joinMediaRoom(newRoom)
+            let priorConnectionState = model.connectionState
+
+            await gate.release()
+            let result = await control.value
+
+            XCTAssertNil(result)
+            XCTAssertEqual(model.callSnapshot?.localParticipant.id.rawValue, "new")
+            XCTAssertEqual(model.connectionState, priorConnectionState)
+            await model.stopMediaRoom()
+        }
+    }
+
+    func testMediaControlsWaitForPendingJoinToFinish() async throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let requested = expectation(description: "fake microphone permission pending")
+        let permissions = NoctCordModelPermissionGate(granted: true, onRequest: { requested.fulfill() })
+        let room = try modelMediaRoom(participant: "pending", permissions: permissions)
+        let joining = Task { try await model.joinMediaRoom(room) }
+        await fulfillment(of: [requested], timeout: 2)
+        let initialSnapshot = await room.snapshot()
+        XCTAssertEqual(initialSnapshot.state, .joining)
+        let priorConnectionState = model.connectionState
+
+        let pendingControl = await model.updateMediaRoom(room, performing: { try await $0.setDeafened(true) })
+
+        XCTAssertNil(pendingControl)
+        XCTAssertEqual(model.connectionState, priorConnectionState)
+        await permissions.release()
+        try await joining.value
+        let joinedControl = await model.updateMediaRoom(room, performing: { try await $0.setDeafened(true) })
+        XCTAssertEqual(joinedControl?.deafened, true)
+        await model.stopMediaRoom()
+    }
+
+    private func modelMediaRoom(
+        participant: String,
+        permissions: NoctCordModelPermissionGate?
+    ) throws -> NoctCordMediaRoom {
+        NoctCordMediaRoom(
+            configuration: .init(
+                roomID: "model-room",
+                participant: .init(id: try NoctCordMediaParticipantID(participant), displayName: participant),
+                wantsMicrophone: permissions != nil
+            ),
+            driver: NoctCordInMemoryMediaDriver(),
+            permissionProvider: permissions ?? NoctCordModelPermissionGate(granted: true)
+        )
+    }
+
     func testPurgeDrainsPendingPreviewWorkAndReturnsToSetup() async throws {
         let model = NoctCordAppModel(seedPreviewData: true)
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("noctcord-reset-input-\(UUID()).txt")
@@ -81,6 +193,23 @@ final class NoctCordAppModelTests: XCTestCase {
         XCTAssertTrue(model.composerText.isEmpty)
     }
 
+    func testInvalidMessageAndCommandKeepTheDraftForCorrection() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let originalEventCount = try XCTUnwrap(model.selectedSpace?.events.count)
+        for draft in [
+            String(repeating: "a", count: 16_385),
+            "/status " + String(repeating: "a", count: 2_049),
+        ] {
+            model.composerText = draft
+
+            model.sendCurrentMessage()
+
+            XCTAssertEqual(model.composerText, draft)
+            XCTAssertEqual(model.selectedSpace?.events.count, originalEventCount)
+            XCTAssertNotNil(model.composerNotice)
+        }
+    }
+
     func testPreviewAttachmentPickerSanitizesAndProjectsSelectedFile() async throws {
         let model = NoctCordAppModel(seedPreviewData: true)
         let originalAttachmentCount = model.selectedAttachments.count
@@ -142,6 +271,76 @@ final class NoctCordAppModelTests: XCTestCase {
         model.selectChannel(unreadChannel)
 
         XCTAssertEqual(model.selectedSpace?.unreadByChannel[unreadChannel], 0)
+    }
+
+    func testSelectingCommunityMarksItsVisibleChannelRead() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let nextSpace = try XCTUnwrap(model.spaces.last)
+        let nextChannel = try XCTUnwrap(nextSpace.textChannels.first)
+        XCTAssertGreaterThan(nextSpace.unreadByChannel[nextChannel.id, default: 0], 0)
+
+        model.selectSpace(nextSpace.id)
+
+        XCTAssertEqual(model.selectedChannelID, nextChannel.id)
+        XCTAssertEqual(model.selectedSpace?.unreadByChannel[nextChannel.id], 0)
+    }
+
+    func testUnreadCountsTrackNewRemoteMessagesWithoutCountingRefreshesOrOwnMessages() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let original = try XCTUnwrap(model.spaces.first)
+        let channel = try XCTUnwrap(original.textChannels.first)
+        let remote = try XCTUnwrap(original.members.first { $0.id != original.currentMember })
+        var updated = original
+        let remoteEvent = NoctCordEvent(
+            spaceID: original.id,
+            author: remote.id,
+            logicalClock: try updated.projection.nextLogicalClock(),
+            operation: .postMessage(id: UUID(), channelID: channel.id, text: "New remote message")
+        )
+        try updated.projection.apply(remoteEvent)
+        updated.events.append(remoteEvent)
+
+        updated.reconcileUnreadCounts(from: original, visibleChannelID: nil)
+
+        let expectedUnread = original.unreadByChannel[channel.id, default: 0] + 1
+        XCTAssertEqual(updated.unreadByChannel[channel.id], expectedUnread)
+        var refreshed = updated
+        refreshed.reconcileUnreadCounts(from: updated, visibleChannelID: nil)
+        XCTAssertEqual(refreshed.unreadByChannel[channel.id], expectedUnread)
+
+        let ownEvent = NoctCordEvent(
+            spaceID: original.id,
+            author: original.currentMember,
+            logicalClock: try refreshed.projection.nextLogicalClock(),
+            operation: .postMessage(id: UUID(), channelID: channel.id, text: "My reply")
+        )
+        try refreshed.projection.apply(ownEvent)
+        refreshed.events.append(ownEvent)
+        refreshed.reconcileUnreadCounts(from: updated, visibleChannelID: nil)
+        XCTAssertEqual(refreshed.unreadByChannel[channel.id], expectedUnread)
+
+        updated.reconcileUnreadCounts(from: refreshed, visibleChannelID: channel.id)
+        XCTAssertEqual(updated.unreadByChannel[channel.id], 0)
+    }
+
+    func testUnreadCountsDiscardArchivedChannelsAndDoNotCountInitialHistory() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let original = try XCTUnwrap(model.spaces.first)
+        let unreadChannelID = try XCTUnwrap(original.unreadByChannel.first { $0.value > 0 }?.key)
+        var loaded = original
+        loaded.reconcileUnreadCounts(from: nil, visibleChannelID: nil)
+        XCTAssertEqual(loaded.unreadByChannel.values.reduce(0, +), 0)
+
+        let archive = NoctCordEvent(
+            spaceID: original.id,
+            author: original.currentMember,
+            logicalClock: try loaded.projection.nextLogicalClock(),
+            operation: .archiveChannel(id: unreadChannelID)
+        )
+        try loaded.projection.apply(archive)
+        loaded.events.append(archive)
+        loaded.reconcileUnreadCounts(from: original, visibleChannelID: nil)
+        XCTAssertNil(loaded.unreadByChannel[unreadChannelID])
     }
 
     func testIdentityScopeCanChangePerCommunity() {
@@ -251,6 +450,19 @@ final class NoctCordAppModelTests: XCTestCase {
         XCTAssertTrue(model.composerText.isEmpty)
     }
 
+    func testSlashCommandAllowsWhitespaceBetweenCommandAndArguments() throws {
+        let model = NoctCordAppModel(seedPreviewData: true)
+        let originalEventCount = try XCTUnwrap(model.selectedSpace?.events.count)
+        model.composerText = "/status   relay"
+
+        model.sendCurrentMessage()
+
+        XCTAssertEqual(model.selectedSpace?.events.count, originalEventCount + 1)
+        XCTAssertEqual(model.selectedSpace?.events.last?.operation.botInvocation?.arguments, "relay")
+        XCTAssertTrue(model.composerText.isEmpty)
+        XCTAssertNil(model.composerNotice)
+    }
+
     func testRoleManagementUpdatesPreviewProjection() throws {
         let model = NoctCordAppModel(seedPreviewData: true)
         let roleID = UUID()
@@ -298,4 +510,73 @@ final class NoctCordAppModelTests: XCTestCase {
         try await model.destroySelectedCommunity()
         XCTAssertFalse(model.spaces.contains { $0.id == ownerSpace.id })
     }
+}
+
+private actor NoctCordModelPermissionGate: NoctCordMediaPermissionProvider {
+    private let granted: Bool
+    private let onRequest: @Sendable () -> Void
+    private var isReleased = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    init(granted: Bool, onRequest: @escaping @Sendable () -> Void = {}) {
+        self.granted = granted
+        self.onRequest = onRequest
+    }
+
+    func request(_ permissions: Set<NoctCordMediaPermission>) async throws -> NoctCordMediaPermissionSnapshot {
+        onRequest()
+        if !isReleased { await withCheckedContinuation { waiter = $0 } }
+        guard granted else { throw NoctCordMediaError.permissionDenied(.microphone) }
+        return .init(microphone: .granted)
+    }
+
+    func release() {
+        isReleased = true
+        waiter?.resume()
+        waiter = nil
+    }
+}
+
+private actor NoctCordModelControlGate {
+    private let fails: Bool
+    private let onStart: @Sendable () -> Void
+    private var isReleased = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    init(fails: Bool, onStart: @escaping @Sendable () -> Void) {
+        self.fails = fails
+        self.onStart = onStart
+    }
+    func run() async throws {
+        onStart()
+        if !isReleased { await withCheckedContinuation { waiter = $0 } }
+        if fails { throw NoctCordMediaError.transportFailure("fake deafen failure") }
+    }
+    func release() { isReleased = true; waiter?.resume(); waiter = nil }
+}
+
+private struct NoctCordModelControlDriver: NoctCordMediaDriver {
+    let gate: NoctCordModelControlGate
+    func makeSession(
+        configuration: NoctCordMediaRoomConfiguration,
+        eventHandler: @escaping @Sendable (NoctCordMediaDriverEvent) -> Void,
+        signalingSink: any NoctCordMediaSignalingSink
+    ) async throws -> any NoctCordMediaDriverSession {
+        NoctCordModelControlSession(gate: gate)
+    }
+}
+
+private actor NoctCordModelControlSession: NoctCordMediaDriverSession {
+    let gate: NoctCordModelControlGate
+    init(gate: NoctCordModelControlGate) { self.gate = gate }
+    func join() async throws {}
+    func leave() async {}
+    func send(_ signal: NoctCordMediaSignal, to recipient: NoctCordMediaParticipantID?) async throws -> NoctCordMediaSignalEnvelope {
+        try NoctCordMediaSignalEnvelope(roomID: "model-room", sender: "old", recipient: recipient,
+            sequence: 1, timestampMilliseconds: 1, signal: signal)
+    }
+    func handleIncomingSignal(_ envelope: NoctCordMediaSignalEnvelope) async throws {}
+    func setMicrophoneEnabled(_ enabled: Bool) async throws {}
+    func setDeafened(_ enabled: Bool) async throws { try await gate.run() }
+    func publishScreenShare(_ track: NoctCordScreenShareTrack) async throws {}
+    func stopScreenShare() async throws {}
 }

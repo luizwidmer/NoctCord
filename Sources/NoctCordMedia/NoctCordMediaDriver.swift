@@ -54,6 +54,7 @@ public actor NoctCordMediaRoom {
     private var state: NoctCordMediaRoomState = .idle
     private var participants: [NoctCordMediaParticipantID: NoctCordMediaParticipant] = [:]
     private var microphoneMuted = false
+    private var microphonePermissionGranted = false
     private var deafened = false
     private var remoteMicrophoneEnabled: [NoctCordMediaParticipantID: Bool] = [:]
     private var remoteDeafened: [NoctCordMediaParticipantID: Bool] = [:]
@@ -75,6 +76,7 @@ public actor NoctCordMediaRoom {
         self.driver = driver
         self.permissionProvider = permissionProvider
         self.signalingSink = signalingSink
+        self.microphoneMuted = !configuration.wantsMicrophone
         self.participants[configuration.participant.id] = configuration.participant
     }
 
@@ -101,23 +103,35 @@ public actor NoctCordMediaRoom {
             throw NoctCordMediaError.invalidState("room can only join from idle")
         }
         state = .joining
+        var joiningSession: (any NoctCordMediaDriverSession)?
         do {
             try configuration.validate()
             screenShareError = nil
             if configuration.wantsMicrophone {
-                _ = try await permissionProvider.request([.microphone])
+                try await requestMicrophonePermission()
             }
-            driverSession = try await driver.makeSession(
+            try requireJoining()
+            let session = try await driver.makeSession(
                 configuration: configuration,
                 eventHandler: { [weak self] event in
                     Task { await self?.receive(event) }
                 },
                 signalingSink: signalingSink
             )
-            try await driverSession?.join()
+            joiningSession = session
+            try requireJoining()
+            driverSession = session
+            try await session.join()
+            try requireJoining()
             state = .joined
         } catch {
-            state = .failed((error as? NoctCordMediaError) ?? .transportFailure(error.localizedDescription))
+            await joiningSession?.leave()
+            driverSession = nil
+            switch state {
+            case .leaving, .left: break
+            default:
+                state = .failed((error as? NoctCordMediaError) ?? .transportFailure(error.localizedDescription))
+            }
             throw error
         }
     }
@@ -141,7 +155,12 @@ public actor NoctCordMediaRoom {
 
     public func setMicrophoneMuted(_ muted: Bool) async throws {
         try requireJoined()
+        if !muted && !microphonePermissionGranted {
+            try await requestMicrophonePermission()
+            try requireJoined()
+        }
         try await driverSession?.setMicrophoneEnabled(!muted)
+        try requireJoined()
         microphoneMuted = muted
     }
 
@@ -161,7 +180,17 @@ public actor NoctCordMediaRoom {
                 : NoctCordMediaError.permissionUnavailable(.screenCapture)
         }
         let track = try await source.makeTrack()
-        try await driverSession?.publishScreenShare(track)
+        try requireJoined()
+        guard let driverSession else {
+            throw NoctCordMediaError.invalidState("room is not joined")
+        }
+        try await driverSession.publishScreenShare(track)
+        do {
+            try requireJoined()
+        } catch {
+            try? await driverSession.stopScreenShare()
+            throw error
+        }
         localScreenShare = track
     }
 
@@ -194,6 +223,22 @@ public actor NoctCordMediaRoom {
         guard case .joined = state, driverSession != nil else {
             throw NoctCordMediaError.invalidState("room is not joined")
         }
+    }
+
+    private func requireJoining() throws {
+        guard case .joining = state else {
+            throw NoctCordMediaError.invalidState("room was left while joining")
+        }
+    }
+
+    private func requestMicrophonePermission() async throws {
+        let permission = try await permissionProvider.request([.microphone]).microphone
+        guard permission == .granted else {
+            throw permission == .denied
+                ? NoctCordMediaError.permissionDenied(.microphone)
+                : NoctCordMediaError.permissionUnavailable(.microphone)
+        }
+        microphonePermissionGranted = true
     }
 
     private func receive(_ event: NoctCordMediaDriverEvent) {

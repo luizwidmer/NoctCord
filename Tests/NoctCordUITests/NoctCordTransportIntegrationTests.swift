@@ -956,13 +956,20 @@ final class NoctCordTransportIntegrationTests: XCTestCase {
     }
 
     private func makeClient(name: String, root: URL) async throws -> HeadlessMessagingClient {
-        try await HeadlessMessagingClient.open(
-            stateStore: ClientStateStore(
-                fileURL: root.appendingPathComponent("\(name).json"),
-                protection: .insecurePlaintextForTesting
-            ),
-            displayName: name
+        let fileURL = root.appendingPathComponent("\(name).json")
+        #if DEBUG
+        let store = ClientStateStore(fileURL: fileURL, protection: .insecurePlaintextForTesting)
+        #else
+        // Release correctly rejects plaintext test stores. A per-client key
+        // and process-local anchor keep these temporary fixtures off Keychain;
+        // this does not exercise persistent rollback-anchor protection.
+        let store = ClientStateStore(
+            fileURL: fileURL,
+            encryptionKey: SymmetricKey(size: .bits256),
+            rollbackAnchorStore: VolatileClientStateRollbackAnchorStore()
         )
+        #endif
+        return try await HeadlessMessagingClient.open(stateStore: store, displayName: name)
     }
 
     private func mark(_ value: String) {

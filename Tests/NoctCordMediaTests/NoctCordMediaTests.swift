@@ -1,6 +1,9 @@
 import XCTest
 @testable import NoctCordMedia
 import Foundation
+#if canImport(WebRTC)
+@preconcurrency import WebRTC
+#endif
 
 final class NoctCordMediaTests: XCTestCase {
     private let roomID: NoctCordMediaRoomID = "room-1"
@@ -257,7 +260,7 @@ final class NoctCordMediaTests: XCTestCase {
         let driver = NoctCordWebRTCMediaDriver()
         do {
             let session = try await driver.makeSession(
-                configuration: .init(roomID: roomID, participant: .init(id: "alice")),
+                configuration: .init(roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false),
                 eventHandler: { _ in },
                 signalingSink: NoctCordDiscardingSignalingSink()
             )
@@ -269,19 +272,302 @@ final class NoctCordMediaTests: XCTestCase {
         }
     }
 
+    #if canImport(WebRTC)
+    func testRawWebRTCReceiveOnlySessionStartsWithMicrophoneDisabled() async throws {
+        let session = try await NoctCordWebRTCMediaDriver().makeSession(
+            configuration: .init(
+                roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false
+            ),
+            eventHandler: { _ in },
+            signalingSink: NoctCordDiscardingSignalingSink()
+        )
+        let inspection = try XCTUnwrap(session as? any NoctCordRawMicrophoneInspectable)
+        let state = try await inspection.inspectLocalMicrophoneState()
+        XCTAssertFalse(state.enabled)
+        XCTAssertEqual(state.localAudioSenders, 0)
+    }
+
+    func testRawWebRTCReceiveOnlyPeerHasNoLocalAudioSender() async throws {
+        let session = try await NoctCordWebRTCMediaDriver().makeSession(
+            configuration: .init(
+                roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false
+            ),
+            eventHandler: { _ in },
+            signalingSink: NoctCordDiscardingSignalingSink()
+        )
+        try await session.join()
+        try await session.handleIncomingSignal(.init(
+            roomID: roomID, sender: "bob", recipient: "alice", sequence: 1,
+            timestampMilliseconds: 1, signal: .join
+        ))
+        let inspection = try XCTUnwrap(session as? any NoctCordRawMicrophoneInspectable)
+        let state = try await inspection.inspectLocalMicrophoneState()
+        await session.leave()
+        XCTAssertFalse(state.enabled)
+        XCTAssertEqual(state.localAudioSenders, 0)
+    }
+
+    func testRawWebRTCFailedScreenShareAnnouncementStopsCapture() async throws {
+        let capture = NoctCordScreenCaptureLifecycleFixture()
+        let driver = NoctCordWebRTCMediaDriver(screenCaptureFactory: { capture })
+        let room = NoctCordMediaRoom(
+            configuration: .init(
+                roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false
+            ),
+            driver: driver, signalingSink: NoctCordFailingScreenShareSink()
+        )
+        try await room.join()
+        do {
+            try await room.startScreenShare(using: NoctCordDescriptorScreenShareSource(
+                permission: .granted,
+                track: .init(trackID: try NoctCordMediaTrackID("mock-screen"), source: .display(identifier: 1))
+            ))
+            XCTFail("The screen-share announcement should fail")
+        } catch let error as NoctCordMediaError {
+            guard case .transportFailure = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let stopped = await capture.lifecycle.stopped
+        let snapshot = await room.snapshot()
+        await room.leave()
+        XCTAssertEqual(stopped, 1)
+        XCTAssertNil(snapshot.localScreenShare)
+    }
+
+    func testRawWebRTCLeaveStopsTheStartedScreenCapture() async throws {
+        let capture = NoctCordScreenCaptureLifecycleFixture()
+        let driver = NoctCordWebRTCMediaDriver(screenCaptureFactory: { capture })
+        let room = NoctCordMediaRoom(
+            configuration: .init(
+                roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false
+            ),
+            driver: driver
+        )
+        try await room.join()
+        try await room.startScreenShare(using: NoctCordDescriptorScreenShareSource(
+            permission: .granted,
+            track: .init(trackID: try NoctCordMediaTrackID("mock-screen"), source: .display(identifier: 1))
+        ))
+        let started = await capture.lifecycle.started
+        XCTAssertEqual(started, 1)
+
+        await room.leave()
+
+        let stopped = await capture.lifecycle.stopped
+        XCTAssertEqual(stopped, 1)
+        let snapshot = await room.snapshot()
+        XCTAssertEqual(snapshot.state, .left)
+        XCTAssertNil(snapshot.localScreenShare)
+    }
+
+    func testRawWebRTCLeaveStopsCaptureThatFinishesStartingAfterLeave() async throws {
+        let started = expectation(description: "Fake capture starts and pauses")
+        let gate = NoctCordLifecycleGate()
+        let capture = NoctCordScreenCaptureLifecycleFixture(
+            startGate: gate, onStart: { started.fulfill() }
+        )
+        let driver = NoctCordWebRTCMediaDriver(screenCaptureFactory: { capture })
+        let room = NoctCordMediaRoom(
+            configuration: .init(
+                roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false
+            ),
+            driver: driver
+        )
+        try await room.join()
+        let source = NoctCordDescriptorScreenShareSource(
+            permission: .granted,
+            track: .init(trackID: try NoctCordMediaTrackID("mock-screen"), source: .display(identifier: 1))
+        )
+        let sharing = Task { try await room.startScreenShare(using: source) }
+        await fulfillment(of: [started], timeout: 2)
+
+        await room.leave()
+        await gate.open()
+        do {
+            try await sharing.value
+            XCTFail("A screen share must not finish joining a room that was left")
+        } catch let error as NoctCordMediaError {
+            guard case .invalidState = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+
+        let stopped = await capture.lifecycle.stopped
+        XCTAssertEqual(stopped, 1)
+        let snapshot = await room.snapshot()
+        XCTAssertEqual(snapshot.state, .left)
+        XCTAssertNil(snapshot.localScreenShare)
+    }
+
+    func testRawWebRTCRejectsScreenShareStartedDuringLeave() async throws {
+        let signaling = expectation(description: "Leave has reached its suspended network send")
+        let gate = NoctCordLifecycleGate()
+        let capture = NoctCordScreenCaptureLifecycleFixture()
+        let driver = NoctCordWebRTCMediaDriver(screenCaptureFactory: { capture })
+        let session = try await driver.makeSession(
+            configuration: .init(
+                roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false
+            ),
+            eventHandler: { _ in },
+            signalingSink: NoctCordBlockingLeaveSink(gate: gate, onLeave: { signaling.fulfill() })
+        )
+        try await session.join()
+        let track = NoctCordScreenShareTrack(
+            trackID: try NoctCordMediaTrackID("mock-screen"), source: .display(identifier: 1)
+        )
+        let leaving = Task { await session.leave() }
+        await fulfillment(of: [signaling], timeout: 2)
+
+        var rejected = false
+        do {
+            try await session.publishScreenShare(track)
+        } catch let error as NoctCordMediaError {
+            if case .invalidState = error { rejected = true }
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        await gate.open()
+        await leaving.value
+
+        XCTAssertTrue(rejected)
+        let started = await capture.lifecycle.started
+        XCTAssertEqual(started, 0)
+    }
+    #endif
+
+    func testReceiveOnlyRoomRequestsPermissionBeforeLaterUnmute() async throws {
+        let permissions = NoctCordPermissionRequestRecorder()
+        let room = NoctCordMediaRoom(
+            configuration: .init(
+                roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false
+            ),
+            driver: NoctCordInMemoryMediaDriver(),
+            permissionProvider: permissions
+        )
+        try await room.join()
+        let initialRequests = await permissions.requests
+        XCTAssertEqual(initialRequests, 0)
+        let initial = await room.snapshot()
+        XCTAssertTrue(initial.microphoneMuted)
+
+        do {
+            try await room.setMicrophoneMuted(false)
+            XCTFail("Microphone permission is required before enabling an initially unrequested microphone")
+        } catch let error as NoctCordMediaError {
+            XCTAssertEqual(error, .permissionDenied(.microphone))
+        }
+        let denied = await room.snapshot()
+        XCTAssertTrue(denied.microphoneMuted)
+        await permissions.allow()
+        try await room.setMicrophoneMuted(false)
+        let allowed = await room.snapshot()
+        XCTAssertFalse(allowed.microphoneMuted)
+        try await room.setMicrophoneMuted(true)
+        try await room.setMicrophoneMuted(false)
+        let requested = await permissions.requests
+        XCTAssertEqual(requested, 2)
+        await room.leave()
+    }
+
+    func testLeavingWhileJoinWaitsForPermissionRemainsTerminal() async throws {
+        let requested = expectation(description: "Join waits for the permission result")
+        let gate = NoctCordLifecycleGate()
+        let permissions = NoctCordPermissionRequestRecorder(
+            gate: gate, onRequest: { requested.fulfill() }
+        )
+        await permissions.allow()
+        let room = NoctCordMediaRoom(
+            configuration: .init(roomID: roomID, participant: .init(id: "alice")),
+            driver: NoctCordInMemoryMediaDriver(), permissionProvider: permissions
+        )
+        let joining = Task { try await room.join() }
+        await fulfillment(of: [requested], timeout: 2)
+
+        await room.leave()
+        await gate.open()
+        do {
+            try await joining.value
+            XCTFail("A delayed permission grant must not undo leaving the room")
+        } catch let error as NoctCordMediaError {
+            guard case .invalidState = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let snapshot = await room.snapshot()
+        await room.leave()
+        XCTAssertEqual(snapshot.state, .left)
+    }
+
+    func testLeavingWhileJoinCreatesDriverReleasesTheLateSession() async throws {
+        let created = expectation(description: "Driver creation pauses")
+        let gate = NoctCordLifecycleGate()
+        let lifecycle = NoctCordJoinLifecycle()
+        let room = NoctCordMediaRoom(
+            configuration: .init(
+                roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false
+            ),
+            driver: NoctCordDelayedJoinDriver(
+                lifecycle: lifecycle, creationGate: gate, onCreate: { created.fulfill() }
+            )
+        )
+        let joining = Task { try await room.join() }
+        await fulfillment(of: [created], timeout: 2)
+
+        await room.leave()
+        await gate.open()
+        do {
+            try await joining.value
+            XCTFail("A late-created session must not join a room that was left")
+        } catch let error as NoctCordMediaError {
+            guard case .invalidState = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let snapshot = await room.snapshot()
+        let joins = await lifecycle.joins
+        let leaves = await lifecycle.leaves
+        await room.leave()
+        XCTAssertEqual(snapshot.state, .left)
+        XCTAssertEqual(joins, 0)
+        XCTAssertGreaterThanOrEqual(leaves, 1)
+    }
+
+    func testLeavingWhileDriverJoinsStopsAnyLateActivation() async throws {
+        let started = expectation(description: "Driver join pauses before activation")
+        let gate = NoctCordLifecycleGate()
+        let lifecycle = NoctCordJoinLifecycle()
+        let room = NoctCordMediaRoom(
+            configuration: .init(
+                roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false
+            ),
+            driver: NoctCordDelayedJoinDriver(
+                lifecycle: lifecycle, joinGate: gate, onJoin: { started.fulfill() }
+            )
+        )
+        let joining = Task { try await room.join() }
+        await fulfillment(of: [started], timeout: 2)
+
+        await room.leave()
+        await gate.open()
+        do {
+            try await joining.value
+            XCTFail("A late driver completion must not undo leaving the room")
+        } catch let error as NoctCordMediaError {
+            guard case .invalidState = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let snapshot = await room.snapshot()
+        let active = await lifecycle.active
+        await room.leave()
+        XCTAssertEqual(snapshot.state, .left)
+        XCTAssertFalse(active)
+    }
+
     func testRawWebRTCNegotiatesOfferAndAnswerThroughInjectedSink() async throws {
         let aliceSink = NoctCordLoopbackSink()
         let bobSink = NoctCordLoopbackSink()
         let permissions = NoctCordFixedPermissionProvider(snapshot: .init(microphone: .granted))
         let driver = NoctCordWebRTCMediaDriver()
         let alice = NoctCordMediaRoom(
-            configuration: .init(roomID: roomID, participant: .init(id: "alice")),
+            configuration: .init(roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false),
             driver: driver,
             permissionProvider: permissions,
             signalingSink: aliceSink
         )
         let bob = NoctCordMediaRoom(
-            configuration: .init(roomID: roomID, participant: .init(id: "bob")),
+            configuration: .init(roomID: roomID, participant: .init(id: "bob"), wantsMicrophone: false),
             driver: driver,
             permissionProvider: permissions,
             signalingSink: bobSink
@@ -337,19 +623,19 @@ final class NoctCordMediaTests: XCTestCase {
         let permissions = NoctCordFixedPermissionProvider(snapshot: .init(microphone: .granted))
         let driver = NoctCordWebRTCMediaDriver()
         let alice = NoctCordMediaRoom(
-            configuration: .init(roomID: roomID, participant: .init(id: "alice")),
+            configuration: .init(roomID: roomID, participant: .init(id: "alice"), wantsMicrophone: false),
             driver: driver,
             permissionProvider: permissions,
             signalingSink: aliceSink
         )
         let bob = NoctCordMediaRoom(
-            configuration: .init(roomID: roomID, participant: .init(id: "bob")),
+            configuration: .init(roomID: roomID, participant: .init(id: "bob"), wantsMicrophone: false),
             driver: driver,
             permissionProvider: permissions,
             signalingSink: bobSink
         )
         let carol = NoctCordMediaRoom(
-            configuration: .init(roomID: roomID, participant: .init(id: "carol")),
+            configuration: .init(roomID: roomID, participant: .init(id: "carol"), wantsMicrophone: false),
             driver: driver,
             permissionProvider: permissions,
             signalingSink: carolSink
@@ -470,6 +756,45 @@ private actor NoctCordSignalKindRecorder {
     func values() -> [NoctCordMediaSignalKind] { kinds }
 }
 
+private actor NoctCordLifecycleGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+private actor NoctCordPermissionRequestRecorder: NoctCordMediaPermissionProvider {
+    private var granted = false
+    private(set) var requests = 0
+    private let gate: NoctCordLifecycleGate?
+    private let onRequest: @Sendable () -> Void
+
+    init(gate: NoctCordLifecycleGate? = nil, onRequest: @escaping @Sendable () -> Void = {}) {
+        self.gate = gate
+        self.onRequest = onRequest
+    }
+
+    func allow() { granted = true }
+
+    func request(_ permissions: Set<NoctCordMediaPermission>) async throws -> NoctCordMediaPermissionSnapshot {
+        requests += 1
+        onRequest()
+        await gate?.wait()
+        guard granted else { throw NoctCordMediaError.permissionDenied(.microphone) }
+        return .init(microphone: .granted)
+    }
+}
+
 private actor NoctCordRemoteVideoLifecycleState {
     private var handler: (@Sendable (NoctCordMediaDriverEvent) -> Void)?
 
@@ -523,5 +848,111 @@ private actor NoctCordRemoteVideoLifecycleSession: NoctCordMediaDriverSession {
     func setMicrophoneEnabled(_ enabled: Bool) async throws { _ = enabled }
     func setDeafened(_ enabled: Bool) async throws { _ = enabled }
     func publishScreenShare(_ track: NoctCordScreenShareTrack) async throws { _ = track }
+    func stopScreenShare() async throws {}
+}
+
+#if canImport(WebRTC)
+private actor NoctCordScreenCaptureLifecycle {
+    private(set) var started = 0
+    private(set) var stopped = 0
+    func start() { started += 1 }
+    func stop() { stopped += 1 }
+}
+
+private final class NoctCordScreenCaptureLifecycleFixture: NoctCordRawScreenCapture, @unchecked Sendable {
+    let videoTrack: RTCVideoTrack
+    let lifecycle = NoctCordScreenCaptureLifecycle()
+    private let startGate: NoctCordLifecycleGate?
+    private let onStart: @Sendable () -> Void
+
+    init(startGate: NoctCordLifecycleGate? = nil, onStart: @escaping @Sendable () -> Void = {}) {
+        self.startGate = startGate
+        self.onStart = onStart
+        let factory = RTCPeerConnectionFactory()
+        videoTrack = factory.videoTrack(with: factory.videoSource(), trackId: "mock-screen")
+    }
+
+    func start() async throws {
+        await lifecycle.start()
+        onStart()
+        await startGate?.wait()
+    }
+    func stop() async { await lifecycle.stop() }
+}
+
+private struct NoctCordBlockingLeaveSink: NoctCordMediaSignalingSink {
+    let gate: NoctCordLifecycleGate
+    let onLeave: @Sendable () -> Void
+
+    func send(_ envelope: NoctCordMediaSignalEnvelope) async throws {
+        if envelope.signal.kind == .leave {
+            onLeave()
+            await gate.wait()
+        }
+    }
+}
+
+private struct NoctCordFailingScreenShareSink: NoctCordMediaSignalingSink {
+    func send(_ envelope: NoctCordMediaSignalEnvelope) async throws {
+        if envelope.signal.kind == .screenShareStarted {
+            throw NoctCordMediaError.transportFailure("fixture rejected the screen-share signal")
+        }
+    }
+}
+#endif
+
+private actor NoctCordJoinLifecycle {
+    private(set) var joins = 0
+    private(set) var leaves = 0
+    private(set) var active = false
+    func beginJoin() { joins += 1 }
+    func activate() { active = true }
+    func leave() { leaves += 1; active = false }
+}
+
+private struct NoctCordDelayedJoinDriver: NoctCordMediaDriver {
+    let lifecycle: NoctCordJoinLifecycle
+    var creationGate: NoctCordLifecycleGate?
+    var joinGate: NoctCordLifecycleGate?
+    var onCreate: @Sendable () -> Void = {}
+    var onJoin: @Sendable () -> Void = {}
+
+    func makeSession(
+        configuration: NoctCordMediaRoomConfiguration,
+        eventHandler: @escaping @Sendable (NoctCordMediaDriverEvent) -> Void,
+        signalingSink: any NoctCordMediaSignalingSink
+    ) async throws -> any NoctCordMediaDriverSession {
+        onCreate()
+        await creationGate?.wait()
+        return NoctCordDelayedJoinSession(lifecycle: lifecycle, gate: joinGate, onJoin: onJoin)
+    }
+}
+
+private actor NoctCordDelayedJoinSession: NoctCordMediaDriverSession {
+    let lifecycle: NoctCordJoinLifecycle
+    let gate: NoctCordLifecycleGate?
+    let onJoin: @Sendable () -> Void
+
+    init(lifecycle: NoctCordJoinLifecycle, gate: NoctCordLifecycleGate?, onJoin: @escaping @Sendable () -> Void) {
+        self.lifecycle = lifecycle
+        self.gate = gate
+        self.onJoin = onJoin
+    }
+
+    func join() async throws {
+        await lifecycle.beginJoin()
+        onJoin()
+        await gate?.wait()
+        await lifecycle.activate()
+    }
+    func leave() async { await lifecycle.leave() }
+    func send(_ signal: NoctCordMediaSignal, to recipient: NoctCordMediaParticipantID?) async throws -> NoctCordMediaSignalEnvelope {
+        try .init(roomID: "room-1", sender: "alice", recipient: recipient, sequence: 1,
+                  timestampMilliseconds: 1, signal: signal)
+    }
+    func handleIncomingSignal(_ envelope: NoctCordMediaSignalEnvelope) async throws {}
+    func setMicrophoneEnabled(_ enabled: Bool) async throws {}
+    func setDeafened(_ enabled: Bool) async throws {}
+    func publishScreenShare(_ track: NoctCordScreenShareTrack) async throws {}
     func stopScreenShare() async throws {}
 }

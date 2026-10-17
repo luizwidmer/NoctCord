@@ -168,6 +168,27 @@ public struct NoctCordSpaceSession: Identifiable, Equatable {
     public var isCurrentUserOwner: Bool {
         currentMember == projection.owner
     }
+
+    mutating func reconcileUnreadCounts(
+        from previous: NoctCordSpaceSession?,
+        visibleChannelID: UUID?
+    ) {
+        let previous = previous?.id == id ? previous : nil
+        unreadByChannel = Dictionary(uniqueKeysWithValues: textChannels.map { channel in
+            guard channel.id != visibleChannelID else { return (channel.id, 0) }
+            guard let previous else { return (channel.id, 0) }
+            let priorMessageIDs = Set(previous.projection.channels[channel.id]?.messageIDs ?? [])
+            let newRemoteMessages = channel.messageIDs.filter { messageID in
+                guard !priorMessageIDs.contains(messageID),
+                      let message = projection.messages[messageID] else { return false }
+                return message.author != currentMember && !message.isRetracted
+            }.count
+            return (
+                channel.id,
+                previous.unreadByChannel[channel.id, default: 0] + newRemoteMessages
+            )
+        })
+    }
 }
 
 @MainActor
@@ -221,6 +242,7 @@ public final class NoctCordAppModel: ObservableObject {
     private var communityLifecycleRecoveryTask: Task<Void, Never>?
     private var identityScopes: [UUID: NoctCordIdentityScope] = [:]
     private var mediaRoom: NoctCordMediaRoom?
+    private var mediaRoomGeneration = UUID()
     private var mediaRefreshTask: Task<Void, Never>?
     private var processedCallSignalIDs: Set<UUID> = []
     private var iceServers: [NoctCordMediaICEServer] = []
@@ -335,10 +357,9 @@ public final class NoctCordAppModel: ObservableObject {
             let pending = Array(operations.values)
             pending.forEach { $0.cancel() }
             refreshTask?.cancel(); mediaRefreshTask?.cancel(); communityLifecycleRecoveryTask?.cancel()
+            await stopMediaRoom()
             for operation in pending { await operation.value }
             if directOperations > 0 { await withCheckedContinuation { resetWaiters.append($0) } }
-            if let mediaRoom { await mediaRoom.leave() }
-            mediaRoom = nil
             if let transport { await transport.discardRealtimeRooms() }
             transport = nil
             try await identityVault.purge()
@@ -622,6 +643,10 @@ public final class NoctCordAppModel: ObservableObject {
         selectedSpaceID = id
         selectedChannelID = spaces.first { $0.id == id }?.textChannels.first?.id
         searchQuery = ""
+        composerNotice = nil
+        if let selectedChannelID {
+            updateSelectedSpace { $0.unreadByChannel[selectedChannelID] = 0 }
+        }
         if !previewMode, usesRelayDiscoveredICE, let transport {
             runOperation { [self] in
                 await refreshRelayCallConnectivity(using: transport, for: id)
@@ -679,11 +704,20 @@ public final class NoctCordAppModel: ObservableObject {
                     botID: match.bot.id,
                     channelID: channelID,
                     commandName: match.command.name,
-                    arguments: parts.count > 1 ? String(parts[1]) : ""
+                    arguments: parts.count > 1
+                        ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        : ""
                 )
             )
         } else {
             operation = .postMessage(id: UUID(), channelID: channelID, text: text)
+        }
+
+        guard operation.isStructurallyValid else {
+            composerNotice = operation.kind == .botCommandInvoked
+                ? "Command arguments are too long or contain unsupported characters."
+                : "This message is too long or contains unsupported characters."
+            return
         }
 
         composerText = ""
@@ -1098,25 +1132,22 @@ public final class NoctCordAppModel: ObservableObject {
               let space = selectedSpace,
               let roomID = space.activeVoiceRoomID else { return }
         runOperation { [self] in
-            do {
-                try await mediaRoom.setMicrophoneMuted(muted)
-                let snapshot = await mediaRoom.snapshot()
-                callSnapshot = snapshot
-                await publishAndRefresh(
-                    .setVoiceMute(
-                        roomID: roomID,
-                        state: NoctCordVoiceParticipantStateV1(
-                            member: space.currentMember,
-                            isJoined: true,
-                            isMuted: snapshot.microphoneMuted,
-                            isDeafened: snapshot.deafened
-                        )
-                    ),
-                    spaceID: space.id
-                )
-            } catch {
-                connectionState = .failed(error.localizedDescription)
-            }
+            guard let snapshot = await updateMediaRoom(mediaRoom, performing: {
+                try await $0.setMicrophoneMuted(muted)
+            }), isCurrentMediaRoom(mediaRoom) else { return }
+            await publishAndRefresh(
+                .setVoiceMute(
+                    roomID: roomID,
+                    state: NoctCordVoiceParticipantStateV1(
+                        member: space.currentMember,
+                        isJoined: true,
+                        isMuted: snapshot.microphoneMuted,
+                        isDeafened: snapshot.deafened
+                    )
+                ),
+                spaceID: space.id,
+                mediaRoom: mediaRoom
+            )
         }
     }
 
@@ -1125,25 +1156,22 @@ public final class NoctCordAppModel: ObservableObject {
               let space = selectedSpace,
               let roomID = space.activeVoiceRoomID else { return }
         runOperation { [self] in
-            do {
-                try await mediaRoom.setDeafened(deafened)
-                let snapshot = await mediaRoom.snapshot()
-                callSnapshot = snapshot
-                await publishAndRefresh(
-                    .setVoiceDeafened(
-                        roomID: roomID,
-                        state: NoctCordVoiceParticipantStateV1(
-                            member: space.currentMember,
-                            isJoined: true,
-                            isMuted: snapshot.microphoneMuted,
-                            isDeafened: snapshot.deafened
-                        )
-                    ),
-                    spaceID: space.id
-                )
-            } catch {
-                connectionState = .failed(error.localizedDescription)
-            }
+            guard let snapshot = await updateMediaRoom(mediaRoom, performing: {
+                try await $0.setDeafened(deafened)
+            }), isCurrentMediaRoom(mediaRoom) else { return }
+            await publishAndRefresh(
+                .setVoiceDeafened(
+                    roomID: roomID,
+                    state: NoctCordVoiceParticipantStateV1(
+                        member: space.currentMember,
+                        isJoined: true,
+                        isMuted: snapshot.microphoneMuted,
+                        isDeafened: snapshot.deafened
+                    )
+                ),
+                spaceID: space.id,
+                mediaRoom: mediaRoom
+            )
         }
     }
 
@@ -1153,35 +1181,32 @@ public final class NoctCordAppModel: ObservableObject {
               let roomID = space.activeVoiceRoomID,
               let projectedRoom = space.projection.voiceRooms[roomID] else { return }
         runOperation { [self] in
-            do {
+            guard let snapshot = await updateMediaRoom(mediaRoom, performing: { room in
                 #if os(macOS)
-                try await mediaRoom.startScreenShare(using: NoctCordMacScreenCaptureKitSource())
+                try await room.startScreenShare(using: NoctCordMacScreenCaptureKitSource())
                 #elseif os(iOS)
-                try await mediaRoom.startScreenShare(using: NoctCordReplayKitScreenShareSource())
+                try await room.startScreenShare(using: NoctCordReplayKitScreenShareSource())
                 #endif
-                let snapshot = await mediaRoom.snapshot()
-                callSnapshot = snapshot
-                if let track = snapshot.localScreenShare {
-                    let source: NoctCordScreenShareKind
-                    switch track.source {
-                    case .display: source = .display
-                    case .replayKitBroadcast: source = .application
-                    }
-                    await publishAndRefresh(
-                        .startScreenShare(
-                            roomID: roomID,
-                            descriptor: NoctCordScreenShareDescriptorV1(
-                                shareID: UUID(),
-                                presenter: space.currentMember,
-                                source: source,
-                                keyID: projectedRoom.signalingKeyID
-                            )
-                        ),
-                        spaceID: space.id
-                    )
+            }), isCurrentMediaRoom(mediaRoom) else { return }
+            if let track = snapshot.localScreenShare {
+                let source: NoctCordScreenShareKind
+                switch track.source {
+                case .display: source = .display
+                case .replayKitBroadcast: source = .application
                 }
-            } catch {
-                connectionState = .failed(error.localizedDescription)
+                await publishAndRefresh(
+                    .startScreenShare(
+                        roomID: roomID,
+                        descriptor: NoctCordScreenShareDescriptorV1(
+                            shareID: UUID(),
+                            presenter: space.currentMember,
+                            source: source,
+                            keyID: projectedRoom.signalingKeyID
+                        )
+                    ),
+                    spaceID: space.id,
+                    mediaRoom: mediaRoom
+                )
             }
         }
     }
@@ -1194,22 +1219,46 @@ public final class NoctCordAppModel: ObservableObject {
             $0.roomID == roomID && $0.descriptor.presenter == space.currentMember
         }
         runOperation { [self] in
-            do {
-                try await mediaRoom.stopScreenShare()
-                callSnapshot = await mediaRoom.snapshot()
-                for share in shares {
-                    await publishAndRefresh(
-                        .stopScreenShare(
-                            roomID: roomID,
-                            shareID: share.descriptor.shareID
-                        ),
-                        spaceID: space.id
-                    )
-                }
-            } catch {
-                connectionState = .failed(error.localizedDescription)
+            guard await updateMediaRoom(mediaRoom, performing: {
+                try await $0.stopScreenShare()
+            }) != nil, isCurrentMediaRoom(mediaRoom) else { return }
+            for share in shares {
+                guard isCurrentMediaRoom(mediaRoom) else { return }
+                await publishAndRefresh(
+                    .stopScreenShare(
+                        roomID: roomID,
+                        shareID: share.descriptor.shareID
+                    ),
+                    spaceID: space.id,
+                    mediaRoom: mediaRoom
+                )
             }
         }
+    }
+
+    func updateMediaRoom(
+        _ room: NoctCordMediaRoom,
+        performing operation: @Sendable (NoctCordMediaRoom) async throws -> Void
+    ) async -> NoctCordMediaRoomSnapshot? {
+        guard isCurrentMediaRoom(room) else { return nil }
+        let initialSnapshot = await room.snapshot()
+        guard isCurrentMediaRoom(room), initialSnapshot.state == .joined else { return nil }
+        do {
+            try await operation(room)
+            guard isCurrentMediaRoom(room) else { return nil }
+            let snapshot = await room.snapshot()
+            guard isCurrentMediaRoom(room) else { return nil }
+            callSnapshot = snapshot
+            return snapshot
+        } catch {
+            guard isCurrentMediaRoom(room) else { return nil }
+            connectionState = .failed(error.localizedDescription)
+            return nil
+        }
+    }
+
+    private func isCurrentMediaRoom(_ room: NoctCordMediaRoom) -> Bool {
+        mediaRoom === room && !Task.isCancelled
     }
 
     @discardableResult
@@ -1585,8 +1634,10 @@ public final class NoctCordAppModel: ObservableObject {
               let initialRoom = space.projection.voiceRooms[roomID],
               !initialRoom.isArchived else { return }
         if let active = space.activeVoiceRoomID, active != roomID {
-            await leaveVoiceRoom(spaceID: spaceID, roomID: active)
+            guard let leftID = await leaveVoiceRoom(spaceID: spaceID, roomID: active),
+                  mediaRoomGeneration == leftID else { return }
         }
+        let joinID = beginMediaRoomJoin()
         activityMessage = "Joining encrypted voice room…"
         do {
             if usesRelayDiscoveredICE,
@@ -1594,6 +1645,7 @@ public final class NoctCordAppModel: ObservableObject {
                expiry.timeIntervalSinceNow <= 60 {
                 await refreshRelayCallConnectivity(using: transport)
             }
+            try requireCurrentMediaRoomJoin(joinID)
             var projectedRoom = initialRoom
             // Never rotate an otherwise valid route from a single joining
             // client: peers already in the room are still bound to that
@@ -1606,6 +1658,7 @@ public final class NoctCordAppModel: ObservableObject {
                 }
                 activityMessage = "Renewing the encrypted voice route…"
                 let route = try await transport.createRealtimeRoute(for: space.id)
+                try requireCurrentMediaRoomJoin(joinID)
                 let rotatedKey = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
                 let renewal = try await transport.publishOperation(
                     spaceID: spaceID,
@@ -1622,7 +1675,9 @@ public final class NoctCordAppModel: ObservableObject {
                 guard renewal.complete else {
                     throw NoctCordTransportError.transportIncomplete
                 }
+                try requireCurrentMediaRoomJoin(joinID)
                 try await reloadSpace(spaceID, using: transport)
+                try requireCurrentMediaRoomJoin(joinID)
                 guard let renewed = spaces.first(where: { $0.id == spaceID })?
                     .projection.voiceRooms[roomID] else {
                     throw NoctCordTransportError.spaceNotFound
@@ -1640,7 +1695,9 @@ public final class NoctCordAppModel: ObservableObject {
             guard publication.complete else {
                 throw NoctCordTransportError.transportIncomplete
             }
+            try requireCurrentMediaRoomJoin(joinID)
             try await reloadSpace(spaceID, using: transport)
+            try requireCurrentMediaRoomJoin(joinID)
 
             let participantID = try NoctCordMediaParticipantID(
                 NoctCordCallSignalCrypto.participantID(for: space.currentMember)
@@ -1674,12 +1731,11 @@ public final class NoctCordAppModel: ObservableObject {
                     spaceID: spaceID,
                     roomID: roomID
                 )
+                try requireCurrentMediaRoomJoin(joinID)
                 if stale.isEmpty { break }
             }
             processedCallSignalIDs.removeAll()
-            try await room.join()
-            mediaRoom = room
-            callSnapshot = await room.snapshot()
+            try await joinMediaRoom(room, joinID: joinID)
             beginRealtimeCallRefresh(
                 coordinator: transport,
                 mediaRoom: room,
@@ -1690,8 +1746,9 @@ public final class NoctCordAppModel: ObservableObject {
             activityMessage = nil
             connectionState = .ready
         } catch {
-            mediaRoom = nil
-            callSnapshot = nil
+            guard mediaRoomGeneration == joinID else { return }
+            let stoppedID = await stopMediaRoom()
+            guard mediaRoomGeneration == stoppedID else { return }
             activityMessage = nil
             connectionState = .failed(error.localizedDescription)
             _ = try? await transport.publishOperation(
@@ -1704,7 +1761,9 @@ public final class NoctCordAppModel: ObservableObject {
                     )
                 )
             )
-            try? await reloadSpace(spaceID, using: transport)
+            if mediaRoomGeneration == stoppedID {
+                try? await reloadSpace(spaceID, using: transport)
+            }
         }
     }
 
@@ -1741,17 +1800,12 @@ public final class NoctCordAppModel: ObservableObject {
         }
     }
 
-    private func leaveVoiceRoom(spaceID: UUID, roomID: UUID) async {
-        mediaRefreshTask?.cancel()
-        mediaRefreshTask = nil
-        if let mediaRoom {
-            await mediaRoom.leave()
-        }
-        self.mediaRoom = nil
-        callSnapshot = nil
-        processedCallSignalIDs.removeAll()
+    @discardableResult
+    private func leaveVoiceRoom(spaceID: UUID, roomID: UUID) async -> UUID? {
+        let leaveID = await stopMediaRoom()
+        guard mediaRoomGeneration == leaveID else { return nil }
         guard let transport,
-              let space = spaces.first(where: { $0.id == spaceID }) else { return }
+              let space = spaces.first(where: { $0.id == spaceID }) else { return leaveID }
         activityMessage = "Leaving voice room…"
         do {
             let publication = try await transport.publishOperation(
@@ -1767,13 +1821,65 @@ public final class NoctCordAppModel: ObservableObject {
             guard publication.complete else {
                 throw NoctCordTransportError.transportIncomplete
             }
+            guard mediaRoomGeneration == leaveID else { return nil }
             await transport.closeRealtimeRoom(spaceID: spaceID, roomID: roomID)
+            guard mediaRoomGeneration == leaveID else { return nil }
             try await reloadSpace(spaceID, using: transport)
-            activityMessage = nil
+            if mediaRoomGeneration == leaveID { activityMessage = nil }
         } catch {
+            guard mediaRoomGeneration == leaveID else { return nil }
             activityMessage = nil
             connectionState = .failed(error.localizedDescription)
         }
+        return mediaRoomGeneration == leaveID ? leaveID : nil
+    }
+
+    private func beginMediaRoomJoin() -> UUID {
+        let joinID = UUID()
+        mediaRoomGeneration = joinID
+        return joinID
+    }
+
+    private func requireCurrentMediaRoomJoin(_ joinID: UUID) throws {
+        guard mediaRoomGeneration == joinID, !Task.isCancelled else {
+            throw CancellationError()
+        }
+    }
+
+    func joinMediaRoom(_ room: NoctCordMediaRoom, joinID: UUID? = nil) async throws {
+        let joinID = joinID ?? beginMediaRoomJoin()
+        try requireCurrentMediaRoomJoin(joinID)
+        // Own pending joins before permission or driver work suspends, so
+        // Leave can make the same room terminal while that work is pending.
+        mediaRoom = room
+        do {
+            try await room.join()
+            try requireCurrentMediaRoomJoin(joinID)
+            let snapshot = await room.snapshot()
+            try requireCurrentMediaRoomJoin(joinID)
+            callSnapshot = snapshot
+        } catch {
+            await room.leave()
+            if mediaRoomGeneration == joinID {
+                mediaRoom = nil
+                callSnapshot = nil
+            }
+            throw error
+        }
+    }
+
+    @discardableResult
+    func stopMediaRoom() async -> UUID {
+        let stoppedID = UUID()
+        mediaRoomGeneration = stoppedID
+        mediaRefreshTask?.cancel()
+        mediaRefreshTask = nil
+        let room = mediaRoom
+        self.mediaRoom = nil
+        callSnapshot = nil
+        processedCallSignalIDs.removeAll()
+        await room?.leave()
+        return stoppedID
     }
 
     private func beginRealtimeCallRefresh(
@@ -1790,7 +1896,9 @@ public final class NoctCordAppModel: ObservableObject {
                     spaceID: spaceID,
                     roomID: room.id
                 ) {
+                    guard !Task.isCancelled, self?.mediaRoom === mediaRoom else { return }
                     for received in realtime where received.author != localMember {
+                        guard !Task.isCancelled, self?.mediaRoom === mediaRoom else { return }
                         await self?.deliverCallSignal(
                             received.signal,
                             author: received.author,
@@ -1801,7 +1909,9 @@ public final class NoctCordAppModel: ObservableObject {
                         )
                     }
                 }
-                if let snapshot = await self?.mediaRoom?.snapshot() {
+                guard !Task.isCancelled, self?.mediaRoom === mediaRoom else { break }
+                if let snapshot = await self?.mediaRoom?.snapshot(),
+                   !Task.isCancelled, self?.mediaRoom === mediaRoom {
                     self?.callSnapshot = snapshot
                 }
                 try? await Task.sleep(for: .milliseconds(150))
@@ -1827,6 +1937,7 @@ public final class NoctCordAppModel: ObservableObject {
                 localMember: localMember
             )
             try await mediaRoom.handleIncomingSignal(envelope)
+            guard isCurrentMediaRoom(mediaRoom) else { return }
             processedCallSignalIDs.insert(signal.signalID)
         } catch {
             // Invalid or misaddressed realtime records are quarantined by
@@ -1837,8 +1948,10 @@ public final class NoctCordAppModel: ObservableObject {
     private func publishAndRefresh(
         _ operation: NoctCordOperation,
         spaceID: UUID,
-        activity: String? = nil
+        activity: String? = nil,
+        mediaRoom: NoctCordMediaRoom? = nil
     ) async {
+        if let mediaRoom, !isCurrentMediaRoom(mediaRoom) { return }
         guard let transport else { return }
         if let activity { activityMessage = activity }
         do {
@@ -1849,10 +1962,13 @@ public final class NoctCordAppModel: ObservableObject {
             guard publication.complete else {
                 throw NoctCordTransportError.transportIncomplete
             }
+            if let mediaRoom, !isCurrentMediaRoom(mediaRoom) { return }
             try await reloadSpace(spaceID, using: transport)
+            if let mediaRoom, !isCurrentMediaRoom(mediaRoom) { return }
             connectionState = .ready
             activityMessage = nil
         } catch {
+            if let mediaRoom, !isCurrentMediaRoom(mediaRoom) { return }
             activityMessage = nil
             connectionState = .failed(error.localizedDescription)
         }
@@ -2000,14 +2116,7 @@ public final class NoctCordAppModel: ObservableObject {
             return
         }
         if selectedSpaceID == spaceID {
-            mediaRefreshTask?.cancel()
-            mediaRefreshTask = nil
-            if let mediaRoom {
-                await mediaRoom.leave()
-            }
-            mediaRoom = nil
-            callSnapshot = nil
-            processedCallSignalIDs.removeAll()
+            await stopMediaRoom()
         }
 
         let attachmentIDs = Set(departingSpace.projection.attachments.keys)
@@ -2107,7 +2216,7 @@ public final class NoctCordAppModel: ObservableObject {
         let activeVoiceRoomID = projection.voiceParticipants.first(where: { _, participants in
             participants[snapshot.currentMember]?.isJoined == true
         })?.key
-        return NoctCordSpaceSession(
+        var session = NoctCordSpaceSession(
             id: spaceID,
             shortName: Self.shortName(projection.name ?? "Space"),
             currentMember: snapshot.currentMember,
@@ -2123,6 +2232,11 @@ public final class NoctCordAppModel: ObservableObject {
             relayName: snapshot.relayName,
             relayAssessment: snapshot.relayAssessment
         )
+        session.reconcileUnreadCounts(
+            from: spaces.first(where: { $0.id == spaceID }),
+            visibleChannelID: selectedSpaceID == spaceID ? selectedChannelID : nil
+        )
+        return session
     }
 
     private static func compactHandle(_ handle: GroupScopedMemberHandleV2) -> String {

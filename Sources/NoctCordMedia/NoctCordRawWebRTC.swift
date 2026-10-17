@@ -14,9 +14,16 @@ import Foundation
 
 public final class NoctCordWebRTCMediaDriver: NoctCordMediaDriver, @unchecked Sendable {
     private let runtime: NoctCordWebRTCRuntime
+    private let screenCaptureFactory: (@Sendable () async throws -> any NoctCordRawScreenCapture)?
 
     public init() {
         runtime = NoctCordWebRTCRuntime.shared
+        screenCaptureFactory = nil
+    }
+
+    init(screenCaptureFactory: @escaping @Sendable () async throws -> any NoctCordRawScreenCapture) {
+        runtime = NoctCordWebRTCRuntime.shared
+        self.screenCaptureFactory = screenCaptureFactory
     }
 
     public func makeSession(
@@ -30,7 +37,8 @@ public final class NoctCordWebRTCMediaDriver: NoctCordMediaDriver, @unchecked Se
             configuration: configuration,
             runtime: runtime,
             eventHandler: eventHandler,
-            signalingSink: signalingSink
+            signalingSink: signalingSink,
+            screenCaptureFactory: screenCaptureFactory
         )
     }
 }
@@ -87,7 +95,12 @@ private actor NoctCordRawSignalingCoordinator {
     }
 }
 
-private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriverSession, @unchecked Sendable {
+protocol NoctCordRawMicrophoneInspectable: Sendable {
+    func inspectLocalMicrophoneState() async throws -> (enabled: Bool, localAudioSenders: Int)
+}
+
+private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriverSession,
+    NoctCordRawMicrophoneInspectable, @unchecked Sendable {
     private let queue = DispatchQueue(label: "org.noctcord.media.webrtc", qos: .userInitiated)
     private let configuration: NoctCordMediaRoomConfiguration
     private let runtime: NoctCordWebRTCRuntime
@@ -97,6 +110,7 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
     private let peerConstraints: RTCMediaConstraints
     private let offerConstraints: RTCMediaConstraints
     private let audioTrack: RTCAudioTrack
+    private let screenCaptureFactory: (@Sendable () async throws -> any NoctCordRawScreenCapture)?
     private var peers: [NoctCordMediaParticipantID: NoctCordRawPeer] = [:]
     private var localVideoTrack: RTCVideoTrack?
     private var localScreenCapture: (any NoctCordRawScreenCapture)?
@@ -111,11 +125,13 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
         configuration: NoctCordMediaRoomConfiguration,
         runtime: NoctCordWebRTCRuntime,
         eventHandler: @escaping @Sendable (NoctCordMediaDriverEvent) -> Void,
-        signalingSink: any NoctCordMediaSignalingSink
+        signalingSink: any NoctCordMediaSignalingSink,
+        screenCaptureFactory: (@Sendable () async throws -> any NoctCordRawScreenCapture)? = nil
     ) {
         self.configuration = configuration
         self.runtime = runtime
         self.eventHandler = eventHandler
+        self.screenCaptureFactory = screenCaptureFactory
         signalingCoordinator = NoctCordRawSignalingCoordinator(
             roomID: configuration.roomID,
             sender: configuration.participant.id,
@@ -153,11 +169,14 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
             trackId: "noctcord-microphone-\(configuration.participant.id.rawValue)"
         )
         super.init()
+        audioTrack.isEnabled = configuration.wantsMicrophone
     }
 
     func join() async throws {
         do {
-            try configureAudioSessionIfNeeded()
+            if configuration.wantsMicrophone {
+                try configureAudioSessionIfNeeded()
+            }
             try await perform { [self] in
                 guard !self.joined else { return }
                 self.joined = true
@@ -170,15 +189,35 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
         }
     }
 
+    func inspectLocalMicrophoneState() async throws -> (enabled: Bool, localAudioSenders: Int) {
+        try await perform { [self] in
+            (
+                enabled: self.audioTrack.isEnabled,
+                localAudioSenders: self.peers.values.reduce(0) { total, peer in
+                    total + peer.connection.senders.filter {
+                        $0.track?.trackId == self.audioTrack.trackId
+                    }.count
+                }
+            )
+        }
+    }
+
     func leave() async {
-        guard (try? await perform { [self] in self.joined }) == true else { return }
-        _ = try? await sendGenerated(.leave)
-        try? await perform { [self] in
+        // Close admission and release local media before awaiting capture
+        // shutdown or the best-effort final network announcement.
+        let teardown = try? await perform { [self] in
+            let wasJoined = self.joined
             self.joined = false
+            let capture = self.detachScreenCapture()
             self.peers.values.forEach { $0.connection.close() }
             self.peers.removeAll()
+            return (wasJoined: wasJoined, capture: capture)
         }
+        await teardown?.capture?.stop()
         deactivateAudioSessionIfNeeded()
+        if teardown?.wasJoined == true {
+            _ = try? await signalingCoordinator.send(.leave, to: nil)
+        }
     }
 
     func send(
@@ -189,8 +228,6 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
     }
 
     func handleIncomingSignal(_ envelope: NoctCordMediaSignalEnvelope) async throws {
-        let isJoined = try await perform { [self] in self.joined }
-        guard isJoined else { throw NoctCordMediaError.invalidState("session is not joined") }
         guard envelope.roomID == configuration.roomID,
               envelope.sender != configuration.participant.id,
               envelope.recipient == nil || envelope.recipient == configuration.participant.id else {
@@ -198,6 +235,7 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
         }
 
         try await perform { [self] in
+            guard self.joined else { throw NoctCordMediaError.invalidState("session is not joined") }
             self.process(envelope.signal, from: envelope.sender)
         }
     }
@@ -205,6 +243,19 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
     func setMicrophoneEnabled(_ enabled: Bool) async throws {
         try await perform { [self] in
             guard self.joined else { throw NoctCordMediaError.invalidState("session is not joined") }
+            if enabled {
+                try self.configureAudioSessionIfNeeded()
+                for peer in self.peers.values where !peer.connection.senders.contains(where: {
+                    $0.track?.trackId == self.audioTrack.trackId
+                }) {
+                    guard peer.connection.add(self.audioTrack, streamIds: ["noctcord-audio"]) != nil else {
+                        throw NoctCordMediaError.transportFailure("microphone sender could not be added")
+                    }
+                    if self.isDesignatedOfferer(for: peer.remoteParticipant) {
+                        self.createOffer(for: peer)
+                    }
+                }
+            }
             self.audioTrack.isEnabled = enabled
         }
         _ = try await sendGenerated(.microphone(enabled: enabled))
@@ -220,57 +271,95 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
     }
 
     func publishScreenShare(_ track: NoctCordScreenShareTrack) async throws {
-        let capture = try await NoctCordRawScreenCaptureFactory.make(
-            track: track,
-            runtime: runtime,
-            runtimeErrorHandler: { [weak self] error in
-                guard let self else { return }
-                self.eventHandler(.screenShareFailed(
-                    participant: self.configuration.participant.id,
-                    error: error
-                ))
-            }
-        )
-        try await capture.start()
-        let previousCapture = try await perform { [self] in
+        try await perform { [self] in
             guard self.joined else { throw NoctCordMediaError.invalidState("session is not joined") }
-            let previousCapture = self.localScreenCapture
-            self.localScreenCapture = capture
-            self.localVideoTrack = capture.videoTrack
-            for peer in self.peers.values {
-                if let sender = peer.screenSender {
-                    _ = peer.connection.removeTrack(sender)
-                }
-                peer.screenSender = peer.connection.add(capture.videoTrack, streamIds: ["noctcord-screen"])
-                if self.isDesignatedOfferer(for: peer.remoteParticipant) {
-                    self.createOffer(for: peer)
-                }
-            }
-            return previousCapture
         }
-        await previousCapture?.stop()
-        _ = try await sendGenerated(.screenShareStarted(track))
-    }
-
-    func stopScreenShare() async throws {
-        let capture = try await perform { [self] in
-            let capture = self.localScreenCapture
-            self.localScreenCapture = nil
-            self.localVideoTrack?.isEnabled = false
-            self.localVideoTrack = nil
-            for peer in self.peers.values {
-                if let sender = peer.screenSender {
-                    _ = peer.connection.removeTrack(sender)
-                    peer.screenSender = nil
+        let capture: any NoctCordRawScreenCapture
+        if let screenCaptureFactory {
+            capture = try await screenCaptureFactory()
+        } else {
+            capture = try await NoctCordRawScreenCaptureFactory.make(
+                track: track,
+                runtime: runtime,
+                runtimeErrorHandler: { [weak self] error in
+                    guard let self else { return }
+                    self.eventHandler(.screenShareFailed(
+                        participant: self.configuration.participant.id,
+                        error: error
+                    ))
+                }
+            )
+        }
+        var installed = false
+        do {
+            try await capture.start()
+            let previousCapture = try await perform { [self] in
+                guard self.joined else { throw NoctCordMediaError.invalidState("session is not joined") }
+                let previousCapture = self.localScreenCapture
+                self.localScreenCapture = capture
+                self.localVideoTrack = capture.videoTrack
+                for peer in self.peers.values {
+                    if let sender = peer.screenSender {
+                        _ = peer.connection.removeTrack(sender)
+                    }
+                    peer.screenSender = peer.connection.add(capture.videoTrack, streamIds: ["noctcord-screen"])
                     if self.isDesignatedOfferer(for: peer.remoteParticipant) {
                         self.createOffer(for: peer)
                     }
                 }
+                return previousCapture
             }
-            return capture
+            installed = true
+            await previousCapture?.stop()
+            _ = try await sendGenerated(.screenShareStarted(track))
+            try await perform { [self] in
+                guard self.joined,
+                      let current = self.localScreenCapture,
+                      current === capture else {
+                    throw NoctCordMediaError.invalidState("screen share is no longer active")
+                }
+            }
+        } catch {
+            let detached = try? await perform { [self] in
+                self.detachScreenCapture(matching: capture)
+            }
+            // If installation was refused, this capture was never owned by
+            // leave/replacement and still needs explicit shutdown.
+            if !installed || detached != nil {
+                await capture.stop()
+            }
+            throw error
+        }
+    }
+
+    func stopScreenShare() async throws {
+        let capture = try await perform { [self] in
+            self.detachScreenCapture()
         }
         await capture?.stop()
         _ = try await sendGenerated(.screenShareStopped)
+    }
+
+    /// Queue-confined: callers detach at the same decision point that checks
+    /// session state, then await OS capture shutdown outside the queue.
+    private func detachScreenCapture(
+        matching expected: (any NoctCordRawScreenCapture)? = nil
+    ) -> (any NoctCordRawScreenCapture)? {
+        guard let capture = localScreenCapture,
+              expected == nil || capture === expected else { return nil }
+        localScreenCapture = nil
+        localVideoTrack?.isEnabled = false
+        localVideoTrack = nil
+        for peer in peers.values {
+            if let sender = peer.screenSender {
+                _ = peer.connection.removeTrack(sender)
+                peer.screenSender = nil
+                if joined && isDesignatedOfferer(for: peer.remoteParticipant) {
+                    createOffer(for: peer)
+                }
+            }
+        }
+        return capture
     }
 
     private func sendGenerated(
@@ -404,6 +493,9 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
         case .microphoneState:
             if let value = signal.value {
                 eventHandler(.microphoneState(participant: sender, enabled: value == "enabled"))
+                if value == "enabled", isDesignatedOfferer(for: sender) {
+                    createOffer(for: peer(for: sender))
+                }
             }
         case .deafenState:
             if let value = signal.value {
@@ -437,7 +529,13 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
             owner: self
         )
         connection.delegate = peer
-        connection.add(audioTrack, streamIds: ["noctcord-audio"])
+        if audioTrack.isEnabled {
+            connection.add(audioTrack, streamIds: ["noctcord-audio"])
+        } else {
+            let receiveOnly = RTCRtpTransceiverInit()
+            receiveOnly.direction = .recvOnly
+            connection.addTransceiver(of: .audio, init: receiveOnly)
+        }
         if let localVideoTrack {
             peer.screenSender = connection.add(localVideoTrack, streamIds: ["noctcord-screen"])
         }
@@ -446,6 +544,7 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
     }
 
     private func createOffer(for peer: NoctCordRawPeer) {
+        guard joined else { return }
         guard !peer.isMakingOffer,
               peer.connection.signalingState == .stable else {
             peer.needsOffer = true
@@ -622,7 +721,7 @@ private final class NoctCordRawWebRTCMediaSession: NSObject, NoctCordMediaDriver
     }
 }
 
-private protocol NoctCordRawScreenCapture: AnyObject, Sendable {
+protocol NoctCordRawScreenCapture: AnyObject, Sendable {
     var videoTrack: RTCVideoTrack { get }
     func start() async throws
     func stop() async
