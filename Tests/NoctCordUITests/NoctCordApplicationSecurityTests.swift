@@ -127,4 +127,81 @@ final class NoctCordApplicationSecurityTests: XCTestCase {
         ).isEmpty)
     }
 
+    func testQueuedBotCommandCannotRunAfterInvokerLosesChannelPermission() async throws {
+        let spaceID = UUID(), channelID = UUID()
+        let owner = GroupScopedMemberHandleV2(rawValue: Data(repeating: 1, count: 32).base64EncodedString())
+        let member = GroupScopedMemberHandleV2(rawValue: Data(repeating: 2, count: 32).base64EncodedString())
+        let botMember = GroupScopedMemberHandleV2(rawValue: Data(repeating: 3, count: 32).base64EncodedString())
+        func event(_ author: GroupScopedMemberHandleV2, _ clock: UInt64,
+                   _ operation: NoctCordOperation) -> NoctCordEvent {
+            NoctCordEvent(spaceID: spaceID, author: author, logicalClock: clock, operation: operation)
+        }
+        let bot = NoctCordBotApplication(
+            id: UUID(), memberHandle: botMember, name: "Audit bot",
+            commands: [NoctCordBotCommand(name: "status", summary: "Show status")]
+        )
+        let invocation = NoctCordBotCommandInvocation(
+            botID: bot.id, channelID: channelID, commandName: "status"
+        )
+        let command = event(member, 4, .invokeBot(invocation))
+        let activeHistory = [
+            event(owner, 1, .createSpace(name: "Community")),
+            event(owner, 2, .createChannel(id: channelID, name: "general")),
+            event(owner, 3, .installBot(bot)),
+            command,
+        ]
+        let active = NoctCordSpaceProjection.project(
+            spaceID: spaceID, owner: owner,
+            activeMembers: [owner, member, botMember], events: activeHistory
+        )
+        XCTAssertEqual(NoctCordBotHost.dispatchableInvocations(from: active), [command])
+
+        let revoked = NoctCordSpaceProjection.project(
+            spaceID: spaceID, owner: owner, activeMembers: [owner, member, botMember],
+            events: activeHistory + [event(owner, 5, .setChannelPermissions(
+                channelID: channelID, roleID: nil,
+                allow: [], deny: [.useApplicationCommands]
+            ))]
+        )
+        XCTAssertEqual(revoked.acceptedEvents.count, 5)
+        XCTAssertNotNil(revoked.projection.botInvocations[invocation.id],
+                        "The command was valid when posted and remains in history")
+        XCTAssertTrue(NoctCordBotHost.dispatchableInvocations(from: revoked).isEmpty)
+        let removed = NoctCordSpaceProjection.project(
+            spaceID: spaceID, owner: owner, activeMembers: [owner, botMember],
+            historicalMembers: [member], events: activeHistory
+        )
+        XCTAssertNotNil(removed.projection.botInvocations[invocation.id])
+        XCTAssertTrue(NoctCordBotHost.dispatchableInvocations(from: removed).isEmpty,
+                      "Historical authors must not retain current bot authority")
+
+        let counter = BotHandlerCounter()
+        let runtime = NoctCordBotRuntime(
+            botID: bot.id, memberHandleRawValue: botMember.rawValue,
+            ledger: NoctCordInMemoryBotInvocationLedger()
+        ) { _ in
+            await counter.increment()
+            return "ok"
+        }
+        do {
+            _ = try await runtime.prepareResponse(for: command, projection: revoked.projection)
+            XCTFail("Revoked command reached the handler")
+        } catch let error as NoctCordBotRuntimeError {
+            XCTAssertEqual(error, .botUnavailable)
+        }
+        let deniedCount = await counter.value()
+        XCTAssertEqual(deniedCount, 0)
+
+        let allowed = try await runtime.prepareResponse(for: command, projection: active.projection)
+        XCTAssertNotNil(allowed, "An authorized queued command must still run")
+        let allowedCount = await counter.value()
+        XCTAssertEqual(allowedCount, 1)
+    }
+
+}
+
+private actor BotHandlerCounter {
+    private var count = 0
+    func increment() { count += 1 }
+    func value() -> Int { count }
 }

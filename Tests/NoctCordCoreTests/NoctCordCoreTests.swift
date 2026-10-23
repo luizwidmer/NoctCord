@@ -364,6 +364,89 @@ final class NoctCordCoreTests: XCTestCase {
         XCTAssertEqual(result.rejectedEvents.count, 1)
     }
 
+    func testOwnerBootstrapCannotForgeAnotherMembersMessage() {
+        let owner = handle(1)
+        let member = handle(2)
+        let forgedMessageID = UUID()
+        let forgedMessage = makeEvent(
+            author: member,
+            clock: 3,
+            operation: .postMessage(
+                id: forgedMessageID,
+                channelID: channelID,
+                text: "forged attribution"
+            )
+        )
+        let bootstrap = makeEvent(author: owner, clock: 4,
+                                  operation: .applyBootstrap([forgedMessage]))
+        let events = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(author: owner, clock: 2,
+                      operation: .createChannel(id: channelID, name: "general")),
+            bootstrap,
+        ]
+
+        let result = project(events, owner: owner, members: [owner, member])
+        XCTAssertNil(result.projection.messages[forgedMessageID])
+        XCTAssertEqual(result.rejectedEvents.map(\.eventID), [bootstrap.id])
+    }
+
+    func testOwnerBootstrapCannotForgeAnotherMembersIdentityBinding() throws {
+        let owner = handle(1)
+        let member = handle(2)
+        let key = try NoctCordIdentityKeyV1.generate(scope: .portable)
+        let profile = try key.publicProfile(displayName: "False Member", createdAt: timestamp)
+        let binding = try key.bind(
+            profile: profile,
+            to: spaceID,
+            memberHandle: member,
+            issuedAt: timestamp.addingTimeInterval(1)
+        )
+        let forgedBinding = makeEvent(
+            author: member,
+            clock: 1,
+            operation: .bindIdentity(binding)
+        )
+        let bootstrap = makeEvent(author: owner, clock: 2,
+                                  operation: .applyBootstrap([forgedBinding]))
+
+        let result = project([bootstrap], owner: owner, members: [owner, member])
+        XCTAssertNil(result.projection.identityBindings[member])
+        XCTAssertTrue(result.rejectedEvents.isEmpty)
+    }
+
+    func testLegacyBootstrapKeepsConfigurationButIgnoresNestedIdentity() throws {
+        let owner = handle(1)
+        let member = handle(2)
+        let key = try NoctCordIdentityKeyV1.generate(scope: .portable)
+        let profile = try key.publicProfile(displayName: "Unverified", createdAt: timestamp)
+        let binding = try key.bind(
+            profile: profile,
+            to: spaceID,
+            memberHandle: member,
+            issuedAt: timestamp.addingTimeInterval(1)
+        )
+        let bootstrap = makeEvent(
+            author: owner,
+            clock: 4,
+            operation: .applyBootstrap([
+                makeEvent(author: owner, clock: 1,
+                          operation: .createSpace(name: "Restored")),
+                makeEvent(author: member, clock: 2,
+                          operation: .bindIdentity(binding)),
+                makeEvent(author: owner, clock: 3,
+                          operation: .createChannel(id: channelID, name: "general")),
+            ])
+        )
+
+        let result = project([bootstrap], owner: owner, members: [owner, member])
+        XCTAssertTrue(result.rejectedEvents.isEmpty)
+        XCTAssertEqual(result.projection.name, "Restored")
+        XCTAssertEqual(result.projection.channels[channelID]?.name, "general")
+        XCTAssertNil(result.projection.identityBindings[member])
+        XCTAssertEqual(try NoctCordCodec.decode(NoctCordCodec.encode(bootstrap)), bootstrap)
+    }
+
     func testProjectionIsDeterministicAcrossDeliveryOrder() {
         let owner = handle(1)
         let member = handle(2)

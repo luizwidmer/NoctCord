@@ -1586,7 +1586,7 @@ public actor NoctCordTransportCoordinator {
         createdAt: Date
     ) throws -> [[NoctCordEvent]] {
         let eligible = events
-            .filter { isBootstrapStateEvent($0.operation.kind) }
+            .filter { $0.operation.kind.isBootstrapConfiguration }
             .sorted(by: canonicalEventOrder)
         guard !eligible.isEmpty else { return [] }
 
@@ -1638,27 +1638,6 @@ public actor NoctCordTransportCoordinator {
             spaceID: spaceID, owner: owner, activeMembers: activeMembers,
             historicalMembers: Set(events.map(\.author)), events: events
         ).acceptedEvents
-    }
-
-    private static func isBootstrapStateEvent(_ kind: NoctCordEventKind) -> Bool {
-        switch kind {
-        case .spaceCreated, .spaceRenamed,
-             .channelCreated, .channelRenamed, .channelArchived,
-             .roleDefined, .roleDeleted, .roleGranted, .roleRevoked,
-             .channelPermissionSet, .channelPermissionRemoved,
-             .voiceRoomCreated, .voiceRoomUpdated, .voiceRoomArchived,
-             .botInstalled, .botUpdated, .botRemoved,
-             .identityBound:
-            true
-        case .messagePosted, .messageEdited, .messageRetracted,
-             .reactionAdded, .reactionRemoved, .messagePinned, .messageUnpinned,
-             .attachmentAdded, .voiceParticipantJoined, .voiceParticipantLeft,
-             .voiceParticipantMuted, .voiceParticipantDeafened,
-             .voiceParticipantSpeaking, .callSignalPosted,
-             .screenShareStarted, .screenShareStopped,
-             .botCommandInvoked, .bootstrapRequested, .bootstrapApplied:
-            false
-        }
     }
 
     private static func authorizeRealtimeEnvelope(

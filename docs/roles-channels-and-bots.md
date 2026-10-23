@@ -34,8 +34,13 @@ versioned format.
 The transport coordinator projects existing verified history and applies a
 candidate event before upload. Unauthorized local actions are rejected before
 they consume relay capacity. Received events are projected through the same
-rules, so a modified client cannot make a compliant peer accept an
-unauthorized event merely by uploading it.
+rules. Application roles constrain conforming clients, but they are not a
+cryptographic revocation boundary: a still-admitted raw client can claim an
+earlier logical clock and timestamp, placing a newly signed event before a role
+revocation in deterministic projection. Removing its group credential through
+a signed epoch transition is required to stop future group writes. Channel
+visibility controls also do not prevent a member with current group keys from
+decrypting group traffic.
 
 Assignment checks both role rank and the permissions being delegated, including
 roles originally created by the owner. A role manager cannot assign an existing
@@ -52,7 +57,15 @@ Bootstrap planning uses only accepted events: rejected configuration cannot be
 republished by the owner, and a forged bootstrap acknowledgement cannot suppress
 a real request. This uses the exact authorized outer events, excluding events
 that reuse an ID already applied inside a bootstrap. Bootstrap batches apply
-atomically, so a rejected nested event leaves the projection unchanged.
+atomically, so a rejected nested event leaves the projection unchanged. Only
+durable configuration events may be nested in an owner bootstrap; messages,
+attachments, commands, live activity, and identity bindings require their own
+member-signed group events. A late joiner may see a generic member label until
+that member publishes a fresh identity binding. Existing bootstrap batches
+that contain identity bindings still replay their configuration, but the
+nested bindings are ignored. Nested configuration keeps historical author
+fields for replay, but only the outer owner bootstrap has a fresh group
+signature; a nested author field is not proof of a fresh member action.
 
 ## Privacy boundary for channels
 
@@ -76,7 +89,10 @@ syntax.
 Invocation is a signed `botCommandInvoked` event. It is also rendered as a
 message in channel history. Invocation requires **View Channel**, **Send
 Messages**, and **Use App Commands** in that channel, so a channel override can
-disable applications without removing the app from the community.
+disable applications without removing the app from the community. The bot host
+checks those permissions again before running a queued command. A command
+accepted before its author loses access remains in history but is not executed
+after that revocation.
 
 Bot code runs in a separately operated client process, not in the relay. The
 `NoctCordBotRuntime` validates the installation and command, atomically claims

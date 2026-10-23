@@ -195,6 +195,27 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
         return result
     }
 
+    /// An accepted command can wait in history while its author loses access.
+    /// Bot handlers and publication retries must use current channel policy,
+    /// not only the permission verdict from when the event was first applied.
+    public func isBotInvocationCurrentlyAuthorized(_ event: NoctCordEvent) -> Bool {
+        guard event.spaceID == spaceID,
+              event.operation.kind == .botCommandInvoked,
+              let invocation = event.operation.botInvocation,
+              botInvocations[invocation.id] == invocation,
+              messages[invocation.id]?.author == event.author,
+              messages[invocation.id]?.channelID == invocation.channelID,
+              let bot = botApplications[invocation.botID],
+              activeMembers.contains(bot.memberHandle),
+              bot.commands.contains(where: { $0.name == invocation.commandName }) else {
+            return false
+        }
+        let current = permissions(for: event.author, in: invocation.channelID)
+        return current.isSuperset(of: [
+            .readMessages, .sendMessages, .useApplicationCommands,
+        ])
+    }
+
     public func permissions(
         for member: GroupScopedMemberHandleV2,
         in channelID: UUID
@@ -760,6 +781,10 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
             }
             var candidate = self
             for nested in events.sorted(by: canonicalOrder) {
+                if nested.operation.kind == .identityBound { continue }
+                guard nested.operation.kind.isBootstrapConfiguration else {
+                    throw NoctCordProjectionError.invalidEvent
+                }
                 try candidate.apply(
                     nested,
                     permittingHistoricalAuthor: true,

@@ -142,8 +142,10 @@ and permission declarations, and supply the same relay configuration.
 - **Roles and channel access.** Ordered roles provide bounded community
   capabilities, while per-channel everyone/role overrides control viewing,
   sending, attachments, reactions, moderation, and application commands.
-  Clients preflight authorization before upload and deterministically reject
-  unauthorized received events.
+  Clients preflight authorization before upload and deterministically project
+  received events. These application roles constrain conforming clients but
+  cannot revoke a still-admitted raw client's group writing authority; see
+  [the role boundary](docs/roles-channels-and-bots.md#permission-model).
 - **Encrypted applications and bots.** An installed app is a dedicated
   Noctweave group member with declared slash commands. Bot code runs in its
   own client process with replay-safe invocation handling; the relay never

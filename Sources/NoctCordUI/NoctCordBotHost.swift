@@ -93,14 +93,8 @@ public actor NoctCordBotHost {
         from result: NoctCordProjectionResult
     ) -> [NoctCordEvent] {
         let projection = result.projection
-        return result.acceptedEvents.filter { event in
-            guard event.operation.kind == .botCommandInvoked,
-                  let invocation = event.operation.botInvocation,
-                  projection.botInvocations[invocation.id] == invocation,
-                  let bot = projection.botApplications[invocation.botID] else {
-                return false
-            }
-            return bot.commands.contains { $0.name == invocation.commandName }
+        return result.acceptedEvents.filter {
+            projection.isBotInvocationCurrentlyAuthorized($0)
         }
     }
 

@@ -216,8 +216,7 @@ public actor NoctCordBotRuntime {
         }
         guard let bot = projection.botApplications[botID],
               bot.memberHandle.rawValue == memberHandleRawValue,
-              bot.commands.contains(where: { $0.name == invocation.commandName }),
-              projection.botInvocations[invocation.id] == invocation else {
+              projection.isBotInvocationCurrentlyAuthorized(event) else {
             throw NoctCordBotRuntimeError.botUnavailable
         }
         guard try await ledger.claim(invocation.id) else { return nil }

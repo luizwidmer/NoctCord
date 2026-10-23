@@ -117,6 +117,29 @@ public enum NoctCordEventKind: String, Codable, CaseIterable, Sendable {
     case identityBound
     case bootstrapRequested
     case bootstrapApplied
+
+    /// Only durable configuration can be attested by an owner's bootstrap.
+    /// User-authored messages and activity require their own signed group event.
+    public var isBootstrapConfiguration: Bool {
+        switch self {
+        case .spaceCreated, .spaceRenamed,
+             .channelCreated, .channelRenamed, .channelArchived,
+             .roleDefined, .roleDeleted, .roleGranted, .roleRevoked,
+             .channelPermissionSet, .channelPermissionRemoved,
+             .voiceRoomCreated, .voiceRoomUpdated, .voiceRoomArchived,
+             .botInstalled, .botUpdated, .botRemoved:
+            true
+        case .messagePosted, .messageEdited, .messageRetracted,
+             .reactionAdded, .reactionRemoved, .messagePinned, .messageUnpinned,
+             .attachmentAdded, .voiceParticipantJoined, .voiceParticipantLeft,
+             .voiceParticipantMuted, .voiceParticipantDeafened,
+             .voiceParticipantSpeaking, .callSignalPosted,
+             .screenShareStarted, .screenShareStopped,
+             .botCommandInvoked, .identityBound,
+             .bootstrapRequested, .bootstrapApplied:
+            false
+        }
+    }
 }
 
 /// A bounded, application-level operation. It is encoded inside a Noctweave
@@ -471,7 +494,12 @@ public struct NoctCordOperation: Codable, Equatable, Sendable {
                   !events.isEmpty
                       && events.count <= 128
                       && events.allSatisfy {
-                          $0.operation.kind != .bootstrapApplied && $0.isStructurallyValid
+                          // Older honest batches included identity bindings.
+                          // Decode them so their configuration can still replay;
+                          // projection ignores the unauthenticated attribution.
+                          ($0.operation.kind.isBootstrapConfiguration
+                              || $0.operation.kind == .identityBound)
+                              && $0.isStructurallyValid
                       }
                       && ((try? NoctweaveCoder.encode(events, sortedKeys: true).count) ?? .max)
                           <= 48 * 1_024
