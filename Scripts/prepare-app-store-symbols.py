@@ -13,8 +13,8 @@ import tempfile
 import urllib.request
 import zipfile
 
-URL = "https://github.com/stasel/WebRTC/releases/download/152.0.0/WebRTC-M152-dSYM.zip"
-SHA256 = "7c99e7cc12b59e4db357581271b412e9ce031ce21a23590a909f7ae1f0b20f87"
+URL = "https://github.com/stasel/WebRTC/releases/download/156.0.0/WebRTC-M156-dSYM.zip"
+SHA256 = "0d01da89de4740750b74503e2cc384af7ed37dd816151a250d7cf6996ea158ee"
 BUNDLE = "WebRTC-macos-x86_64_arm64.dSYM"
 
 def digest(path):
@@ -48,7 +48,7 @@ def main():
     expected = uuids(framework / executable)
     cache = Path(__file__).resolve().parents[1] / ".build/app-store-symbols"
     cache.mkdir(parents=True, exist_ok=True)
-    source = args.symbols_zip or cache / "WebRTC-M152-dSYM.zip"
+    source = args.symbols_zip or cache / "WebRTC-M156-dSYM.zip"
     if not source.exists():
         partial = source.with_suffix(".download")
         try:

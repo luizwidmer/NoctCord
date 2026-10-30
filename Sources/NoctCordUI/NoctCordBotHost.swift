@@ -41,6 +41,14 @@ public actor NoctCordBotHost {
     public func processOnce() async throws -> NoctCordBotHostCycleResult {
         _ = try await coordinator.synchronize(spaceID: spaceID)
         let snapshot = try await coordinator.storedSpaceSnapshot(spaceID: spaceID)
+        #if NOCTCORD_VERIFIED_CORE
+        guard snapshot.policyMode == .verified,
+              let result = snapshot.verifiedProjection else {
+            return NoctCordBotHostCycleResult(
+                observedInvocations: 0, publishedResponses: 0
+            )
+        }
+        #else
         let result = NoctCordSpaceProjection.project(
             spaceID: spaceID,
             owner: snapshot.owner,
@@ -48,6 +56,7 @@ public actor NoctCordBotHost {
             historicalMembers: Set(snapshot.events.map(\.author)),
             events: snapshot.events
         )
+        #endif
         let projection = result.projection
         let invocations = Self.dispatchableInvocations(from: result)
         var publishedResponses = 0

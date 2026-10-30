@@ -45,7 +45,7 @@ and a `NoctCordRealtimeRouteV1` containing route, append, and read capabilities
 plus an expiry. Members join by publishing a group-scoped join event and then
 opening a `NoctCordMediaRoom`.
 
-The current native driver uses `stasel/WebRTC` 151.0.0 and a peer mesh capped
+The current native driver uses `stasel/WebRTC` M156 and a peer mesh capped
 by the client at eight participants. Each
 peer exchanges microphone, offer, answer, ICE, join/leave, mute/deafen, and
 screen-share control messages through the custom signaling sink. Media samples
@@ -80,6 +80,27 @@ The current coordinator uses a subscription capability followed by bounded
 cursor sync. The active room refresh loop polls the route approximately every
 150 ms. This is not a claim that the current client has a persistent WebSocket
 media-signaling session.
+
+Verified policy checks current voice permission before publishing and accepting
+realtime signals. On a verified epoch or room-key change, the native client
+closes its active media session. After a Core member removal, the owner signs
+a new snapshot with freshly derived room keys and relay routes, excluding the
+removed credential from that epoch. If owner publication is interrupted, the
+signed snapshot series resumes with the same credentials and expiry. After a
+long offline retry, an expired route remains unusable while the policy series
+completes; an owner must renew it with a signed `voiceRoomUpdated` event before
+calls can resume. A relay or offline peer may delay observing a policy change.
+
+Room signaling keys and route capabilities are distributed to every admitted
+group member. The current permission baseline grants `connectVoice` and
+`speakVoice` to every admitted member, so removing an elevated role does not
+revoke voice access. Patched clients reject signals from a member removed by
+a signed Core epoch transition and close sessions after observing it. A
+still-admitted member can read group-wide signaling material and send
+capability-bearing relay traffic. A future explicit voice-deny policy would
+still be an application restriction, not cryptographic room secrecy. Removing
+the member's Core group credential, or using a separate room group with its
+own keys, is required for that exclusion.
 
 ## Screen sharing
 
@@ -122,6 +143,12 @@ Joining with a microphone requests the host microphone permission. Starting a
 share requests screen-capture access through ScreenCaptureKit or ReplayKit.
 The application bundle, not this Swift package, is responsible for usage
 description strings, entitlements, signing, and platform permission review.
+
+The pinned M156 WebRTC binary predates a public October 27, 2026 WebRTC
+input-validation advisory. The advisory does not establish whether this Apple
+binary is affected or fixed. Calling remains enabled while that mapping is
+unresolved; maintainers must carry the risk in release notes and follow the
+binary-mapping and archive checks in `APP_STORE_RELEASE.md`.
 
 ## Explicit non-goals
 

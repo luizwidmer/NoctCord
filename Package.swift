@@ -15,7 +15,7 @@ if let localPath = ProcessInfo.processInfo.environment["NOCTWEAVE_PACKAGE_PATH"]
 } else {
     noctweaveDependency = .package(
         url: "https://github.com/luizwidmer/Noctweave.git",
-        revision: "f8f240dfd48d0eb584f5fdfe6b9a23b575652d4e"
+        revision: "7f873747447ba7c7b11d57cb9ccde63e47f20fa9"
     )
     noctweavePackageIdentity = "Noctweave"
 }
@@ -37,8 +37,8 @@ let package = Package(
         noctweaveDependency,
         .package(
             url: "https://github.com/stasel/WebRTC.git",
-            // M152 includes matching distribution symbols. Pin the source and binary checksum.
-            revision: "1d04692697cb642bfebf6ad2dd99fe52649c3d6d"
+            // M156 includes matching distribution symbols. Pin the source and binary checksum.
+            revision: "3cc466ea040e5dcd1344697bf211dc4c079d1a0c"
         ),
     ],
     targets: [
@@ -49,7 +49,8 @@ let package = Package(
                     name: "NoctweaveCore",
                     package: noctweavePackageIdentity
                 )
-            ]
+            ],
+            swiftSettings: [.define("NOCTCORD_VERIFIED_CORE")]
         ),
         .target(
             name: "NoctCordMedia",
@@ -70,7 +71,8 @@ let package = Package(
                     name: "NoctweaveCore",
                     package: noctweavePackageIdentity
                 )
-            ]
+            ],
+            swiftSettings: [.define("NOCTCORD_VERIFIED_CORE")]
         ),
         .executableTarget(
             name: "NoctCordDemo",
@@ -84,7 +86,8 @@ let package = Package(
             dependencies: ["NoctCordCore", .product(
                 name: "NoctweaveCore",
                 package: noctweavePackageIdentity
-            )]
+            )],
+            swiftSettings: [.define("NOCTCORD_VERIFIED_CORE")]
         ),
         .testTarget(
             name: "NoctCordMediaTests",
@@ -98,7 +101,8 @@ let package = Package(
                     name: "NoctweaveCore",
                     package: noctweavePackageIdentity
                 )
-            ]
+            ],
+            swiftSettings: [.define("NOCTCORD_VERIFIED_CORE")]
         ),
     ]
 )

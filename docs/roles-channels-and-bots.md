@@ -17,6 +17,10 @@ cannot grant permissions they do not possess, give themselves a role, manage
 an equal or higher member, or create an administrator role. The community
 owner and members with **Administrator** bypass ordinary checks.
 
+Voice join and speak are baseline member permissions. Removing an elevated
+role does not revoke voice access from an otherwise admitted member; excluding
+that member requires a signed Core group removal and new epoch.
+
 Channel overrides target either everyone or one role. Effective channel
 permissions are resolved in this order:
 
@@ -31,16 +35,49 @@ assigned role. Deleting a role also removes its assignments and channel
 overrides. The compact codec carries all role and override events in a
 versioned format.
 
-The transport coordinator projects existing verified history and applies a
-candidate event before upload. Unauthorized local actions are rejected before
-they consume relay capacity. Received events are projected through the same
-rules. Application roles constrain conforming clients, but they are not a
-cryptographic revocation boundary: a still-admitted raw client can claim an
-earlier logical clock and timestamp, placing a newly signed event before a role
-revocation in deterministic projection. Removing its group credential through
-a signed epoch transition is required to stop future group writes. Channel
-visibility controls also do not prevent a member with current group keys from
-decrypting group traffic.
+The verified policy protocol (`org.noctcord/event@2`, or the exact
+`org.noctcord/event@1;schema=2` discriminator for an existing group credential)
+orders policy changes with owner-signed checkpoints. Each checkpoint binds the
+group epoch, transcript, active credential set, and Core's authenticated
+per-credential counters and rolling digests. A member's clock or timestamp
+cannot move an event across a verified permission change. Peers enforce the
+new cutoff after receiving and verifying the checkpoint; relay delivery delay
+cannot provide an instantaneous global revocation guarantee.
+
+The community owner alone publishes role, channel, bot, and room policy changes
+in verified mode. Delegated role managers may request an owner action, but
+their own configuration events do not alter authority. Bare version-1 events
+are never accepted as verified policy. Legacy content stays in a separate
+read-only archive until the owner reviews the exact configuration, rotates to
+a fresh signed group epoch, and publishes a complete verified snapshot. A
+joining or late-upgrading member waits for a current-epoch owner snapshot;
+missing historical authority is never inferred.
+
+Large snapshots form an atomic series of at most 64 fragments and 8,192
+configuration operations. Partial series grant no policy. Core retains at
+most 256 protected checkpoint fragments. Before retiring an old prefix, the
+client verifies that every retained authorized ordinary event and visible
+state survives replay from a later complete snapshot. When retained content
+still needs older proof, further policy changes fail closed. A relay-delayed
+old-interval event first delivered after its proof was retired is rejected,
+not accepted under the new policy.
+
+A signed group epoch can advance while an owner snapshot series is incomplete,
+for example when a member leaves. The incomplete old-epoch fragments remain
+bound to their Core receipts but do not apply their configuration. A linked,
+complete owner snapshot in the newer epoch restores the same effective policy
+and keeps authenticated intervening messages under the last complete policy.
+Until that snapshot is complete, ordinary use is read-only. An interrupted
+legacy genesis still requires the owner's exact reviewed proposal; the client
+does not reconstruct authority from unreviewed version-1 events.
+
+All active members must upgrade before relying on verified mode. An old binary
+can still write with its admitted group credential and use its own version-1
+projector, giving it a different view. The owner can rebind upgraded members
+with a new signed epoch and snapshot. Removing an untrusted group credential
+through a signed epoch transition is required to stop future group writes.
+Channel visibility controls cannot prevent a member with current group keys
+from decrypting group traffic.
 
 Assignment checks both role rank and the permissions being delegated, including
 roles originally created by the owner. A role manager cannot assign an existing
@@ -48,11 +85,10 @@ administrator role or a role with permissions they lack. Editing a message
 requires current Send Messages permission; retraction remains available for
 removing existing content.
 
-Ordinary events may advance the last accepted application clock by at most
-1,024. Larger jumps are rejected instead of letting a member exhaust the clock
-and prevent future publications. Local publications derive their next clock
-from accepted projection state, not the raw signed event log. The owner's
-configuration bootstrap may bridge a larger gap for a newly admitted member.
+Legacy ordinary events may advance the last accepted application clock by at
+most 1,024. Verified authorization uses Core's authenticated transport
+counters and derives a local display clock from accepted projection state, so
+a member cannot exhaust future publication with a chosen clock.
 Bootstrap planning uses only accepted events: rejected configuration cannot be
 republished by the owner, and a forged bootstrap acknowledgement cannot suppress
 a real request. This uses the exact authorized outer events, excluding events

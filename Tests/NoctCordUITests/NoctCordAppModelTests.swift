@@ -102,6 +102,127 @@ final class NoctCordAppModelTests: XCTestCase {
         await model.stopMediaRoom()
     }
 
+    func testVerifiedMediaStateRequiresTeardownOnEpochRemovalAndRoomCredentialChanges() throws {
+        let preview = NoctCordAppModel(seedPreviewData: true)
+        let relay = try XCTUnwrap(preview.selectedSpace?.relayAssessment)
+        let spaceID = UUID()
+        let roomID = UUID()
+        let owner = GroupScopedMemberHandleV2.generate()
+        let member = GroupScopedMemberHandleV2.generate()
+        let current = try verifiedMediaSession(
+            spaceID: spaceID, roomID: roomID, owner: owner, member: member,
+            relay: relay, routeByte: 0x11, keyByte: 0x21
+        )
+        XCTAssertFalse(NoctCordAppModel.mediaStateRequiresStop(
+            roomID: roomID, previous: current, updated: current
+        ))
+
+        var newEpoch = current
+        newEpoch.groupEpoch += 1
+        XCTAssertTrue(NoctCordAppModel.mediaStateRequiresStop(
+            roomID: roomID, previous: current, updated: newEpoch
+        ))
+
+        let removedMember = try verifiedMediaSession(
+            spaceID: spaceID, roomID: roomID, owner: owner, member: member,
+            relay: relay, routeByte: 0x11, keyByte: 0x21, memberIsActive: false
+        )
+        XCTAssertFalse(removedMember.projection.activeMembers.contains(member))
+        XCTAssertTrue(NoctCordAppModel.mediaStateRequiresStop(
+            roomID: roomID, previous: current, updated: removedMember
+        ))
+
+        let newRoute = try verifiedMediaSession(
+            spaceID: spaceID, roomID: roomID, owner: owner, member: member,
+            relay: relay, routeByte: 0x12, keyByte: 0x21
+        )
+        XCTAssertTrue(NoctCordAppModel.mediaStateRequiresStop(
+            roomID: roomID, previous: current, updated: newRoute
+        ))
+
+        let newKey = try verifiedMediaSession(
+            spaceID: spaceID, roomID: roomID, owner: owner, member: member,
+            relay: relay, routeByte: 0x11, keyByte: 0x22
+        )
+        XCTAssertTrue(NoctCordAppModel.mediaStateRequiresStop(
+            roomID: roomID, previous: current, updated: newKey
+        ))
+
+        var unverified = current
+        unverified.policyMode = .awaitingOwnerCheckpoint
+        XCTAssertTrue(NoctCordAppModel.mediaStateRequiresStop(
+            roomID: roomID, previous: current, updated: unverified
+        ))
+        XCTAssertTrue(NoctCordAppModel.mediaStateRequiresStop(
+            roomID: roomID, previous: current, updated: nil
+        ))
+    }
+
+    private func verifiedMediaSession(
+        spaceID: UUID,
+        roomID: UUID,
+        owner: GroupScopedMemberHandleV2,
+        member: GroupScopedMemberHandleV2,
+        relay: NoctCordRelayAssessment,
+        routeByte: UInt8,
+        keyByte: UInt8,
+        memberIsActive: Bool = true
+    ) throws -> NoctCordSpaceSession {
+        let route = NoctCordRealtimeRouteV1(
+            routeCapability: Data(repeating: routeByte, count: 32),
+            appendCapability: Data(repeating: routeByte &+ 0x30, count: 32),
+            readCapability: Data(repeating: routeByte &+ 0x60, count: 32),
+            expiresAt: Date(timeIntervalSince1970: 2_000_000_000)
+        )
+        let events = [
+            NoctCordEvent(
+                spaceID: spaceID, author: owner, logicalClock: 1,
+                operation: .createSpace(name: "Call test")
+            ),
+            NoctCordEvent(
+                spaceID: spaceID, author: owner, logicalClock: 2,
+                operation: .createVoiceRoom(
+                    id: roomID,
+                    spec: NoctCordVoiceRoomSpecV1(
+                        name: "Call", signalingKey: Data(repeating: keyByte, count: 32),
+                        realtimeRoute: route
+                    )
+                )
+            ),
+        ]
+        let active: Set<GroupScopedMemberHandleV2> = memberIsActive ? [owner, member] : [owner]
+        let result = NoctCordSpaceProjection.project(
+            spaceID: spaceID, owner: owner, activeMembers: active, events: events
+        )
+        XCTAssertTrue(result.rejectedEvents.isEmpty)
+        XCTAssertNotNil(result.projection.voiceRooms[roomID])
+        return NoctCordSpaceSession(
+            id: spaceID,
+            groupEpoch: 2,
+            shortName: "CT",
+            currentMember: member,
+            identityScope: .isolated,
+            members: [
+                NoctCordMemberViewState(
+                    id: owner, displayName: "Owner", roleName: "Owner", presence: .active
+                ),
+                NoctCordMemberViewState(
+                    id: member, displayName: "Member", roleName: "Member", presence: .active
+                ),
+            ],
+            events: events,
+            policyMode: .verified,
+            legacyArchiveEvents: [],
+            legacyArchiveProjection: nil,
+            projection: result.projection,
+            unreadByChannel: [:],
+            voiceRooms: [NoctCordUI.NoctCordVoiceRoom(id: roomID, name: "Call", participantCount: 0)],
+            activeVoiceRoomID: roomID,
+            relayName: "Test relay",
+            relayAssessment: relay
+        )
+    }
+
     private func modelMediaRoom(
         participant: String,
         permissions: NoctCordModelPermissionGate?

@@ -12,6 +12,7 @@ struct NoctCordCommunitySettingsSheet: View {
         case roles = "Roles"
         case channels = "Channel access"
         case applications = "Apps & bots"
+        case legacyArchive = "Legacy archive"
 
         var id: String { rawValue }
 
@@ -21,6 +22,7 @@ struct NoctCordCommunitySettingsSheet: View {
             case .roles: "person.3.sequence.fill"
             case .channels: "number.square.fill"
             case .applications: "puzzlepiece.extension.fill"
+            case .legacyArchive: "archivebox.fill"
             }
         }
     }
@@ -33,7 +35,10 @@ struct NoctCordCommunitySettingsSheet: View {
                     .padding(.horizontal, 12)
                     .padding(.bottom, 10)
 
-                ForEach(Section.allCases) { item in
+                ForEach(Section.allCases.filter {
+                    $0 != .legacyArchive
+                        || canViewLegacyArchive
+                }) { item in
                     Button {
                         section = item
                     } label: {
@@ -116,7 +121,16 @@ struct NoctCordCommunitySettingsSheet: View {
         case .roles: "Create a hierarchy and assign community-wide capabilities."
         case .channels: "Override role permissions for a specific channel."
         case .applications: "Manage encrypted bot principals and slash commands."
+        case .legacyArchive: "Read retained history from before the security migration."
         }
+    }
+
+    /// Legacy access rules are not trusted as current authority. Restrict the
+    /// retained plaintext archive to the group owner to avoid exposing
+    /// historically restricted channels through this new view.
+    private var canViewLegacyArchive: Bool {
+        guard let space = model.selectedSpace else { return false }
+        return space.isCurrentUserOwner && !space.legacyArchiveEvents.isEmpty
     }
 
     @ViewBuilder
@@ -130,7 +144,217 @@ struct NoctCordCommunitySettingsSheet: View {
             CommunityChannelAccessSettings(model: model)
         case .applications:
             CommunityApplicationSettings(model: model)
+        case .legacyArchive:
+            if canViewLegacyArchive {
+                CommunityLegacyArchiveSettings(model: model)
+            } else {
+                Text("This archive is available only to the community owner.")
+                    .foregroundStyle(NoctCordTheme.secondaryText)
+            }
         }
+    }
+}
+
+/// Displays older, locally retained content without feeding it into the
+/// current authorization projection or offering message actions.
+private struct CommunityLegacyArchiveSettings: View {
+    @ObservedObject var model: NoctCordAppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            NoctCordSettingsNotice(
+                symbol: "archivebox.fill",
+                text: "This is read-only history from the older community format. Its former access rules do not authorize current messages, apps, or calls. History that is no longer stored on this device cannot be restored here.",
+                color: NoctCordTheme.mutedCoral
+            )
+
+            if let space = model.selectedSpace,
+               let archive = space.legacyArchiveProjection {
+                let channels = archive.channels.values.sorted {
+                    $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                }
+                ForEach(channels) { channel in
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("# \(channel.name)")
+                            .font(.system(size: 14, weight: .bold))
+                        ForEach(channel.messageIDs, id: \.self) { messageID in
+                            if let message = archive.messages[messageID] {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("\(String(message.author.rawValue.prefix(8))) · \(message.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(NoctCordTheme.secondaryText)
+                                    Text(message.isRetracted ? "Message removed" : message.text)
+                                        .font(.system(size: 12))
+                                        .textSelection(.enabled)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        ForEach(channel.attachmentIDs, id: \.self) { attachmentID in
+                            if let attachment = archive.attachments[attachmentID] {
+                                Text("Attachment · \(attachment.mediaType) · \(attachment.size) bytes")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(NoctCordTheme.secondaryText)
+                            }
+                        }
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(NoctCordTheme.surface, in: RoundedRectangle(cornerRadius: 12))
+                }
+                if channels.isEmpty {
+                    Text("No retained channels are available in this archive.")
+                        .foregroundStyle(NoctCordTheme.secondaryText)
+                }
+            } else {
+                Text("No retained legacy history is available.")
+                    .foregroundStyle(NoctCordTheme.secondaryText)
+            }
+        }
+    }
+}
+
+/// The owner sees the complete effective access configuration before any
+/// legacy record is promoted to verified policy authority.
+private struct CommunityMigrationReviewSheet: View {
+    @ObservedObject var model: NoctCordAppModel
+    let review: NoctCordMigrationReview
+    @Environment(\.dismiss) private var dismiss
+    @State private var isApproving = false
+    @State private var showsError = false
+    @State private var errorText = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Review community security migration")
+                .font(.system(size: 20, weight: .bold, design: .rounded))
+            NoctCordSettingsNotice(
+                symbol: "exclamationmark.shield.fill",
+                text: "Legacy access records are unverified. Approving signs exactly the configuration below in a fresh group epoch. All members must upgrade: older clients cannot enforce these rules. Removing a member requires a signed group membership change.",
+                color: NoctCordTheme.mutedCoral
+            )
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    detailSection("Community", [
+                        "Name: \(review.projection.name ?? "Untitled space")",
+                        "Owner: \(review.projection.owner.rawValue)",
+                        "Configuration operations: \(review.configuration.count)"
+                    ])
+                    detailSection("Channels", channelLines)
+                    detailSection("Roles and capabilities", roleLines)
+                    detailSection("Member role assignments", assignmentLines)
+                    detailSection("Channel access overrides", overrideLines)
+                    detailSection("Voice rooms", voiceLines)
+                    detailSection("Apps and bots", botLines)
+                }
+            }
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .disabled(isApproving)
+                Spacer()
+                Button {
+                    isApproving = true
+                    Task {
+                        defer { isApproving = false }
+                        do {
+                            try await model.approveLegacyMigration(review)
+                            dismiss()
+                        } catch {
+                            errorText = error.localizedDescription
+                            showsError = true
+                        }
+                    }
+                } label: {
+                    if isApproving {
+                        ProgressView()
+                    } else {
+                        Text("Approve this exact configuration")
+                    }
+                }
+                .buttonStyle(NoctCordPrimaryButtonStyle())
+                .disabled(isApproving)
+            }
+        }
+        .padding(22)
+        .foregroundStyle(NoctCordTheme.primaryText)
+        .background(NoctCordTheme.canvas)
+        #if os(macOS)
+        .frame(width: 700, height: 670)
+        #endif
+        .alert("Migration failed", isPresented: $showsError) {
+            Button("OK") { errorText = "" }
+        } message: {
+            Text(errorText)
+        }
+    }
+
+    private func detailSection(_ title: String, _ lines: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title).font(.system(size: 13, weight: .bold))
+            if lines.isEmpty {
+                Text("None").foregroundStyle(NoctCordTheme.secondaryText)
+            } else {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(size: 11))
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(NoctCordTheme.surface, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var channelLines: [String] {
+        review.projection.channels.values.sorted { $0.id.uuidString < $1.id.uuidString }
+            .map { "# \($0.name) (\($0.id.uuidString), \($0.isArchived ? "archived" : "active"))" }
+    }
+
+    private var roleLines: [String] {
+        review.projection.roles.values.sorted { $0.id.uuidString < $1.id.uuidString }
+            .map { role in
+                "\(role.name) (\(role.id.uuidString), priority \(role.position)): \(role.permissions.map(\.rawValue).joined(separator: ", "))"
+            }
+    }
+
+    private var assignmentLines: [String] {
+        review.projection.roleAssignments.keys.sorted { $0.rawValue < $1.rawValue }
+            .flatMap { member in
+                review.projection.roleAssignments[member, default: []]
+                    .sorted { $0.uuidString < $1.uuidString }
+                    .map { roleID in
+                        "\(memberLabel(member)): \(review.projection.roles[roleID]?.name ?? roleID.uuidString)"
+                    }
+            }
+    }
+
+    private var overrideLines: [String] {
+        review.projection.channels.values.sorted { $0.id.uuidString < $1.id.uuidString }
+            .flatMap { channel in
+                channel.permissionOverrides.values.map { access in
+                    let target = access.roleID.flatMap { review.projection.roles[$0]?.name }
+                        ?? (access.roleID?.uuidString ?? "Everyone")
+                    return "# \(channel.name) · \(target): allow [\(access.allow.map(\.rawValue).joined(separator: ", "))], deny [\(access.deny.map(\.rawValue).joined(separator: ", "))]"
+                }.sorted()
+            }
+    }
+
+    private var voiceLines: [String] {
+        review.projection.voiceRooms.values.sorted { $0.id.uuidString < $1.id.uuidString }
+            .map { "\($0.name) (\($0.id.uuidString), limit \($0.maxParticipants), \($0.isArchived ? "archived" : "active"))" }
+    }
+
+    private var botLines: [String] {
+        review.projection.botApplications.values.sorted { $0.id.uuidString < $1.id.uuidString }
+            .map { bot in
+                "\(bot.name) (\(bot.id.uuidString), member \(bot.memberHandle.rawValue)): \(bot.commands.map(\.name).joined(separator: ", "))"
+            }
+    }
+
+    private func memberLabel(_ handle: GroupScopedMemberHandleV2) -> String {
+        let displayName = model.selectedSpace?.members.first { $0.id == handle }?.displayName
+        return "\(displayName ?? "Member") (\(handle.rawValue))"
     }
 }
 
@@ -138,16 +362,21 @@ private struct CommunityOverviewSettings: View {
     @ObservedObject var model: NoctCordAppModel
     @Environment(\.dismiss) private var dismiss
     @State private var lifecycleAlert: CommunityLifecycleAlert?
+    @State private var migrationReview: NoctCordMigrationReview?
+    @State private var isPreparingMigration = false
+    @State private var isRebinding = false
 
     private enum CommunityLifecycleAlert: Identifiable {
         case confirmLeave
         case confirmDestroy
+        case confirmRebind
         case failure(String)
 
         var id: String {
             switch self {
             case .confirmLeave: "confirm-leave"
             case .confirmDestroy: "confirm-destroy"
+            case .confirmRebind: "confirm-rebind"
             case .failure(let message): "failure-\(message)"
             }
         }
@@ -191,11 +420,67 @@ private struct CommunityOverviewSettings: View {
             )
 
             if let space = model.selectedSpace {
+                if space.isPolicyReadOnly {
+                    NoctCordSettingsNotice(
+                        symbol: "lock.shield.fill",
+                        text: space.policyMode == .legacyReadOnly
+                            ? "This community is read-only until the owner reviews and approves its security migration. Older messages remain in Legacy archive."
+                            : "This community is waiting for an owner-approved access update. Posting, apps, and calls are paused.",
+                        color: NoctCordTheme.mutedCoral
+                    )
+                    if space.policyMode == .legacyReadOnly && space.isCurrentUserOwner {
+                        Button {
+                            isPreparingMigration = true
+                            Task {
+                                defer { isPreparingMigration = false }
+                                do {
+                                    migrationReview = try await model.prepareLegacyMigrationReview()
+                                } catch {
+                                    lifecycleAlert = .failure(error.localizedDescription)
+                                }
+                            }
+                        } label: {
+                            if isPreparingMigration {
+                                ProgressView()
+                            } else {
+                                Label("Review security migration…", systemImage: "checkmark.shield")
+                            }
+                        }
+                        .buttonStyle(NoctCordPrimaryButtonStyle())
+                        .disabled(isPreparingMigration)
+                    }
+                } else if space.policyMode == .verified && !space.isCurrentUserOwner {
+                    NoctCordSettingsNotice(
+                        symbol: "person.crop.circle.badge.checkmark",
+                        text: "The community owner approves changes to roles, channels, and app access.",
+                        color: NoctCordTheme.mutedCoral
+                    )
+                } else if space.policyMode == .verified && space.isCurrentUserOwner {
+                    NoctCordSettingsNotice(
+                        symbol: "arrow.triangle.2.circlepath.circle.fill",
+                        text: "Members who upgraded after the security migration may need a fresh owner-signed policy epoch before they can rejoin activity. Renewing the epoch rotates voice signaling access and ends current calls as members sync.",
+                        color: NoctCordTheme.mutedCoral
+                    )
+                    Button {
+                        lifecycleAlert = .confirmRebind
+                    } label: {
+                        if isRebinding {
+                            ProgressView()
+                        } else {
+                            Label("Renew policy for upgraded members…", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    }
+                    .buttonStyle(NoctCordPrimaryButtonStyle())
+                    .disabled(isRebinding)
+                }
                 communityLifecycleCard(space)
             }
         }
         .alert(item: $lifecycleAlert) { alert in
             lifecycleAlert(for: alert)
+        }
+        .sheet(item: $migrationReview) { review in
+            CommunityMigrationReviewSheet(model: model, review: review)
         }
     }
 
@@ -271,6 +556,20 @@ private struct CommunityOverviewSettings: View {
                 },
                 secondaryButton: .cancel()
             )
+        case .confirmRebind:
+            return Alert(
+                title: Text("Renew access for upgraded members?"),
+                message: Text("The owner will sign a new membership epoch and current access snapshot. Active calls will end when members receive the update. This does not grant access to removed members."),
+                primaryButton: .default(Text("Renew Policy")) {
+                    isRebinding = true
+                    Task {
+                        defer { isRebinding = false }
+                        do { try await model.rebindVerifiedCommunityAfterUpgrade() }
+                        catch { lifecycleAlert = .failure(error.localizedDescription) }
+                    }
+                },
+                secondaryButton: .cancel()
+            )
         case .failure(let message):
             return Alert(
                 title: Text("Action Couldn’t Be Completed"),
@@ -328,7 +627,9 @@ private struct CommunityRoleSettings: View {
             if model.selectedSpace?.canManageRoles != true {
                 NoctCordSettingsNotice(
                     symbol: "lock.fill",
-                    text: "You can inspect roles, but only a member with Manage Roles may change them.",
+                    text: model.selectedSpace?.policyMode == .verified
+                        ? "You can inspect roles. The community owner approves changes to verified access rules."
+                        : "You can inspect roles, but only a member with Manage Roles may change them.",
                     color: NoctCordTheme.warning
                 )
             }

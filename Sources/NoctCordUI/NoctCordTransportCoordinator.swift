@@ -4,6 +4,10 @@ import NoctCordCore
 import NoctCordMedia
 @preconcurrency import NoctweaveCore
 
+#if !NOCTCORD_VERIFIED_CORE
+#error("NoctCord transport requires authenticated Core receipts and NOCTCORD_VERIFIED_CORE; legacy policy authoring is disabled.")
+#endif
+
 // Noctweave's sync result is immutable value state, but its current public
 // declaration predates Swift 6 Sendable annotations. This local conformance
 // allows the dedicated transport actor to pass verified events to the UI.
@@ -20,6 +24,8 @@ public enum NoctCordTransportError: Error, Equatable, LocalizedError {
     case ownerCannotLeave
     case communityOwnerRequired
     case communityTerminal
+    case checkpointCapacityReached
+    case snapshotProposalMismatch
 
     public var errorDescription: String? {
         switch self {
@@ -43,6 +49,10 @@ public enum NoctCordTransportError: Error, Equatable, LocalizedError {
             "Only the community owner can destroy this community."
         case .communityTerminal:
             "This community has already been left or destroyed."
+        case .checkpointCapacityReached:
+            "The verified policy history is full while retained messages still depend on it. Wait for safe history compaction before another policy change."
+        case .snapshotProposalMismatch:
+            "A different owner snapshot is already signed. Resume that exact proposal or review it before trying again."
         }
     }
 }
@@ -182,12 +192,27 @@ public struct NoctCordTransportMember: Sendable {
     public let isCurrentMember: Bool
 }
 
+public enum NoctCordPolicyMode: String, Equatable, Sendable {
+    /// Compatibility mode for the published Core pin before verified receipts
+    /// become available. This mode must not be used after v2 activation.
+    case legacyWritable
+    case legacyReadOnly
+    case awaitingOwnerCheckpoint
+    case verified
+}
+
 public struct NoctCordStoredSpaceSnapshot: Sendable {
     public let spaceID: UUID
+    public let groupEpoch: UInt64
     public let owner: GroupScopedMemberHandleV2
     public let currentMember: GroupScopedMemberHandleV2
     public let members: [NoctCordTransportMember]
     public let events: [NoctCordEvent]
+    public let policyMode: NoctCordPolicyMode
+    public let verifiedProjection: NoctCordProjectionResult?
+    /// Bounded v1 history for display only. It never supplies current roles,
+    /// ACLs, bot dispatch, or realtime permission decisions.
+    public let legacyArchiveEvents: [NoctCordEvent]
     public let relay: RelayEndpoint
     public let relayName: String
     public let relayAssessment: NoctCordRelayAssessment
@@ -435,12 +460,24 @@ public actor NoctCordTransportCoordinator {
                 operation: .createChannel(id: generalChannelID, name: "general")
             ),
         ]
+        #if NOCTCORD_VERIFIED_CORE
+        let genesis = try await publishVerifiedCheckpoint(
+            spaceID: groupID,
+            operation: .applyBootstrap(events),
+            kind: .snapshot,
+            at: createdAt.addingTimeInterval(2)
+        )
+        guard genesis.complete else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        #else
         for event in events {
             let publication = try await publish(event)
             guard publication.complete else {
                 throw NoctCordTransportError.transportIncomplete
             }
         }
+        #endif
         let infoResponse = try? await relayClient(for: selectedRelay).send(.info())
         let assessment: NoctCordRelayAssessment
         if case .relayInfo(let info)? = infoResponse?.successBody {
@@ -491,6 +528,16 @@ public actor NoctCordTransportCoordinator {
               ) else {
             throw NoctCordTransportError.invitationPermissionDenied
         }
+        #if NOCTCORD_VERIFIED_CORE
+        let verified = try NoctCordSecureProjectionV2.project(verified: snapshot)
+        let configuration = try verified.projection.checkpointConfiguration(
+            createdAt: issuedAt
+        )
+        _ = try Self.plannedSnapshotChunks(
+            configuration, snapshot: snapshot,
+            extraCredential: GroupScopedCredentialHandleV2.generate()
+        )
+        #endif
         guard let digest = snapshot.signedState.digest else {
             throw NoctCordTransportError.eventRejected
         }
@@ -574,6 +621,16 @@ public actor NoctCordTransportCoordinator {
               ) else {
             throw NoctCordTransportError.invitationPermissionDenied
         }
+        #if NOCTCORD_VERIFIED_CORE
+        let verified = try NoctCordSecureProjectionV2.project(verified: snapshot)
+        let configuration = try verified.projection.checkpointConfiguration(
+            createdAt: createdAt
+        )
+        _ = try Self.plannedSnapshotChunks(
+            configuration, snapshot: snapshot,
+            extraCredential: request.admission.credentialHandle
+        )
+        #endif
         let prepared = try await client.prepareGroupMemberAddition(
             groupID: spaceID,
             admission: request.admission,
@@ -598,6 +655,12 @@ public actor NoctCordTransportCoordinator {
             }
         }
         _ = try? await client.maintainGroup(groupID: spaceID)
+        #if NOCTCORD_VERIFIED_CORE
+        // Admission changes the group epoch. The owner must publish a
+        // current-epoch snapshot for the joiner; failure leaves the joiner
+        // explicitly awaiting that snapshot and can be retried later.
+        _ = try? await ensureCommunityBootstrap(spaceID: spaceID)
+        #endif
         return try response.encoded()
     }
 
@@ -639,6 +702,15 @@ public actor NoctCordTransportCoordinator {
             throw NoctCordTransportError.transportIncomplete
         }
         _ = try await client.maintainGroup(groupID: response.groupID)
+        #if NOCTCORD_VERIFIED_CORE
+        // This one signed control request learns the joiner's current route.
+        // It is v1-shaped for wire compatibility but never enters v2 policy
+        // projection and grants no application authority.
+        try await publishVerifiedJoinControlRequest(
+            spaceID: response.groupID, at: observedAt
+        )
+        return response.groupID
+        #else
         let bootstrapRequest = try await publishOperation(
             spaceID: response.groupID,
             operation: .requestBootstrap(),
@@ -648,6 +720,7 @@ public actor NoctCordTransportCoordinator {
             throw NoctCordTransportError.transportIncomplete
         }
         return response.groupID
+        #endif
     }
 
     /// Answers encrypted bootstrap requests once the owner's route cache has
@@ -656,13 +729,101 @@ public actor NoctCordTransportCoordinator {
     @discardableResult
     public func ensureCommunityBootstrap(spaceID: UUID) async throws -> Bool {
         let runtime = try await client.openGroupRuntime(groupID: spaceID)
-        let snapshot = await runtime.snapshot()
+        var snapshot = await runtime.snapshot()
         guard snapshot.localCredential.memberHandle
                 == snapshot.signedState.members.first(where: {
                     $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
                 })?.id else {
             return false
         }
+        #if NOCTCORD_VERIFIED_CORE
+        try await pinReceivedCheckpoints(snapshot.events, runtime: runtime)
+        snapshot = await runtime.snapshot()
+        let pendingFragment = snapshot.pendingApplicationPublications.contains {
+            guard let secure = try? NoctCordCodec.unwrapSecure($0.event),
+                  let checkpoint = secure.checkpoint else { return false }
+            return checkpoint.groupEpoch == snapshot.signedState.epoch
+                && checkpoint.snapshotFragment != nil
+        }
+        if try Self.incompleteSnapshotFragment(in: snapshot) != nil
+            || pendingFragment {
+            let previous = try NoctCordSecureProjectionV2.projectForOwnerRebind(
+                verified: snapshot
+            )
+            let configuration = try previous.projection.checkpointConfiguration(
+                createdAt: Date()
+            )
+            let publication: NoctCordTransportPublication
+            do {
+                publication = try await publishVerifiedSnapshotSeries(
+                    spaceID: spaceID, configuration: configuration, at: Date()
+                )
+            } catch NoctCordTransportError.snapshotProposalMismatch {
+                publication = try await publishVerifiedSnapshotSeries(
+                    spaceID: spaceID, configuration: configuration,
+                    rotateVoiceRoutes: true, at: Date()
+                )
+            }
+            guard publication.complete else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+            return true
+        }
+        if let pending = snapshot.pendingApplicationPublications.first(where: {
+            guard let secure = try? NoctCordCodec.unwrapSecure($0.event),
+                  let checkpoint = secure.checkpoint else { return false }
+            return checkpoint.kind == .snapshot
+                && checkpoint.groupEpoch == snapshot.signedState.epoch
+        }), let secure = try? NoctCordCodec.unwrapSecure(pending.event),
+           secure.checkpoint?.snapshotFragment == nil {
+            // Resume the exact signed snapshot. Rebuilding configuration here
+            // would generate new nested event IDs and fork the owner chain.
+            let resumed = try await publishVerifiedCheckpoint(
+                spaceID: spaceID,
+                operation: secure.event.operation,
+                kind: .snapshot,
+                snapshotFragment: secure.checkpoint?.snapshotFragment,
+                at: Date()
+            )
+            guard resumed.complete else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+            return true
+        }
+        guard try Self.latestCheckpointDigest(in: snapshot) != nil else {
+            return false
+        }
+        if snapshot.protectedApplicationEventIDs.contains(where: { id in
+            guard let outer = snapshot.events.first(where: { $0.id == id }),
+                  let secure = try? NoctCordCodec.unwrapSecure(outer),
+                  let checkpoint = secure.checkpoint else { return false }
+            let isCompleteSnapshot = checkpoint.snapshotFragment.map {
+                $0.index + 1 == $0.count
+            } ?? true
+            return isCompleteSnapshot
+                && checkpoint.groupEpoch == snapshot.signedState.epoch
+                && checkpoint.groupTranscriptHash
+                    == snapshot.signedState.confirmedTranscriptHash
+        }) {
+            return false
+        }
+        let previous = try NoctCordSecureProjectionV2.projectForOwnerRebind(
+            verified: snapshot
+        )
+        let configuration = try previous.projection.checkpointConfiguration(
+            createdAt: Date()
+        )
+        let publication = try await publishVerifiedSnapshotSeries(
+            spaceID: spaceID,
+            configuration: configuration,
+            rotateVoiceRoutes: true,
+            at: Date()
+        )
+        guard publication.complete else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        return true
+        #else
         let events = Self.acceptedBootstrapHistory(
             spaceID: spaceID,
             owner: snapshot.localCredential.memberHandle,
@@ -705,6 +866,7 @@ public actor NoctCordTransportCoordinator {
             }
         }
         return true
+        #endif
     }
 
     @discardableResult
@@ -720,6 +882,28 @@ public actor NoctCordTransportCoordinator {
         guard snapshot.localCredential.memberHandle == event.author else {
             throw NoctCordTransportError.eventRejected
         }
+        #if NOCTCORD_VERIFIED_CORE
+        guard !event.operation.kind.isBootstrapConfiguration,
+              event.operation.kind != .bootstrapApplied else {
+            throw NoctCordTransportError.eventRejected
+        }
+        let verified = try NoctCordSecureProjectionV2.project(verified: snapshot)
+        var authorizationProjection = verified.projection
+        do {
+            try authorizationProjection.applyVerifiedV2(
+                event, permittingHistoricalAuthor: false
+            )
+        } catch {
+            throw NoctCordTransportError.eventRejected
+        }
+        let groupEvent = try NoctCordCodec.wrapSecure(
+            NoctCordSecureEventV2(
+                event: event,
+                credential: snapshot.localCredential.credentialHandle
+            ),
+            usingLegacyCapability: Self.requiresLegacyContentCapability(snapshot)
+        )
+        #else
         let decodedEvents = snapshot.events.compactMap { try? NoctCordCodec.unwrap($0) }
         let activeMembers = Set(
             snapshot.signedState.members
@@ -747,6 +931,7 @@ public actor NoctCordTransportCoordinator {
             event,
             credential: snapshot.localCredential.credentialHandle
         )
+        #endif
         let prepared = try await client.prepareGroupApplication(
             groupEvent,
             at: date ?? event.createdAt
@@ -775,18 +960,298 @@ public actor NoctCordTransportCoordinator {
             throw NoctCordTransportError.spaceNotFound
         }
         let pages = try await client.syncGroup(groupID: spaceID)
+        #if NOCTCORD_VERIFIED_CORE
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let beforePin = await runtime.snapshot()
+        try await pinReceivedCheckpoints(beforePin.events, runtime: runtime)
+        let snapshot = await runtime.snapshot()
+        guard snapshot.protectedApplicationEventIDs.contains(where: { id in
+            snapshot.events.contains {
+                $0.id == id && NoctCordCodec.isSecureContent($0.content)
+            }
+        }) else { return [] }
+        return try NoctCordSecureProjectionV2.project(verified: snapshot)
+            .acceptedEvents.sorted(by: Self.canonicalEventOrder)
+        #else
         return pages
             .flatMap(\.receivedEvents)
             .compactMap { try? NoctCordCodec.unwrap($0) }
             .sorted(by: NoctCordTransportCoordinator.canonicalEventOrder)
+        #endif
     }
 
     public func allStoredEvents(spaceID: UUID) async throws -> [NoctCordEvent] {
         let runtime = try await client.openGroupRuntime(groupID: spaceID)
         let snapshot = await runtime.snapshot()
+        #if NOCTCORD_VERIFIED_CORE
+        return try NoctCordSecureProjectionV2.project(verified: snapshot)
+            .acceptedEvents.sorted(by: Self.canonicalEventOrder)
+        #else
         return snapshot.events
             .compactMap { try? NoctCordCodec.unwrap($0) }
             .sorted(by: NoctCordTransportCoordinator.canonicalEventOrder)
+        #endif
+    }
+
+    /// Returns an owner-authored *proposal* based on bounded v1 history. The
+    /// caller must show its effective channels, roles, ACLs, bots, and voice
+    /// rooms for explicit owner approval; it is never silently promoted into
+    /// v2 authority.
+    public func proposedLegacyConfigurationForReview(
+        spaceID: UUID,
+        at date: Date = Date()
+    ) async throws -> [NoctCordEvent] {
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let snapshot = await runtime.snapshot()
+        guard let owner = snapshot.signedState.members.first(where: {
+            $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
+        })?.id,
+        owner == snapshot.localCredential.memberHandle else {
+            throw NoctCordTransportError.communityOwnerRequired
+        }
+        #if NOCTCORD_VERIFIED_CORE
+        if let pending = snapshot.pendingApplicationPublications.first(where: {
+            guard let secure = try? NoctCordCodec.unwrapSecure($0.event),
+                  let checkpoint = secure.checkpoint else { return false }
+            return checkpoint.kind == .snapshot
+                && checkpoint.previousCheckpointDigest == nil
+        }), let secure = try? NoctCordCodec.unwrapSecure(pending.event),
+           secure.checkpoint?.snapshotFragment == nil,
+           let signedConfiguration = secure.event.operation.bootstrapEvents {
+            // A pending signed genesis is the exact artifact awaiting owner
+            // confirmation/retry, including its original nested event IDs.
+            return signedConfiguration
+        }
+        #endif
+        let legacy = snapshot.events.compactMap { try? NoctCordCodec.unwrap($0) }
+        let projection = NoctCordSpaceProjection.project(
+            spaceID: spaceID,
+            owner: owner,
+            activeMembers: Set(snapshot.signedState.activeCredentials.map(\.memberHandle)),
+            historicalMembers: Set(legacy.map(\.author)),
+            events: legacy
+        ).projection
+        return try projection.checkpointConfiguration(createdAt: date)
+    }
+
+    /// Promotes only the exact owner-reviewed configuration into the verified
+    /// policy protocol. A legacy Core record must cross into a fresh signed
+    /// group epoch first; old v1 events remain display-only history.
+    public func migrateCommunityToVerifiedPolicy(
+        spaceID: UUID,
+        approvedConfiguration: [NoctCordEvent],
+        at date: Date = Date()
+    ) async throws -> NoctCordTransportPublication {
+        #if NOCTCORD_VERIFIED_CORE
+        _ = try await client.maintainGroup(groupID: spaceID, at: date)
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        var snapshot = await runtime.snapshot()
+        let pendingEpochs = snapshot.outboundTransportOperations.filter {
+            $0.kind == .epoch && !$0.isComplete
+        }
+        for transport in pendingEpochs {
+            guard snapshot.epochIntents.contains(where: {
+                $0.id == transport.logicalID
+                    && $0.signedCommit.operation == .updateMetadata
+            }) else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+            let resumed = try await client.resumeGroupTransport(
+                groupID: spaceID, operationID: transport.id, at: date
+            )
+            guard resumed.complete else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+        }
+        if !pendingEpochs.isEmpty {
+            snapshot = await (try await client.openGroupRuntime(groupID: spaceID)).snapshot()
+        }
+        let incompleteSeries = try Self.incompleteSnapshotFragment(in: snapshot)
+        let interruptedOldGenesis = Self.hasInterruptedOldEpochGenesis(in: snapshot)
+        guard let owner = snapshot.signedState.members.first(where: {
+            $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
+        })?.id,
+        owner == snapshot.localCredential.memberHandle,
+        !approvedConfiguration.isEmpty,
+        approvedConfiguration.allSatisfy({
+            $0.spaceID == spaceID && $0.author == owner
+                && $0.operation.kind.isBootstrapConfiguration
+        }),
+        (incompleteSeries != nil || interruptedOldGenesis
+            || !snapshot.protectedApplicationEventIDs.contains(where: { id in
+            snapshot.events.contains {
+                $0.id == id && NoctCordCodec.isSecureContent($0.content)
+            }
+        })) else {
+            throw NoctCordTransportError.communityOwnerRequired
+        }
+        if let pending = snapshot.pendingApplicationPublications.first(where: {
+            guard let secure = try? NoctCordCodec.unwrapSecure($0.event),
+                  let checkpoint = secure.checkpoint else { return false }
+            return checkpoint.kind == .snapshot
+                && checkpoint.previousCheckpointDigest == nil
+        }), let secure = try? NoctCordCodec.unwrapSecure(pending.event),
+           secure.checkpoint?.snapshotFragment == nil {
+            guard secure.event.operation.bootstrapEvents == approvedConfiguration else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+            return try await publishVerifiedCheckpoint(
+                spaceID: spaceID,
+                operation: secure.event.operation,
+                kind: .snapshot,
+                snapshotFragment: secure.checkpoint?.snapshotFragment,
+                at: date
+            )
+        }
+        var reviewed = NoctCordSpaceProjection(
+            spaceID: spaceID, owner: owner,
+            activeMembers: Set(snapshot.signedState.activeCredentials.map(\.memberHandle))
+        )
+        do { try reviewed.applyVerifiedConfigurationSnapshot(approvedConfiguration) }
+        catch { throw NoctCordTransportError.eventRejected }
+        _ = try Self.plannedSnapshotChunks(
+            approvedConfiguration, snapshot: snapshot
+        )
+
+        if snapshot.currentVerificationFrontiers() == nil {
+            let configurationDigest = Data(SHA256.hash(data:
+                try NoctweaveCoder.encode(approvedConfiguration, sortedKeys: true)
+            ))
+            var material = Data("NoctCord/verified-policy-migration/v2\0".utf8)
+            material.append(Data(spaceID.uuidString.utf8))
+            material.append(snapshot.signedState.digest ?? Data())
+            material.append(configurationDigest)
+            let metadataDigest = Data(SHA256.hash(data: material))
+            let idempotencyKey = Data(SHA256.hash(data:
+                Data("NoctCord/migration-epoch-idempotency/v2\0".utf8)
+                    + material
+            ))
+            let prepared = try await client.prepareGroupEpoch(
+                groupID: spaceID,
+                operation: .updateMetadata,
+                proposedMembers: snapshot.signedState.members,
+                proposedCredentials: snapshot.signedState.memberCredentials,
+                proposedPermissions: snapshot.signedState.permissions,
+                proposedMetadataDigest: metadataDigest,
+                idempotencyKey: idempotencyKey,
+                createdAt: date
+            )
+            if let transport = prepared.transportOperation {
+                let resumed = try await client.resumeGroupTransport(
+                    groupID: spaceID, operationID: transport.id, at: date
+                )
+                guard resumed.complete else {
+                    throw NoctCordTransportError.transportIncomplete
+                }
+            }
+            snapshot = await (try await client.openGroupRuntime(groupID: spaceID)).snapshot()
+            guard snapshot.currentVerificationFrontiers() != nil else {
+                throw NoctCordTransportError.eventRejected
+            }
+        }
+        return try await publishVerifiedSnapshotSeries(
+            spaceID: spaceID,
+            configuration: approvedConfiguration,
+            at: date.addingTimeInterval(1)
+        )
+        #else
+        throw NoctCordTransportError.unsupportedEvent
+        #endif
+    }
+
+    /// Gives upgraded members a fresh Core-verifiable policy root in the same
+    /// community. Old clients may have consumed earlier schema-2 traffic
+    /// without v6 receipts; they remain read-only until this owner epoch and
+    /// linked snapshot arrive after their upgrade.
+    @discardableResult
+    public func rebindVerifiedCommunityAfterUpgrade(
+        spaceID: UUID,
+        at date: Date = Date()
+    ) async throws -> Bool {
+        #if NOCTCORD_VERIFIED_CORE
+        _ = try await client.maintainGroup(groupID: spaceID, at: date)
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        var snapshot = await runtime.snapshot()
+        guard let owner = snapshot.signedState.members.first(where: {
+            $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
+        })?.id,
+        owner == snapshot.localCredential.memberHandle,
+        try Self.latestCheckpointDigest(in: snapshot) != nil else {
+            throw NoctCordTransportError.communityOwnerRequired
+        }
+        _ = try NoctCordSecureProjectionV2.projectForOwnerRebind(
+            verified: snapshot
+        )
+        if try Self.incompleteSnapshotFragment(in: snapshot) != nil
+            || snapshot.pendingApplicationPublications.contains(where: {
+                guard let secure = try? NoctCordCodec.unwrapSecure($0.event),
+                      let checkpoint = secure.checkpoint else { return false }
+                return checkpoint.groupEpoch == snapshot.signedState.epoch
+                    && checkpoint.snapshotFragment != nil
+            }) {
+            // A member can force a later epoch by leaving, so complete any
+            // owner series already in this epoch before choosing another
+            // epoch. The continuation is exact and Core-bound.
+            guard try await ensureCommunityBootstrap(spaceID: spaceID) else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+            snapshot = await (try await client.openGroupRuntime(
+                groupID: spaceID
+            )).snapshot()
+        }
+        let pending = snapshot.outboundTransportOperations.filter {
+            $0.kind == .epoch && !$0.isComplete
+        }
+        if !pending.isEmpty {
+            for transport in pending {
+                guard snapshot.epochIntents.contains(where: {
+                    $0.id == transport.logicalID
+                        && $0.signedCommit.operation == .updateMetadata
+                }) else {
+                    throw NoctCordTransportError.transportIncomplete
+                }
+                let resumed = try await client.resumeGroupTransport(
+                    groupID: spaceID, operationID: transport.id, at: date
+                )
+                guard resumed.complete else {
+                    throw NoctCordTransportError.transportIncomplete
+                }
+            }
+            snapshot = await (try await client.openGroupRuntime(groupID: spaceID)).snapshot()
+        } else if (try Self.latestCheckpointEpoch(in: snapshot))
+                    == snapshot.signedState.epoch {
+            guard let stateDigest = snapshot.signedState.digest else {
+                throw NoctCordTransportError.eventRejected
+            }
+            var material = Data("NoctCord/upgrade-rebind-epoch/v2\0".utf8)
+            material.append(Data(spaceID.uuidString.utf8))
+            material.append(stateDigest)
+            let prepared = try await client.prepareGroupEpoch(
+                groupID: spaceID,
+                operation: .updateMetadata,
+                proposedMembers: snapshot.signedState.members,
+                proposedCredentials: snapshot.signedState.memberCredentials,
+                proposedPermissions: snapshot.signedState.permissions,
+                proposedMetadataDigest: Data(SHA256.hash(data: material)),
+                idempotencyKey: Data(SHA256.hash(data:
+                    Data("NoctCord/upgrade-rebind-idempotency/v2\0".utf8)
+                        + material
+                )),
+                createdAt: date
+            )
+            if let transport = prepared.transportOperation {
+                let resumed = try await client.resumeGroupTransport(
+                    groupID: spaceID, operationID: transport.id, at: date
+                )
+                guard resumed.complete else {
+                    throw NoctCordTransportError.transportIncomplete
+                }
+            }
+        }
+        return try await ensureCommunityBootstrap(spaceID: spaceID)
+        #else
+        throw NoctCordTransportError.unsupportedEvent
+        #endif
     }
 
     @discardableResult
@@ -795,8 +1260,22 @@ public actor NoctCordTransportCoordinator {
         operation: NoctCordOperation,
         at date: Date = Date()
     ) async throws -> NoctCordTransportPublication {
+        #if NOCTCORD_VERIFIED_CORE
+        if operation.kind.isBootstrapConfiguration {
+            return try await publishVerifiedCheckpoint(
+                spaceID: spaceID, operation: operation,
+                kind: .delta, at: date
+            )
+        }
+        guard operation.kind != .bootstrapApplied else {
+            throw NoctCordTransportError.eventRejected
+        }
+        #endif
         let runtime = try await client.openGroupRuntime(groupID: spaceID)
         let snapshot = await runtime.snapshot()
+        #if NOCTCORD_VERIFIED_CORE
+        let projection = try NoctCordSecureProjectionV2.project(verified: snapshot).projection
+        #else
         let existing = snapshot.events.compactMap { try? NoctCordCodec.unwrap($0) }
         guard let owner = snapshot.signedState.members.first(where: {
             $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
@@ -812,6 +1291,7 @@ public actor NoctCordTransportCoordinator {
             historicalMembers: Set(existing.map(\.author)),
             events: existing
         ).projection
+        #endif
         let event = NoctCordEvent(
             spaceID: spaceID,
             author: snapshot.localCredential.memberHandle,
@@ -827,7 +1307,11 @@ public actor NoctCordTransportCoordinator {
         assessRelay: Bool = true
     ) async throws -> NoctCordStoredSpaceSnapshot {
         let runtime = try await client.openGroupRuntime(groupID: spaceID)
-        let snapshot = await runtime.snapshot()
+        var snapshot = await runtime.snapshot()
+        #if NOCTCORD_VERIFIED_CORE
+        try await pinReceivedCheckpoints(snapshot.events, runtime: runtime)
+        snapshot = await runtime.snapshot()
+        #endif
         let local = snapshot.localCredential.memberHandle
         let members = snapshot.signedState.members
             .filter { $0.isActive(at: snapshot.signedState.epoch) }
@@ -849,14 +1333,52 @@ public actor NoctCordTransportCoordinator {
         }
         let communityRelay = try Self.relayEndpoint(from: snapshot)
         let preference = await relayPreference(for: communityRelay)
+        #if NOCTCORD_VERIFIED_CORE
+        let legacyArchive = Self.legacyArchiveBeforeVerifiedCutoff(snapshot)
+            .sorted(by: Self.canonicalEventOrder)
+        let hasSecureTraffic = snapshot.events.contains {
+            NoctCordCodec.isSecureContent($0.content)
+        }
+        let hasProtectedCheckpoint = snapshot.protectedApplicationEventIDs.contains { id in
+            snapshot.events.contains {
+                $0.id == id && NoctCordCodec.isSecureContent($0.content)
+            }
+        }
+        let policyMode: NoctCordPolicyMode
+        let verifiedProjection: NoctCordProjectionResult?
+        if hasProtectedCheckpoint {
+            policyMode = .verified
+            verifiedProjection = try NoctCordSecureProjectionV2.project(verified: snapshot)
+        } else if hasSecureTraffic {
+            policyMode = .awaitingOwnerCheckpoint
+            verifiedProjection = nil
+        } else if snapshot.applicationVerificationLegacyThroughEpoch > 0
+                    || !legacyArchive.isEmpty {
+            policyMode = .legacyReadOnly
+            verifiedProjection = nil
+        } else {
+            policyMode = .awaitingOwnerCheckpoint
+            verifiedProjection = nil
+        }
+        let projectedEvents = verifiedProjection?.acceptedEvents ?? []
+        #else
+        let legacyArchive: [NoctCordEvent] = []
+        let policyMode: NoctCordPolicyMode = .legacyWritable
+        let verifiedProjection: NoctCordProjectionResult? = nil
+        let projectedEvents = snapshot.events
+            .compactMap { try? NoctCordCodec.unwrap($0) }
+            .sorted(by: Self.canonicalEventOrder)
+        #endif
         return NoctCordStoredSpaceSnapshot(
             spaceID: spaceID,
+            groupEpoch: snapshot.signedState.epoch,
             owner: owner,
             currentMember: local,
             members: members,
-            events: snapshot.events
-                .compactMap { try? NoctCordCodec.unwrap($0) }
-                .sorted(by: NoctCordTransportCoordinator.canonicalEventOrder),
+            events: projectedEvents,
+            policyMode: policyMode,
+            verifiedProjection: verifiedProjection,
+            legacyArchiveEvents: legacyArchive,
             relay: communityRelay,
             relayName: preference?.name ?? communityRelay.host,
             relayAssessment: assessRelay
@@ -1195,6 +1717,13 @@ public actor NoctCordTransportCoordinator {
             readCapability: OpaqueCapabilityV1.generate(),
             expiresAt: now.addingTimeInterval(lifetime)
         )
+        return try await createRealtimeRoute(endpoint: endpoint, request: request)
+    }
+
+    private func createRealtimeRoute(
+        endpoint: RelayEndpoint,
+        request: RealtimeRouteCreateRequestV1
+    ) async throws -> NoctCordRealtimeRouteV1 {
         guard request.isStructurallyValid else {
             throw NoctCordTransportError.invalidConfiguration
         }
@@ -1213,6 +1742,24 @@ public actor NoctCordTransportCoordinator {
             readCapability: created.readCapability,
             expiresAt: created.expiresAt
         )
+    }
+
+    private func createRotatedRoutes(
+        for spaceID: UUID,
+        requests: [RealtimeRouteCreateRequestV1]
+    ) async throws {
+        guard !requests.isEmpty else { return }
+        let endpoint = try await relayEndpoint(for: spaceID)
+        for request in requests {
+            // After a long offline retry, the owner must still finish the
+            // already signed policy transition. An expired route grants no
+            // calling capability; the normal owner voice-room renewal delta
+            // can mint a fresh route after the policy series is complete.
+            if request.expiresAt <= Date() { continue }
+            _ = try await createRealtimeRoute(
+                endpoint: endpoint, request: request
+            )
+        }
     }
 
     public func publishRealtimeCallSignal(
@@ -1554,6 +2101,1028 @@ public actor NoctCordTransportCoordinator {
         return Data(SHA256.hash(data: material))
     }
 
+    #if NOCTCORD_VERIFIED_CORE
+    private static func legacyArchiveBeforeVerifiedCutoff(
+        _ snapshot: GroupRuntimeRecord
+    ) -> [NoctCordEvent] {
+        let genesis = snapshot.protectedApplicationEventIDs.compactMap { id
+            -> NoctCordPolicyCheckpointV2? in
+            guard let outer = snapshot.events.first(where: { $0.id == id }),
+                  let secure = try? NoctCordCodec.unwrapSecure(outer),
+                  let checkpoint = secure.checkpoint,
+                  checkpoint.previousCheckpointDigest == nil else { return nil }
+            return checkpoint
+        }.first
+        let hasProtectedSecureRoot = snapshot.protectedApplicationEventIDs.contains { id in
+            snapshot.events.contains {
+                $0.id == id && NoctCordCodec.isSecureContent($0.content)
+            }
+        }
+        return snapshot.events.compactMap { outer in
+            guard outer.content.type == NoctCordCodec.contentType,
+                  !NoctCordCodec.isSecureContent(outer.content),
+                  let event = try? NoctCordCodec.unwrap(outer),
+                  event.operation.kind != .bootstrapRequested else {
+                return nil
+            }
+            guard let genesis else {
+                if !hasProtectedSecureRoot { return event }
+                return snapshot.applicationVerificationReceipt(for: outer.id) == nil
+                    && snapshot.applicationVerificationLegacyThroughEpoch > 0
+                    ? event : nil
+            }
+            if let receipt = snapshot.applicationVerificationReceipt(for: outer.id) {
+                if receipt.epoch < genesis.groupEpoch { return event }
+                guard receipt.epoch == genesis.groupEpoch,
+                      let frontier = genesis.frontiers.first(where: {
+                          $0.epoch == receipt.epoch
+                              && $0.credential == receipt.credentialHandle
+                      }),
+                      receipt.messageCounter < frontier.nextCounter else {
+                    return nil
+                }
+                return event
+            }
+            // A v5-migrated record has no Core receipts for historical v1
+            // events. Once v2 starts, every newly consumed envelope has a
+            // receipt, so absence can denote only old local archive data.
+            return snapshot.applicationVerificationLegacyThroughEpoch > 0
+                ? event : nil
+        }
+    }
+
+    /// Computes the complete bounded series before an epoch transition. Size
+    /// checks include the outer Core event and a worst-case 64-part fragment
+    /// header, so a later part cannot unexpectedly exceed Core's padded limit.
+    static func plannedSnapshotChunks(
+        _ configuration: [NoctCordEvent],
+        snapshot: GroupRuntimeRecord,
+        extraCredential: GroupScopedCredentialHandleV2? = nil
+    ) throws -> [[NoctCordEvent]] {
+        guard !configuration.isEmpty,
+              configuration.count <= NoctCordSnapshotFragmentV2.maximumParts * 128,
+              configuration.allSatisfy({
+                  $0.spaceID == snapshot.groupId
+                      && $0.author == snapshot.localCredential.memberHandle
+                      && $0.operation.kind.isBootstrapConfiguration
+                      && $0.isStructurallyValid
+              }) else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        var handles = Set(snapshot.signedState.activeCredentials.map(\.credentialHandle))
+        if let extraCredential { handles.insert(extraCredential) }
+        guard !handles.isEmpty,
+              handles.count <= NoctCordPolicyCheckpointV2.maximumFrontiers else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        let dummyHash = Data(repeating: 0, count: SHA256.byteCount)
+        let frontiers = handles.map {
+            NoctCordCredentialFrontierV2(
+                epoch: NoctCordEvent.maximumLogicalClock,
+                transcriptHash: dummyHash,
+                credential: $0,
+                nextCounter: NoctCordEvent.maximumLogicalClock,
+                prefixDigest: dummyHash
+            )
+        }.sorted(by: NoctCordPolicyCheckpointV2.frontierOrder)
+        func fits(_ chunk: [NoctCordEvent], fragmented: Bool) -> Bool {
+            guard !chunk.isEmpty, chunk.count <= 128,
+                  let bytes = try? NoctweaveCoder.encode(chunk, sortedKeys: true) else {
+                return false
+            }
+            let event = NoctCordEvent(
+                spaceID: snapshot.groupId,
+                author: snapshot.localCredential.memberHandle,
+                logicalClock: NoctCordEvent.maximumLogicalClock,
+                createdAt: Date(timeIntervalSince1970: 4_000_000_000),
+                operation: .applyBootstrap(chunk)
+            )
+            let checkpoint = NoctCordPolicyCheckpointV2(
+                spaceID: snapshot.groupId,
+                owner: snapshot.localCredential.memberHandle,
+                groupEpoch: NoctCordEvent.maximumLogicalClock,
+                groupTranscriptHash: dummyHash,
+                previousCheckpointDigest: dummyHash,
+                configurationDigest: Data(SHA256.hash(data: bytes)),
+                frontiers: frontiers,
+                snapshotFragment: fragmented
+                    ? NoctCordSnapshotFragmentV2(
+                        seriesID: UUID(), index: 63, count: 64,
+                        fullConfigurationDigest: dummyHash,
+                        seriesSeed: dummyHash
+                    ) : nil
+            )
+            let secure = NoctCordSecureEventV2(
+                event: event,
+                credential: snapshot.localCredential.credentialHandle,
+                checkpoint: checkpoint
+            )
+            guard secure.isStructurallyValid,
+                  let outer = try? NoctCordCodec.wrapSecure(
+                      secure, usingLegacyCapability: true
+                  ),
+                  let outerBytes = try? NoctweaveCoder.encode(outer, sortedKeys: true)
+            else { return false }
+            return outerBytes.count <= NoctCordCodec.maximumEventBytes - 1_024
+        }
+        if fits(configuration, fragmented: false) { return [configuration] }
+        var chunks: [[NoctCordEvent]] = []
+        var offset = 0
+        while offset < configuration.count {
+            var lower = 1
+            var upper = min(128, configuration.count - offset)
+            var best = 0
+            while lower <= upper {
+                let candidate = lower + (upper - lower) / 2
+                let chunk = Array(configuration[offset..<(offset + candidate)])
+                if fits(chunk, fragmented: true) {
+                    best = candidate
+                    lower = candidate + 1
+                } else {
+                    upper = candidate - 1
+                }
+            }
+            guard best > 0 else { throw NoctCordTransportError.invalidConfiguration }
+            chunks.append(Array(configuration[offset..<(offset + best)]))
+            guard chunks.count <= NoctCordSnapshotFragmentV2.maximumParts else {
+                throw NoctCordTransportError.invalidConfiguration
+            }
+            offset += best
+        }
+        return chunks
+    }
+
+    package static func rotateVoiceRoutesForEpochRebind(
+        _ configuration: [NoctCordEvent],
+        spaceID: UUID,
+        epoch: UInt64,
+        seed: Data,
+        at date: Date
+    ) throws -> (events: [NoctCordEvent], routes: [RealtimeRouteCreateRequestV1]) {
+        guard seed.count == SHA256.byteCount else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        var result: [NoctCordEvent] = []
+        var routes: [RealtimeRouteCreateRequestV1] = []
+        result.reserveCapacity(configuration.count)
+        let seedKey = SymmetricKey(data: seed)
+        func derived(_ label: String, roomID: UUID) -> Data {
+            var info = Data("NoctCord/epoch-voice-credential/v2\0".utf8)
+            info.append(Data(spaceID.uuidString.lowercased().utf8))
+            var networkEpoch = epoch.bigEndian
+            withUnsafeBytes(of: &networkEpoch) { info.append(contentsOf: $0) }
+            info.append(Data(roomID.uuidString.lowercased().utf8))
+            info.append(0)
+            info.append(Data(label.utf8))
+            let key = HKDF<SHA256>.deriveKey(
+                inputKeyMaterial: seedKey,
+                salt: Data("NoctCord/epoch-voice-rotation/v2".utf8),
+                info: info,
+                outputByteCount: SHA256.byteCount
+            )
+            return key.withUnsafeBytes { Data($0) }
+        }
+        for event in configuration {
+            guard event.operation.kind == .voiceRoomCreated,
+                  let roomID = event.operation.voiceRoomID,
+                  let spec = event.operation.voiceRoomSpec else {
+                result.append(event)
+                continue
+            }
+            let request = RealtimeRouteCreateRequestV1(
+                routeCapability: derived("route", roomID: roomID),
+                appendCapability: derived("append", roomID: roomID),
+                readCapability: derived("read", roomID: roomID),
+                expiresAt: date.addingTimeInterval(23 * 60 * 60)
+            )
+            guard request.isStructurallyValid else {
+                throw NoctCordTransportError.invalidConfiguration
+            }
+            routes.append(request)
+            result.append(NoctCordEvent(
+                id: event.id,
+                spaceID: event.spaceID,
+                author: event.author,
+                logicalClock: event.logicalClock,
+                createdAt: event.createdAt,
+                operation: .createVoiceRoom(
+                    id: roomID,
+                    spec: NoctCordVoiceRoomSpecV1(
+                        name: spec.name,
+                        maxParticipants: spec.maxParticipants,
+                        signalingKey: derived("signal", roomID: roomID),
+                        realtimeRoute: NoctCordRealtimeRouteV1(
+                            routeCapability: request.routeCapability,
+                            appendCapability: request.appendCapability,
+                            readCapability: request.readCapability,
+                            expiresAt: request.expiresAt
+                        )
+                    )
+                )
+            ))
+        }
+        return (result, routes)
+    }
+
+    private func publishVerifiedJoinControlRequest(
+        spaceID: UUID,
+        at date: Date
+    ) async throws {
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let snapshot = await runtime.snapshot()
+        guard snapshot.originJoinAnchorID != nil,
+              !snapshot.protectedApplicationEventIDs.contains(where: { id in
+                  snapshot.events.contains {
+                      $0.id == id && NoctCordCodec.isSecureContent($0.content)
+                  }
+              }) else {
+            throw NoctCordTransportError.eventRejected
+        }
+        let event = NoctCordEvent(
+            spaceID: spaceID,
+            author: snapshot.localCredential.memberHandle,
+            logicalClock: 1,
+            createdAt: date,
+            operation: .requestBootstrap()
+        )
+        let outer = try NoctCordCodec.wrap(
+            event, credential: snapshot.localCredential.credentialHandle
+        )
+        let prepared = try await client.prepareGroupApplication(outer, at: date)
+        if let transport = prepared.transportOperation {
+            let resumed = try await client.resumeGroupTransport(
+                groupID: spaceID, operationID: transport.id, at: date
+            )
+            guard resumed.complete else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+        }
+    }
+
+    private static func requiresLegacyContentCapability(
+        _ snapshot: GroupRuntimeRecord
+    ) -> Bool {
+        !snapshot.signedState.activeCredentials.allSatisfy { credential in
+            credential.contentTypes.contains {
+                $0.supports(NoctCordCodec.secureContentType)
+            }
+        }
+    }
+
+    private static func latestCheckpointDigest(
+        in snapshot: GroupRuntimeRecord
+    ) throws -> Data? {
+        let checkpoints = try snapshot.protectedApplicationEventIDs.compactMap { id
+            -> (digest: Data, previous: Data?)? in
+            guard let outer = snapshot.events.first(where: { $0.id == id }),
+                  NoctCordCodec.isSecureContent(outer.content) else { return nil }
+            let secure = try NoctCordCodec.unwrapSecure(outer)
+            guard let checkpoint = secure.checkpoint else {
+                throw NoctCordTransportError.eventRejected
+            }
+            return (try secure.canonicalDigest(), checkpoint.previousCheckpointDigest)
+        }
+        guard !checkpoints.isEmpty else { return nil }
+        let predecessors = Set(checkpoints.compactMap(\.previous))
+        let tails = checkpoints.filter { !predecessors.contains($0.digest) }
+        guard tails.count == 1 else { throw NoctCordTransportError.eventRejected }
+        return tails[0].digest
+    }
+
+    private static func latestCheckpointEpoch(
+        in snapshot: GroupRuntimeRecord
+    ) throws -> UInt64? {
+        let checkpoints = try snapshot.protectedApplicationEventIDs.compactMap { id
+            -> (digest: Data, previous: Data?, epoch: UInt64)? in
+            guard let outer = snapshot.events.first(where: { $0.id == id }),
+                  NoctCordCodec.isSecureContent(outer.content) else { return nil }
+            let secure = try NoctCordCodec.unwrapSecure(outer)
+            guard let checkpoint = secure.checkpoint else {
+                throw NoctCordTransportError.eventRejected
+            }
+            return (try secure.canonicalDigest(), checkpoint.previousCheckpointDigest,
+                    checkpoint.groupEpoch)
+        }
+        guard !checkpoints.isEmpty else { return nil }
+        let predecessors = Set(checkpoints.compactMap(\.previous))
+        let tails = checkpoints.filter { !predecessors.contains($0.digest) }
+        guard tails.count == 1 else { throw NoctCordTransportError.eventRejected }
+        return tails[0].epoch
+    }
+
+    private static func incompleteSnapshotFragment(
+        in snapshot: GroupRuntimeRecord,
+        currentEpochOnly: Bool = true
+    ) throws -> NoctCordSnapshotFragmentV2? {
+        guard let digest = try latestCheckpointDigest(in: snapshot) else { return nil }
+        for id in snapshot.protectedApplicationEventIDs {
+            guard let outer = snapshot.events.first(where: { $0.id == id }),
+                  NoctCordCodec.isSecureContent(outer.content),
+                  let secure = try? NoctCordCodec.unwrapSecure(outer),
+                  (try? secure.canonicalDigest()) == digest,
+                  let checkpoint = secure.checkpoint,
+                  (!currentEpochOnly
+                    || checkpoint.groupEpoch == snapshot.signedState.epoch),
+                  let fragment = checkpoint.snapshotFragment else {
+                continue
+            }
+            return fragment.index + 1 < fragment.count ? fragment : nil
+        }
+        return nil
+    }
+
+    /// An owner-reviewed v1 genesis can be interrupted by another member's
+    /// signed epoch transition. The partial old-epoch proposal never became
+    /// policy; the owner may explicitly review a fresh proposal and link a
+    /// new current-epoch snapshot to that inert authenticated prefix.
+    private static func hasInterruptedOldEpochGenesis(
+        in snapshot: GroupRuntimeRecord
+    ) -> Bool {
+        let protected = Set(snapshot.protectedApplicationEventIDs)
+        let checkpoints = snapshot.events.compactMap { outer
+            -> (policy: NoctCordPolicyCheckpointV2, digest: Data)? in
+            guard protected.contains(outer.id),
+                  let secure = try? NoctCordCodec.unwrapSecure(outer),
+                  let checkpoint = secure.checkpoint,
+                  let digest = try? secure.canonicalDigest() else {
+                return nil
+            }
+            return (checkpoint, digest)
+        }
+        guard let first = checkpoints.first,
+              let fragment = first.policy.snapshotFragment,
+              first.policy.previousCheckpointDigest == nil,
+              first.policy.groupEpoch < snapshot.signedState.epoch,
+              checkpoints.count < fragment.count else { return false }
+        return checkpoints.enumerated().allSatisfy { index, entry in
+            let checkpoint = entry.policy
+            let expectedPrevious = index == 0 ? nil : checkpoints[index - 1].digest
+            return checkpoint.kind == .snapshot
+                && checkpoint.previousCheckpointDigest == expectedPrevious
+                && checkpoint.groupEpoch == first.policy.groupEpoch
+                && checkpoint.groupTranscriptHash
+                    == first.policy.groupTranscriptHash
+                && checkpoint.snapshotFragment?.seriesID == fragment.seriesID
+                && checkpoint.snapshotFragment?.index == index
+                && checkpoint.snapshotFragment?.count == fragment.count
+                && checkpoint.snapshotFragment?.seriesSeed == fragment.seriesSeed
+                && checkpoint.snapshotFragment?.fullConfigurationDigest
+                    == fragment.fullConfigurationDigest
+        }
+    }
+
+    /// Keep every checkpoint needed by retained content. A later complete
+    /// full snapshot may become the local root only when replay from that
+    /// root preserves all currently authorized ordinary events and the exact
+    /// visible state. Core atomically records tombstones for the retired
+    /// checkpoint IDs so their retained ciphertext cannot be reinterpreted.
+    private func retireObsoleteCheckpointPrefix(
+        runtime: NoctweavePQGroupRuntimeV2,
+        allowStaleOwnerEpoch: Bool = false
+    ) async throws {
+        let snapshot = await runtime.snapshot()
+        let full = try allowStaleOwnerEpoch
+            ? NoctCordSecureProjectionV2.projectForOwnerRebind(verified: snapshot)
+            : NoctCordSecureProjectionV2.project(verified: snapshot)
+        let protected = Set(snapshot.protectedApplicationEventIDs)
+        let checkpoints = snapshot.events.filter { outer in
+            protected.contains(outer.id)
+                && NoctCordCodec.isSecureContent(outer.content)
+                && (try? NoctCordCodec.unwrapSecure(outer).checkpoint) != nil
+        }
+        guard checkpoints.count > 1 else { return }
+        let ordinaryIDs = Set(snapshot.events.compactMap { outer -> UUID? in
+            guard let secure = try? NoctCordCodec.unwrapSecure(outer),
+                  secure.checkpoint == nil else { return nil }
+            return outer.id
+        })
+        let acceptedOrdinary = Set(full.acceptedEvents.map(\.id))
+            .intersection(ordinaryIDs)
+        for index in stride(from: checkpoints.count - 1, through: 1, by: -1) {
+            let root = checkpoints[index]
+            guard let secure = try? NoctCordCodec.unwrapSecure(root),
+                  let policy = secure.checkpoint,
+                  policy.kind == .snapshot,
+                  (policy.snapshotFragment == nil
+                    || policy.snapshotFragment?.index == 0) else { continue }
+            let retiring = Set(checkpoints[..<index].map(\.id))
+            guard let candidate = try? NoctCordSecureProjectionV2
+                .projectAfterRetiring(
+                    retiring, verified: snapshot,
+                    allowStaleOwnerEpoch: allowStaleOwnerEpoch
+                ),
+                candidate.projection.hasSameRetainedState(as: full.projection),
+                Set(candidate.acceptedEvents.map(\.id))
+                    .intersection(ordinaryIDs) == acceptedOrdinary,
+                let bound = snapshot.protectedVerificationFrontiers(for: root.id) else {
+                continue
+            }
+            try await runtime.replaceProtectedApplicationEventSeries(
+                retiring: Array(retiring),
+                with: [GroupProtectedApplicationVerificationBindingV2(
+                    eventID: root.id,
+                    frontiers: bound
+                )]
+            )
+            return
+        }
+    }
+
+    private func publishVerifiedSnapshotSeries(
+        spaceID: UUID,
+        configuration: [NoctCordEvent],
+        rotateVoiceRoutes: Bool = false,
+        at date: Date
+    ) async throws -> NoctCordTransportPublication {
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        let beforeRetirement = await runtime.snapshot()
+        if (try? Self.latestCheckpointDigest(in: beforeRetirement)) != nil,
+           (try? Self.incompleteSnapshotFragment(
+               in: beforeRetirement, currentEpochOnly: false
+           )) == nil,
+           !beforeRetirement.pendingApplicationPublications.contains(where: {
+               (try? NoctCordCodec.unwrapSecure($0.event).checkpoint) != nil
+           }) {
+            // Old content may have aged out since the last policy change.
+            // Free only a prefix whose removal preserves all *retained*
+            // authorized content before reserving pins for a new series.
+            try await retireObsoleteCheckpointPrefix(
+                runtime: runtime, allowStaleOwnerEpoch: true
+            )
+        }
+        let snapshot = await runtime.snapshot()
+        let pending = snapshot.pendingApplicationPublications.compactMap {
+            try? NoctCordCodec.unwrapSecure($0.event)
+        }.first {
+            $0.checkpoint?.snapshotFragment != nil
+                && $0.checkpoint?.groupEpoch == snapshot.signedState.epoch
+        }
+        let incomplete = try Self.incompleteSnapshotFragment(in: snapshot)
+        let existing = pending?.checkpoint?.snapshotFragment ?? incomplete
+        let seriesID = existing?.seriesID ?? UUID()
+        let seed = existing?.seriesSeed
+            ?? SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+        let firstExisting = snapshot.events.compactMap {
+            try? NoctCordCodec.unwrapSecure($0)
+        }.first {
+            $0.checkpoint?.snapshotFragment?.seriesID == seriesID
+                && $0.checkpoint?.snapshotFragment?.index == 0
+        }
+        let baseDate = firstExisting?.event.createdAt ?? date
+        let rotated = rotateVoiceRoutes
+            ? try Self.rotateVoiceRoutesForEpochRebind(
+                configuration, spaceID: spaceID,
+                epoch: snapshot.signedState.epoch,
+                seed: seed, at: baseDate
+            )
+            : (events: configuration, routes: [RealtimeRouteCreateRequestV1]())
+        let effectiveConfiguration = rotated.events
+        var chunks = try Self.plannedSnapshotChunks(
+            effectiveConfiguration, snapshot: snapshot
+        )
+        if rotateVoiceRoutes && !rotated.routes.isEmpty && chunks.count == 1 {
+            guard effectiveConfiguration.count >= 2 else {
+                throw NoctCordTransportError.invalidConfiguration
+            }
+            let split = effectiveConfiguration.count / 2
+            chunks = [Array(effectiveConfiguration[..<split]),
+                      Array(effectiveConfiguration[split...])]
+        }
+        if chunks.count == 1 {
+            let published = try await publishVerifiedCheckpoint(
+                spaceID: spaceID,
+                operation: .applyBootstrap(chunks[0]),
+                kind: .snapshot,
+                at: date
+            )
+            if published.complete {
+                try await retireObsoleteCheckpointPrefix(
+                    runtime: try await client.openGroupRuntime(groupID: spaceID)
+                )
+            }
+            return published
+        }
+        let fullDigest = try NoctCordSnapshotFragmentV2.fullDigest(
+            of: effectiveConfiguration
+        )
+        if let existing {
+            guard existing.count == chunks.count,
+                  existing.fullConfigurationDigest == fullDigest,
+                  pending == nil || incomplete == nil
+                    || existing.index == incomplete!.index + 1 else {
+                throw NoctCordTransportError.snapshotProposalMismatch
+            }
+        }
+        let firstIndex = pending?.checkpoint?.snapshotFragment?.index
+            ?? incomplete.map { $0.index + 1 } ?? 0
+        guard snapshot.protectedApplicationEventIDs.count
+                + (chunks.count - firstIndex)
+                <= GroupRuntimeRecord.maximumProtectedApplicationEvents else {
+            throw NoctCordTransportError.checkpointCapacityReached
+        }
+        var last: NoctCordTransportPublication?
+        if firstIndex > 0 {
+            // Fragment zero already durably records the seed and base date.
+            // The exact relay requests are idempotent across a crash/reopen.
+            try await createRotatedRoutes(
+                for: spaceID, requests: rotated.routes
+            )
+        }
+        for index in firstIndex..<chunks.count {
+            let fragment = NoctCordSnapshotFragmentV2(
+                seriesID: seriesID,
+                index: index,
+                count: chunks.count,
+                fullConfigurationDigest: fullDigest,
+                seriesSeed: seed
+            )
+            let publication = try await publishVerifiedCheckpoint(
+                spaceID: spaceID,
+                operation: .applyBootstrap(chunks[index]),
+                kind: .snapshot,
+                snapshotFragment: fragment,
+                beforeFanoutRoutes: index == 0 ? rotated.routes : [],
+                at: date.addingTimeInterval(TimeInterval(index))
+            )
+            last = publication
+            if !publication.complete { return publication }
+        }
+        guard let last else { throw NoctCordTransportError.eventRejected }
+        try await retireObsoleteCheckpointPrefix(
+            runtime: try await client.openGroupRuntime(groupID: spaceID)
+        )
+        return last
+    }
+
+    private func publishVerifiedCheckpoint(
+        spaceID: UUID,
+        operation: NoctCordOperation,
+        kind: NoctCordPolicyCheckpointKindV2,
+        snapshotFragment: NoctCordSnapshotFragmentV2? = nil,
+        beforeFanoutRoutes: [RealtimeRouteCreateRequestV1] = [],
+        at date: Date
+    ) async throws -> NoctCordTransportPublication {
+        let runtime = try await client.openGroupRuntime(groupID: spaceID)
+        var snapshot = await runtime.snapshot()
+        try await pinReceivedCheckpoints(snapshot.events, runtime: runtime)
+        snapshot = await runtime.snapshot()
+        guard let owner = snapshot.signedState.members.first(where: {
+            $0.role == .owner && $0.isActive(at: snapshot.signedState.epoch)
+        })?.id,
+        snapshot.localCredential.memberHandle == owner else {
+            throw NoctCordTransportError.eventRejected
+        }
+
+        for stalePending in snapshot.pendingApplicationPublications {
+            guard let secure = try? NoctCordCodec.unwrapSecure(stalePending.event),
+                  let checkpoint = secure.checkpoint,
+                  checkpoint.groupEpoch < snapshot.signedState.epoch else {
+                continue
+            }
+            var transport = snapshot.outboundTransportOperations.first {
+                $0.logicalID == stalePending.event.id
+            }
+            if transport == nil {
+                transport = try await client.prepareGroupApplication(
+                    stalePending.event, at: max(date, stalePending.event.createdAt)
+                ).transportOperation
+            }
+            if let transport {
+                let resumed = try await client.resumeGroupTransport(
+                    groupID: spaceID, operationID: transport.id, at: date
+                )
+                guard resumed.complete else {
+                    throw NoctCordTransportError.transportIncomplete
+                }
+            }
+            let recovered = try await client.openGroupRuntime(groupID: spaceID)
+            try await recovered.replaceProtectedApplicationEvent(
+                previousEventID: nil,
+                with: stalePending.event.id,
+                verificationFrontiers: checkpoint.frontiers.map {
+                    $0.coreFrontier(groupID: spaceID)
+                }
+            )
+            snapshot = await recovered.snapshot()
+        }
+
+        // A failed or interrupted fanout must resume the exact signed event.
+        // Publishing a new checkpoint here could split the owner chain.
+        if let pending = snapshot.pendingApplicationPublications.first(where: {
+            (try? NoctCordCodec.unwrapSecure($0.event).checkpoint) != nil
+        }) {
+            guard let secure = try? NoctCordCodec.unwrapSecure(pending.event),
+                  secure.event.operation == operation,
+                  secure.checkpoint?.kind == kind,
+                  secure.checkpoint?.snapshotFragment == snapshotFragment else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+            var transport = snapshot.outboundTransportOperations.first(where: {
+                $0.logicalID == pending.event.id
+            })
+            if transport == nil {
+                // Core can persist the sender ratchet and exact envelope just
+                // before preparing the transport journal. Retrying the same
+                // event materializes that journal without signing a fork.
+                let recovered = try await client.prepareGroupApplication(
+                    pending.event, at: max(date, pending.event.createdAt)
+                )
+                transport = recovered.transportOperation
+            }
+            try await createRotatedRoutes(
+                for: spaceID, requests: beforeFanoutRoutes
+            )
+            if let transport {
+                let resumed = try await client.resumeGroupTransport(
+                    groupID: spaceID, operationID: transport.id, at: date
+                )
+                guard resumed.complete else {
+                    return NoctCordTransportPublication(
+                        event: secure.event,
+                        operationID: transport.id,
+                        complete: false
+                    )
+                }
+            }
+            let resumedRuntime = try await client.openGroupRuntime(groupID: spaceID)
+            try await resumedRuntime.replaceProtectedApplicationEvent(
+                previousEventID: nil,
+                with: pending.event.id,
+                verificationFrontiers: secure.checkpoint!.frontiers.map {
+                    $0.coreFrontier(groupID: spaceID)
+                }
+            )
+            return NoctCordTransportPublication(
+                event: secure.event,
+                operationID: transport?.id,
+                complete: true
+            )
+        }
+
+        if kind == .delta,
+           snapshot.protectedApplicationEventIDs.count
+                >= GroupRuntimeRecord.maximumProtectedApplicationEvents
+                    - NoctCordSnapshotFragmentV2.maximumParts {
+            let current = try NoctCordSecureProjectionV2.project(
+                verified: snapshot
+            ).projection
+            let configuration = try current.checkpointConfiguration(
+                createdAt: date
+            )
+            let refresh = try await publishVerifiedSnapshotSeries(
+                spaceID: spaceID, configuration: configuration, at: date
+            )
+            guard refresh.complete else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+            snapshot = await (try await client.openGroupRuntime(
+                groupID: spaceID
+            )).snapshot()
+            guard snapshot.protectedApplicationEventIDs.count
+                    < GroupRuntimeRecord.maximumProtectedApplicationEvents
+                        - NoctCordSnapshotFragmentV2.maximumParts else {
+                throw NoctCordTransportError.checkpointCapacityReached
+            }
+        }
+        guard snapshot.protectedApplicationEventIDs.count
+                < GroupRuntimeRecord.maximumProtectedApplicationEvents else {
+            throw NoctCordTransportError.checkpointCapacityReached
+        }
+
+        let previousDigest = try Self.latestCheckpointDigest(in: snapshot)
+        if let incomplete = try Self.incompleteSnapshotFragment(in: snapshot) {
+            guard let snapshotFragment,
+                  snapshotFragment.seriesID == incomplete.seriesID,
+                  snapshotFragment.index == incomplete.index + 1,
+                  snapshotFragment.count == incomplete.count,
+                  snapshotFragment.seriesSeed == incomplete.seriesSeed,
+                  snapshotFragment.fullConfigurationDigest
+                    == incomplete.fullConfigurationDigest else {
+                throw NoctCordTransportError.transportIncomplete
+            }
+        } else if let snapshotFragment, snapshotFragment.index != 0 {
+            throw NoctCordTransportError.eventRejected
+        }
+        switch kind {
+        case .snapshot:
+            guard operation.kind == .bootstrapApplied,
+                  !operation.bootstrapEvents!.isEmpty else {
+                throw NoctCordTransportError.eventRejected
+            }
+        case .delta:
+            guard previousDigest != nil,
+                  operation.kind.isBootstrapConfiguration
+                    || (previousDigest != nil
+                        && operation.kind == .bootstrapRequested) else {
+                throw NoctCordTransportError.eventRejected
+            }
+        }
+        if previousDigest != nil && snapshotFragment == nil {
+            _ = try NoctCordSecureProjectionV2.projectForOwnerRebind(
+                verified: snapshot
+            )
+        }
+        guard let coreFrontiers = snapshot.currentVerificationFrontiers(),
+              coreFrontiers.count == snapshot.signedState.activeCredentials.count else {
+            throw NoctCordTransportError.eventRejected
+        }
+        let appFrontiers = coreFrontiers.map(NoctCordCredentialFrontierV2.init)
+        let configurationBytes: Data
+        if kind == .snapshot {
+            configurationBytes = try NoctweaveCoder.encode(
+                operation.bootstrapEvents!, sortedKeys: true
+            )
+        } else {
+            configurationBytes = try NoctweaveCoder.encode(operation, sortedKeys: true)
+        }
+        let projection: NoctCordSpaceProjection
+        if previousDigest == nil || kind == .snapshot {
+            projection = NoctCordSpaceProjection(
+                spaceID: spaceID, owner: owner,
+                activeMembers: Set(snapshot.signedState.activeCredentials.map(\.memberHandle))
+            )
+        } else {
+            projection = try NoctCordSecureProjectionV2.project(
+                verified: snapshot
+            ).projection
+        }
+        let event = NoctCordEvent(
+            spaceID: spaceID,
+            author: owner,
+            logicalClock: try projection.nextLogicalClock(),
+            createdAt: date,
+            operation: operation
+        )
+        var candidate = projection
+        if snapshotFragment == nil {
+            do {
+                try candidate.applyVerifiedV2(
+                    event, permittingHistoricalAuthor: false
+                )
+                let fullConfiguration = try candidate.checkpointConfiguration(
+                    createdAt: date
+                )
+                _ = try Self.plannedSnapshotChunks(
+                    fullConfiguration, snapshot: snapshot
+                )
+            } catch {
+                throw NoctCordTransportError.eventRejected
+            }
+        }
+        let secure = NoctCordSecureEventV2(
+            event: event,
+            credential: snapshot.localCredential.credentialHandle,
+            checkpoint: NoctCordPolicyCheckpointV2(
+                spaceID: spaceID,
+                owner: owner,
+                kind: kind,
+                groupEpoch: snapshot.signedState.epoch,
+                groupTranscriptHash: snapshot.signedState.confirmedTranscriptHash,
+                previousCheckpointDigest: previousDigest,
+                configurationDigest: Data(SHA256.hash(data: configurationBytes)),
+                frontiers: appFrontiers,
+                snapshotFragment: snapshotFragment
+            )
+        )
+        let outer = try NoctCordCodec.wrapSecure(
+            secure,
+            usingLegacyCapability: Self.requiresLegacyContentCapability(snapshot)
+        )
+        guard try NoctweaveCoder.encode(outer, sortedKeys: true).count
+                <= NoctCordCodec.maximumEventBytes else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        let prepared = try await client.prepareGroupApplication(outer, at: date)
+        // The exact signed first fragment and its seed are durable before
+        // creating any external realtime route. A retry reconstructs the
+        // same capabilities and expiry from that fragment.
+        try await createRotatedRoutes(
+            for: spaceID, requests: beforeFanoutRoutes
+        )
+        if let transport = prepared.transportOperation {
+            let resumed = try await client.resumeGroupTransport(
+                groupID: spaceID, operationID: transport.id, at: date
+            )
+            guard resumed.complete else {
+                return NoctCordTransportPublication(
+                    event: event, operationID: transport.id, complete: false
+                )
+            }
+        }
+        let publishedRuntime = try await client.openGroupRuntime(groupID: spaceID)
+        snapshot = await publishedRuntime.snapshot()
+        guard snapshot.pendingApplicationPublications.allSatisfy({
+            $0.event.id != outer.id
+        }) else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        try await publishedRuntime.replaceProtectedApplicationEvent(
+            previousEventID: nil,
+            with: outer.id,
+            verificationFrontiers: coreFrontiers
+        )
+        return NoctCordTransportPublication(
+            event: event,
+            operationID: prepared.transportOperation?.id,
+            complete: true
+        )
+    }
+
+    package func pinReceivedCheckpoints(
+        _ events: [GroupConversationEventV2],
+        runtime: NoctweavePQGroupRuntimeV2,
+        capacityLimit: Int = GroupRuntimeRecord.maximumProtectedApplicationEvents
+    ) async throws {
+        guard capacityLimit > 0,
+              capacityLimit <= GroupRuntimeRecord.maximumProtectedApplicationEvents else {
+            throw NoctCordTransportError.invalidConfiguration
+        }
+        let initial = await runtime.snapshot()
+        let owner = initial.signedState.members.first(where: {
+            $0.role == .owner && $0.isActive(at: initial.signedState.epoch)
+        })?.id
+        var fragmentsBySeries: [UUID: [NoctCordSnapshotFragmentV2]] = [:]
+        for outer in events where outer.authorMemberHandle == owner {
+            guard let secure = try? NoctCordCodec.unwrapSecure(outer),
+                  let fragment = secure.checkpoint?.snapshotFragment else { continue }
+            fragmentsBySeries[fragment.seriesID, default: []].append(fragment)
+        }
+        let completeSeries = Set(fragmentsBySeries.compactMap { id, fragments
+            -> UUID? in
+            guard let first = fragments.first,
+                  fragments.count == first.count,
+                  Set(fragments.map(\.index)) == Set(0..<first.count),
+                  fragments.allSatisfy({
+                      $0.count == first.count
+                          && $0.seriesSeed == first.seriesSeed
+                          && $0.fullConfigurationDigest
+                              == first.fullConfigurationDigest
+                  }) else { return nil }
+            return id
+        })
+        let latestCompleteSnapshotEpoch = events.compactMap { outer -> UInt64? in
+            guard outer.authorMemberHandle == owner,
+                  let secure = try? NoctCordCodec.unwrapSecure(outer),
+                  let checkpoint = secure.checkpoint,
+                  checkpoint.kind == .snapshot,
+                  checkpoint.snapshotFragment.map({ fragment in
+                      fragment.index + 1 == fragment.count
+                          && completeSeries.contains(fragment.seriesID)
+                  }) ?? true else { return nil }
+            return checkpoint.groupEpoch
+        }.max()
+        let localIsOwner = initial.localCredential.memberHandle == owner
+        let protected = Set(initial.protectedApplicationEventIDs)
+        let retired = Set(initial.retiredProtectedApplicationEventIDs)
+        let pending = Set(initial.pendingApplicationPublications.map { $0.event.id })
+        let eligible = events.filter { outer in
+            guard outer.authorMemberHandle == owner,
+                  NoctCordCodec.isSecureContent(outer.content),
+                  !protected.contains(outer.id),
+                  !retired.contains(outer.id),
+                  !pending.contains(outer.id),
+                  let secure = try? NoctCordCodec.unwrapSecure(outer),
+                  let checkpoint = secure.checkpoint else { return false }
+            return localIsOwner
+                || checkpoint.snapshotFragment.map {
+                    completeSeries.contains($0.seriesID)
+                        || checkpoint.groupEpoch
+                            < (latestCompleteSnapshotEpoch ?? 0)
+                } ?? true
+        }
+        if protected.count + eligible.count > capacityLimit {
+            guard !localIsOwner,
+                  let last = eligible.last,
+                  let lastSecure = try? NoctCordCodec.unwrapSecure(last),
+                  let lastPolicy = lastSecure.checkpoint,
+                  lastPolicy.kind == .snapshot,
+                  (lastPolicy.snapshotFragment == nil
+                    || (lastPolicy.snapshotFragment.map {
+                        $0.index + 1 == $0.count
+                            && completeSeries.contains($0.seriesID)
+                    } ?? false)) else {
+                throw NoctCordTransportError.checkpointCapacityReached
+            }
+            let additions = Set(eligible.map(\.id))
+            let full = try NoctCordSecureProjectionV2.projectForAtomicReceiverPin(
+                verified: initial, adding: additions, retiring: []
+            )
+            let ordinaryIDs = Set(events.compactMap { outer -> UUID? in
+                guard let secure = try? NoctCordCodec.unwrapSecure(outer),
+                      secure.checkpoint == nil else { return nil }
+                return outer.id
+            })
+            let fullOrdinary = Set(full.acceptedEvents.map(\.id))
+                .intersection(ordinaryIDs)
+            let oldCheckpoints = events.filter { outer in
+                protected.contains(outer.id)
+                    && NoctCordCodec.isSecureContent(outer.content)
+                    && (try? NoctCordCodec.unwrapSecure(outer).checkpoint) != nil
+            }
+            let requiredRetirement = protected.count + eligible.count
+                - capacityLimit
+            var retiredSafely = false
+            if oldCheckpoints.count >= requiredRetirement {
+                for length in stride(
+                    from: oldCheckpoints.count, through: requiredRetirement, by: -1
+                ) {
+                    let oldIDs = Set(oldCheckpoints.prefix(length).map(\.id))
+                    guard let candidate = try? NoctCordSecureProjectionV2
+                        .projectForAtomicReceiverPin(
+                            verified: initial, adding: additions,
+                            retiring: oldIDs
+                        ),
+                        candidate.projection.hasSameRetainedState(
+                            as: full.projection
+                        ),
+                        Set(candidate.acceptedEvents.map(\.id))
+                            .intersection(ordinaryIDs) == fullOrdinary else {
+                        continue
+                    }
+                    let bindings = try eligible.map { outer in
+                        guard let secure = try? NoctCordCodec.unwrapSecure(outer),
+                              let checkpoint = secure.checkpoint else {
+                            throw NoctCordTransportError.eventRejected
+                        }
+                        return GroupProtectedApplicationVerificationBindingV2(
+                            eventID: outer.id,
+                            frontiers: checkpoint.frontiers.map {
+                                $0.coreFrontier(groupID: initial.groupId)
+                            }
+                        )
+                    }
+                    try await runtime.replaceProtectedApplicationEventSeries(
+                        retiring: Array(oldIDs), with: bindings
+                    )
+                    retiredSafely = true
+                    break
+                }
+            }
+            guard retiredSafely else {
+                // Never pin a prefix of a complete series and then hit Core's
+                // cap. The caller remains read-only until enough old content
+                // ages out for an atomic replacement.
+                throw NoctCordTransportError.checkpointCapacityReached
+            }
+        }
+        for outer in events where NoctCordCodec.isSecureContent(outer.content) {
+            let snapshot = await runtime.snapshot()
+            if snapshot.protectedApplicationEventIDs.contains(outer.id) { continue }
+            if snapshot.retiredProtectedApplicationEventIDs.contains(outer.id) {
+                // Atomic Core retirement leaves a tombstone while the old
+                // ciphertext remains in the retained event window. It must
+                // never be rebound as a live owner policy checkpoint.
+                continue
+            }
+            if snapshot.pendingApplicationPublications.contains(where: {
+                $0.event.id == outer.id
+            }) { continue }
+            guard let secure = try? NoctCordCodec.unwrapSecure(outer),
+                  let checkpoint = secure.checkpoint else { continue }
+            guard let owner else { throw NoctCordTransportError.eventRejected }
+            // A member may send a structurally valid checkpoint-shaped
+            // payload, but cannot claim the Core owner credential. Treat it
+            // as rejected content, not a group-wide pinning error.
+            guard outer.authorMemberHandle == owner else { continue }
+            if let fragment = checkpoint.snapshotFragment,
+               !localIsOwner && !completeSeries.contains(fragment.seriesID)
+                && checkpoint.groupEpoch
+                    >= (latestCompleteSnapshotEpoch ?? 0) {
+                // Withholding the tail cannot consume up to 64 protected pins
+                // on every receiver. Projection remains fail-closed until
+                // the whole signed series arrives and is pinned.
+                continue
+            }
+            guard
+            checkpoint.owner == owner,
+            checkpoint.spaceID == snapshot.groupId,
+            let receipt = snapshot.applicationVerificationReceipt(for: outer.id),
+            receipt.outcome == .accepted,
+            receipt.eventDigest == outer.digest,
+            receipt.epoch == checkpoint.groupEpoch,
+            receipt.transcriptHash == checkpoint.groupTranscriptHash else {
+                throw NoctCordTransportError.eventRejected
+            }
+            if checkpoint.groupEpoch == snapshot.signedState.epoch {
+                guard Set(checkpoint.frontiers.filter {
+                    $0.epoch == checkpoint.groupEpoch
+                }.map(\.credential)) == Set(
+                    snapshot.signedState.activeCredentials.map(\.credentialHandle)
+                ) else {
+                    throw NoctCordTransportError.eventRejected
+                }
+            }
+            try await runtime.replaceProtectedApplicationEvent(
+                previousEventID: nil,
+                with: outer.id,
+                verificationFrontiers: checkpoint.frontiers.map {
+                    $0.coreFrontier(groupID: snapshot.groupId)
+                }
+            )
+        }
+    }
+    #endif
+
     private static func projectedSpace(
         from snapshot: GroupRuntimeRecord
     ) throws -> NoctCordSpaceProjection {
@@ -1565,6 +3134,9 @@ public actor NoctCordTransportCoordinator {
         let members = Set(snapshot.signedState.members.compactMap {
             $0.isActive(at: snapshot.signedState.epoch) ? $0.id : nil
         })
+        #if NOCTCORD_VERIFIED_CORE
+        return try NoctCordSecureProjectionV2.project(verified: snapshot).projection
+        #else
         let events = snapshot.events.compactMap { try? NoctCordCodec.unwrap($0) }
         let projection = NoctCordSpaceProjection.project(
             spaceID: snapshot.groupId,
@@ -1574,6 +3146,7 @@ public actor NoctCordTransportCoordinator {
             events: events
         ).projection
         return projection
+        #endif
     }
 
     /// Replays only durable application configuration. Message bodies,

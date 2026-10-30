@@ -125,11 +125,19 @@ public struct NoctCordMessagePresentation: Identifiable, Equatable {
 
 public struct NoctCordSpaceSession: Identifiable, Equatable {
     public let id: UUID
+    public var groupEpoch: UInt64
     public var shortName: String
     public var currentMember: GroupScopedMemberHandleV2
     public var identityScope: NoctCordIdentityScope
     public var members: [NoctCordMemberViewState]
     public var events: [NoctCordEvent]
+    /// Only `.verified` projections may authorize v2 community activity.
+    /// Legacy events are retained separately for read-only history display.
+    public var policyMode: NoctCordPolicyMode
+    public var legacyArchiveEvents: [NoctCordEvent]
+    /// Display-only projection of retained v1 history. Never use for a live
+    /// permission, bot, route, or publication decision.
+    public var legacyArchiveProjection: NoctCordSpaceProjection?
     public var projection: NoctCordSpaceProjection
     public var unreadByChannel: [UUID: Int]
     public var voiceRooms: [NoctCordVoiceRoom]
@@ -137,7 +145,13 @@ public struct NoctCordSpaceSession: Identifiable, Equatable {
     public var relayName: String
     public var relayAssessment: NoctCordRelayAssessment
 
-    public var name: String { projection.name ?? "Untitled space" }
+    public var name: String {
+        projection.name ?? legacyArchiveProjection?.name ?? "Untitled space"
+    }
+
+    public var isPolicyReadOnly: Bool {
+        policyMode == .legacyReadOnly || policyMode == .awaitingOwnerCheckpoint
+    }
 
     public var textChannels: [NoctCordChannel] {
         projection.channels.values
@@ -154,15 +168,21 @@ public struct NoctCordSpaceSession: Identifiable, Equatable {
     }
 
     public var canManageChannels: Bool {
-        projection.permissions(for: currentMember).contains(.manageChannels)
+        guard !isPolicyReadOnly,
+              policyMode != .verified || isCurrentUserOwner else { return false }
+        return projection.permissions(for: currentMember).contains(.manageChannels)
     }
 
     public var canManageRoles: Bool {
-        projection.permissions(for: currentMember).contains(.manageRoles)
+        guard !isPolicyReadOnly,
+              policyMode != .verified || isCurrentUserOwner else { return false }
+        return projection.permissions(for: currentMember).contains(.manageRoles)
     }
 
     public var canManageBots: Bool {
-        projection.permissions(for: currentMember).contains(.manageBots)
+        guard !isPolicyReadOnly,
+              policyMode != .verified || isCurrentUserOwner else { return false }
+        return projection.permissions(for: currentMember).contains(.manageBots)
     }
 
     public var isCurrentUserOwner: Bool {
@@ -189,6 +209,16 @@ public struct NoctCordSpaceSession: Identifiable, Equatable {
             )
         })
     }
+}
+
+/// The exact configuration events the owner will authorize in the verified
+/// policy protocol, together with their effective policy after v2 replay.
+struct NoctCordMigrationReview: Identifiable {
+    let spaceID: UUID
+    let configuration: [NoctCordEvent]
+    let projection: NoctCordSpaceProjection
+
+    var id: UUID { spaceID }
 }
 
 @MainActor
@@ -242,6 +272,8 @@ public final class NoctCordAppModel: ObservableObject {
     private var communityLifecycleRecoveryTask: Task<Void, Never>?
     private var identityScopes: [UUID: NoctCordIdentityScope] = [:]
     private var mediaRoom: NoctCordMediaRoom?
+    private var activeMediaSpaceID: UUID?
+    private var activeMediaRoomID: UUID?
     private var mediaRoomGeneration = UUID()
     private var mediaRefreshTask: Task<Void, Never>?
     private var processedCallSignalIDs: Set<UUID> = []
@@ -461,6 +493,7 @@ public final class NoctCordAppModel: ObservableObject {
 
     public var selectedChannelPermissions: Set<NoctCordPermission> {
         guard let space = selectedSpace,
+              !space.isPolicyReadOnly,
               let channelID = selectedChannelID else { return [] }
         return space.projection.permissions(for: space.currentMember, in: channelID)
     }
@@ -475,7 +508,7 @@ public final class NoctCordAppModel: ObservableObject {
 
     public var canInviteToSelectedSpace: Bool {
         guard let space = selectedSpace else { return false }
-        return space.isCurrentUserOwner
+        return space.policyMode == .verified && space.isCurrentUserOwner
     }
 
     public var isSelectedCommunityLifecycleOperationInFlight: Bool {
@@ -834,6 +867,7 @@ public final class NoctCordAppModel: ObservableObject {
         ).projection
         let session = NoctCordSpaceSession(
             id: spaceID,
+            groupEpoch: 0,
             shortName: Self.shortName(cleanName),
             currentMember: owner,
             identityScope: identityScope,
@@ -846,6 +880,9 @@ public final class NoctCordAppModel: ObservableObject {
                 )
             ],
             events: events,
+            policyMode: .legacyWritable,
+            legacyArchiveEvents: [],
+            legacyArchiveProjection: nil,
             projection: projection,
             unreadByChannel: [:],
             voiceRooms: [],
@@ -879,6 +916,82 @@ public final class NoctCordAppModel: ObservableObject {
             lifetime: lifetime
         )
         return try invitation.encoded()
+    }
+
+    /// Builds a local preview from legacy history. It has no authority until
+    /// the owner explicitly approves this exact configuration in the UI.
+    func prepareLegacyMigrationReview() async throws -> NoctCordMigrationReview {
+        guard !resetIsPending else { throw CancellationError() }
+        directOperations += 1
+        defer { endDirectOperation() }
+        guard let transport, let space = selectedSpace,
+              space.policyMode == .legacyReadOnly,
+              space.isCurrentUserOwner else {
+            throw NoctCordTransportError.communityOwnerRequired
+        }
+        activityMessage = "Preparing the community policy for review…"
+        defer { activityMessage = nil }
+        let configuration = try await transport.proposedLegacyConfigurationForReview(
+            spaceID: space.id
+        )
+        var projection = NoctCordSpaceProjection(
+            spaceID: space.id,
+            owner: space.currentMember,
+            activeMembers: Set(space.members.map(\.id))
+        )
+        let probe = NoctCordEvent(
+            spaceID: space.id,
+            author: space.currentMember,
+            logicalClock: UInt64(configuration.count + 1),
+            operation: .applyBootstrap(configuration)
+        )
+        try projection.applyVerifiedV2(probe, permittingHistoricalAuthor: false)
+        return NoctCordMigrationReview(
+            spaceID: space.id,
+            configuration: configuration,
+            projection: projection
+        )
+    }
+
+    /// Approves only the reviewed event array. No legacy event gains policy
+    /// authority merely because it appeared in the old local projection.
+    func approveLegacyMigration(_ review: NoctCordMigrationReview) async throws {
+        guard !resetIsPending else { throw CancellationError() }
+        directOperations += 1
+        defer { endDirectOperation() }
+        guard let transport, let space = selectedSpace,
+              space.id == review.spaceID,
+              space.policyMode == .legacyReadOnly,
+              space.isCurrentUserOwner else {
+            throw NoctCordTransportError.communityOwnerRequired
+        }
+        activityMessage = "Publishing owner-approved community policy…"
+        defer { activityMessage = nil }
+        let publication = try await transport.migrateCommunityToVerifiedPolicy(
+            spaceID: review.spaceID,
+            approvedConfiguration: review.configuration
+        )
+        guard publication.complete else {
+            throw NoctCordTransportError.transportIncomplete
+        }
+        try await reloadSpace(review.spaceID, using: transport)
+    }
+
+    /// Gives members who upgraded after the original migration a new
+    /// authenticated current-epoch policy root in the same community.
+    func rebindVerifiedCommunityAfterUpgrade() async throws {
+        guard !resetIsPending else { throw CancellationError() }
+        directOperations += 1
+        defer { endDirectOperation() }
+        guard let transport, let space = selectedSpace,
+              space.policyMode == .verified,
+              space.isCurrentUserOwner else {
+            throw NoctCordTransportError.communityOwnerRequired
+        }
+        activityMessage = "Renewing the signed community access epoch…"
+        defer { activityMessage = nil }
+        _ = try await transport.rebindVerifiedCommunityAfterUpgrade(spaceID: space.id)
+        try await reloadSpace(space.id, using: transport)
     }
 
     public func prepareCommunityAdmission(
@@ -920,7 +1033,13 @@ public final class NoctCordAppModel: ObservableObject {
             requestCode,
             for: spaceID
         )
-        try await reloadSpace(spaceID, using: transport)
+        do {
+            try await reloadSpace(spaceID, using: transport)
+        } catch {
+            // The signed admission response already exists. Preserve it for
+            // the owner even if the new-epoch snapshot still needs retry.
+            composerNotice = "The member was admitted. Share the response code, then retry community sync: \(error.localizedDescription)"
+        }
         return response
     }
 
@@ -1638,6 +1757,8 @@ public final class NoctCordAppModel: ObservableObject {
                   mediaRoomGeneration == leftID else { return }
         }
         let joinID = beginMediaRoomJoin()
+        activeMediaSpaceID = spaceID
+        activeMediaRoomID = roomID
         activityMessage = "Joining encrypted voice room…"
         do {
             if usesRelayDiscoveredICE,
@@ -1874,11 +1995,18 @@ public final class NoctCordAppModel: ObservableObject {
         mediaRoomGeneration = stoppedID
         mediaRefreshTask?.cancel()
         mediaRefreshTask = nil
+        let routeSpaceID = activeMediaSpaceID
+        let routeRoomID = activeMediaRoomID
+        activeMediaSpaceID = nil
+        activeMediaRoomID = nil
         let room = mediaRoom
         self.mediaRoom = nil
         callSnapshot = nil
         processedCallSignalIDs.removeAll()
         await room?.leave()
+        if let routeSpaceID, let routeRoomID {
+            await transport?.closeRealtimeRoom(spaceID: routeSpaceID, roomID: routeRoomID)
+        }
         return stoppedID
     }
 
@@ -2039,11 +2167,23 @@ public final class NoctCordAppModel: ObservableObject {
                 _ = try? await transport.synchronize(spaceID: spaceID)
                 _ = try? await transport.ensureCommunityBootstrap(spaceID: spaceID)
             }
-            loaded.append(try await makeSession(
-                spaceID: spaceID,
-                using: transport,
-                assessRelay: assessRelays
-            ))
+            do {
+                loaded.append(try await makeSession(
+                    spaceID: spaceID,
+                    using: transport,
+                    assessRelay: assessRelays
+                ))
+            } catch {
+                if activeMediaSpaceID == spaceID { _ = await stopMediaRoom() }
+                throw error
+            }
+        }
+        if let activeMediaSpaceID,
+           activeMediaRequiresStop(
+                previous: spaces.first { $0.id == activeMediaSpaceID },
+                updated: loaded.first { $0.id == activeMediaSpaceID }
+           ) {
+            _ = await stopMediaRoom()
         }
         spaces = loaded.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
@@ -2150,7 +2290,20 @@ public final class NoctCordAppModel: ObservableObject {
     ) async throws {
         _ = try? await transport.synchronize(spaceID: spaceID)
         _ = try? await transport.ensureCommunityBootstrap(spaceID: spaceID)
-        let session = try await makeSession(spaceID: spaceID, using: transport)
+        let session: NoctCordSpaceSession
+        do {
+            session = try await makeSession(spaceID: spaceID, using: transport)
+        } catch {
+            if activeMediaSpaceID == spaceID { _ = await stopMediaRoom() }
+            throw error
+        }
+        if activeMediaSpaceID == spaceID,
+           activeMediaRequiresStop(
+                previous: spaces.first { $0.id == spaceID },
+                updated: session
+           ) {
+            _ = await stopMediaRoom()
+        }
         if let index = spaces.firstIndex(where: { $0.id == spaceID }) {
             spaces[index] = session
         } else {
@@ -2164,6 +2317,41 @@ public final class NoctCordAppModel: ObservableObject {
         }
     }
 
+    /// A Core epoch or verified room route/key change ends the current media
+    /// session before further signaling can use the prior authorization.
+    private func activeMediaRequiresStop(
+        previous: NoctCordSpaceSession?,
+        updated: NoctCordSpaceSession?
+    ) -> Bool {
+        guard let activeMediaRoomID else { return false }
+        return Self.mediaStateRequiresStop(
+            roomID: activeMediaRoomID,
+            previous: previous,
+            updated: updated
+        )
+    }
+
+    /// Shared by both refresh paths and their projected-state regression tests.
+    static func mediaStateRequiresStop(
+        roomID: UUID,
+        previous: NoctCordSpaceSession?,
+        updated: NoctCordSpaceSession?
+    ) -> Bool {
+        guard let updated,
+              updated.policyMode == .verified,
+              updated.projection.activeMembers.contains(updated.currentMember),
+              updated.projection.permissions(for: updated.currentMember).contains(.connectVoice),
+              let room = updated.projection.voiceRooms[roomID],
+              !room.isArchived else { return true }
+        guard let previous else { return true }
+        if previous.groupEpoch != updated.groupEpoch { return true }
+        guard let oldRoom = previous.projection.voiceRooms[roomID] else {
+            return true
+        }
+        return oldRoom.signalingKeyID != room.signalingKeyID
+            || oldRoom.realtimeRoute != room.realtimeRoute
+    }
+
     private func makeSession(
         spaceID: UUID,
         using transport: NoctCordTransportCoordinator,
@@ -2174,13 +2362,33 @@ public final class NoctCordAppModel: ObservableObject {
             assessRelay: assessRelay
         )
         let activeMembers = Set(snapshot.members.map(\.handle))
-        let projection = NoctCordSpaceProjection.project(
-            spaceID: spaceID,
-            owner: snapshot.owner,
-            activeMembers: activeMembers,
-            historicalMembers: Set(snapshot.events.map(\.author)),
-            events: snapshot.events
-        ).projection
+        let archiveProjection = snapshot.legacyArchiveEvents.isEmpty ? nil
+            : NoctCordSpaceProjection.project(
+                spaceID: spaceID,
+                owner: snapshot.owner,
+                activeMembers: activeMembers,
+                historicalMembers: Set(snapshot.legacyArchiveEvents.map(\.author)),
+                events: snapshot.legacyArchiveEvents
+            ).projection
+        let projection: NoctCordSpaceProjection
+        if snapshot.policyMode == .verified,
+           let verified = snapshot.verifiedProjection {
+            projection = verified.projection
+        } else if snapshot.policyMode == .legacyWritable {
+            projection = NoctCordSpaceProjection.project(
+                spaceID: spaceID,
+                owner: snapshot.owner,
+                activeMembers: activeMembers,
+                historicalMembers: Set(snapshot.events.map(\.author)),
+                events: snapshot.events
+            ).projection
+        } else {
+            projection = NoctCordSpaceProjection(
+                spaceID: spaceID,
+                owner: snapshot.owner,
+                activeMembers: activeMembers
+            )
+        }
         let botMembers = Set(projection.botApplications.values.map(\.memberHandle))
         let members = snapshot.members.map { member in
             let projectedRoleName: String
@@ -2218,6 +2426,7 @@ public final class NoctCordAppModel: ObservableObject {
         })?.key
         var session = NoctCordSpaceSession(
             id: spaceID,
+            groupEpoch: snapshot.groupEpoch,
             shortName: Self.shortName(projection.name ?? "Space"),
             currentMember: snapshot.currentMember,
             identityScope: projection.identityBindings[snapshot.currentMember]?.profile.scope
@@ -2225,6 +2434,9 @@ public final class NoctCordAppModel: ObservableObject {
                 ?? .isolated,
             members: members,
             events: snapshot.events,
+            policyMode: snapshot.policyMode,
+            legacyArchiveEvents: snapshot.legacyArchiveEvents,
+            legacyArchiveProjection: archiveProjection,
             projection: projection,
             unreadByChannel: spaces.first(where: { $0.id == spaceID })?.unreadByChannel ?? [:],
             voiceRooms: voiceRooms,
@@ -2397,11 +2609,15 @@ private extension NoctCordAppModel {
         ).projection
         return NoctCordSpaceSession(
             id: spaceID,
+            groupEpoch: 0,
             shortName: "NS",
             currentMember: owner,
             identityScope: .portable,
             members: members,
             events: events,
+            policyMode: .legacyWritable,
+            legacyArchiveEvents: [],
+            legacyArchiveProjection: nil,
             projection: projection,
             unreadByChannel: [buildRoom: 2, fieldNotes: 1],
             voiceRooms: [
@@ -2491,11 +2707,15 @@ private extension NoctCordAppModel {
         ).projection
         return NoctCordSpaceSession(
             id: spaceID,
+            groupEpoch: 0,
             shortName: "PG",
             currentMember: current,
             identityScope: .isolated,
             members: members,
             events: events,
+            policyMode: .legacyWritable,
+            legacyArchiveEvents: [],
+            legacyArchiveProjection: nil,
             projection: projection,
             unreadByChannel: [channelID: 1],
             voiceRooms: [],

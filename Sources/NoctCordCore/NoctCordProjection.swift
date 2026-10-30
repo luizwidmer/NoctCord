@@ -98,6 +98,29 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
     public private(set) var appliedEventIDs: Set<UUID>
 
     private var lastOrder: EventOrder?
+    private var verifiedV2EventCount: UInt64
+
+    /// Checkpoint retirement may change replay bookkeeping and accepted
+    /// checkpoint IDs. It is safe only when every user-visible durable and
+    /// ephemeral projection field remains identical.
+    package func hasSameRetainedState(as other: Self) -> Bool {
+        spaceID == other.spaceID
+            && owner == other.owner
+            && name == other.name
+            && activeMembers == other.activeMembers
+            && channels == other.channels
+            && roles == other.roles
+            && roleAssignments == other.roleAssignments
+            && botApplications == other.botApplications
+            && botInvocations == other.botInvocations
+            && identityBindings == other.identityBindings
+            && messages == other.messages
+            && attachments == other.attachments
+            && voiceRooms == other.voiceRooms
+            && voiceParticipants == other.voiceParticipants
+            && callSignals == other.callSignals
+            && activeScreenShares == other.activeScreenShares
+    }
 
     public init(
         spaceID: UUID,
@@ -122,6 +145,7 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
         activeScreenShares = [:]
         appliedEventIDs = []
         lastOrder = nil
+        verifiedV2EventCount = 0
     }
 
     public static func project(
@@ -259,6 +283,99 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
             }
     }
 
+    /// A bounded owner-authored snapshot for a v2 policy checkpoint. It
+    /// contains durable configuration only; member messages and call activity
+    /// remain independently signed events. The caller must reject an oversized
+    /// snapshot rather than publish a partial authorization state.
+    public func checkpointConfiguration(createdAt: Date) throws -> [NoctCordEvent] {
+        guard let name else { throw NoctCordProjectionError.missingDependency }
+        var events: [NoctCordEvent] = []
+        func append(_ operation: NoctCordOperation) {
+            let index = events.count
+            let operationBytes = (try? NoctweaveCoder.encode(
+                operation, sortedKeys: true
+            )) ?? Data()
+            var material = Data("NoctCord/checkpoint-config-event/v2\0".utf8)
+            material.append(Data(spaceID.uuidString.utf8))
+            material.append(Data(String(index).utf8))
+            material.append(operationBytes)
+            let digest = Array(SHA256.hash(data: material))
+            let stableID = UUID(uuid: (
+                digest[0], digest[1], digest[2], digest[3],
+                digest[4], digest[5], digest[6], digest[7],
+                digest[8], digest[9], digest[10], digest[11],
+                digest[12], digest[13], digest[14], digest[15]
+            ))
+            events.append(NoctCordEvent(
+                id: stableID,
+                spaceID: spaceID,
+                author: owner,
+                logicalClock: UInt64(index + 1),
+                // Synthetic snapshots must be reproducible after a crash.
+                createdAt: Date(timeIntervalSince1970: 1_577_836_800
+                    + TimeInterval(index)),
+                operation: operation
+            ))
+        }
+
+        append(.createSpace(name: name))
+        for channel in channels.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            append(.createChannel(id: channel.id, name: channel.name))
+            if channel.isArchived { append(.archiveChannel(id: channel.id)) }
+        }
+        for role in roles.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            append(.defineRole(role))
+        }
+        // Installation requires an unassigned bot member. A role may be
+        // granted later, so preserve that valid ordering in snapshots.
+        for bot in botApplications.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            append(.installBot(bot))
+        }
+        for member in roleAssignments.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
+            for roleID in roleAssignments[member, default: []].sorted(by: {
+                $0.uuidString < $1.uuidString
+            }) {
+                append(.grantRole(id: roleID, to: member))
+            }
+        }
+        for channel in channels.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            for target in channel.permissionOverrides.keys.sorted(by: {
+                switch ($0, $1) {
+                case (.everyone, .role): true
+                case (.role, .everyone): false
+                case (.everyone, .everyone): false
+                case (.role(let lhs), .role(let rhs)):
+                    lhs.uuidString < rhs.uuidString
+                }
+            }) {
+                guard let override = channel.permissionOverrides[target] else { continue }
+                append(.setChannelPermissions(
+                    channelID: channel.id,
+                    roleID: override.roleID,
+                    allow: Set(override.allow),
+                    deny: Set(override.deny)
+                ))
+            }
+        }
+        for room in voiceRooms.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            append(.createVoiceRoom(id: room.id, spec: NoctCordVoiceRoomSpecV1(
+                name: room.name,
+                maxParticipants: room.maxParticipants,
+                signalingKey: room.signalingKey,
+                realtimeRoute: room.realtimeRoute
+            )))
+            if room.isArchived { append(.archiveVoiceRoom(id: room.id)) }
+        }
+        let encoded = try NoctweaveCoder.encode(events, sortedKeys: true)
+        guard events.count <= 64 * 128,
+              encoded.count <= 4 * 1_024 * 1_024,
+              Set(events.map(\.id)).count == events.count,
+              events.allSatisfy(\.isStructurallyValid) else {
+            throw NoctCordProjectionError.invalidEvent
+        }
+        return events
+    }
+
     public func highestRolePosition(for member: GroupScopedMemberHandleV2) -> UInt16 {
         member == owner ? .max : (roles(for: member).map(\.position).max() ?? 0)
     }
@@ -267,11 +384,108 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
         try apply(event, permittingHistoricalAuthor: false, enforcingOrder: true)
     }
 
+    /// Core receipts and owner checkpoints provide the ordering boundary in
+    /// v2. A sender-chosen application clock cannot reject a later policy
+    /// transition or move an event across that boundary. The v1 projection
+    /// path continues to enforce its original canonical clock order.
+    package mutating func applyVerifiedV2(
+        _ event: NoctCordEvent,
+        permittingHistoricalAuthor: Bool
+    ) throws {
+        try apply(
+            event,
+            permittingHistoricalAuthor: permittingHistoricalAuthor,
+            enforcingOrder: false
+        )
+        // An admitted peer controls `logicalClock`. It must not be able to
+        // pin local publication at the maximum clock or force a gap failure.
+        // Verified v2 order comes from Core receipts and owner frontiers.
+        if verifiedV2EventCount < NoctCordEvent.maximumLogicalClock {
+            verifiedV2EventCount += 1
+        }
+    }
+
+    /// Applies one fully verified owner snapshot assembled from one or more
+    /// signed checkpoint fragments. The caller verifies every fragment and
+    /// the aggregate digest before this method can change policy.
+    package mutating func applyVerifiedConfigurationSnapshot(
+        _ events: [NoctCordEvent]
+    ) throws {
+        guard !events.isEmpty,
+              events.count <= 64 * 128,
+              Set(events.map(\.id)).count == events.count,
+              events.allSatisfy({
+                  $0.spaceID == spaceID && $0.author == owner
+                      && $0.operation.kind.isBootstrapConfiguration
+                      && $0.isStructurallyValid
+              }) else {
+            throw NoctCordProjectionError.invalidEvent
+        }
+        var candidate = self
+        for nested in events.sorted(by: canonicalOrder) {
+            try candidate.apply(
+                nested,
+                permittingHistoricalAuthor: true,
+                enforcingOrder: false
+            )
+        }
+        self = candidate
+        noteVerifiedV2Boundary()
+    }
+
+    /// An owner snapshot after the first v2 checkpoint bootstraps a new
+    /// member. Existing members verify its configuration without resetting
+    /// retained messages, attachments, reactions, or call activity.
+    func hasSameDurableConfiguration(
+        as other: Self,
+        allowingEpochVoiceCredentialRotation: Bool = false
+    ) -> Bool {
+        guard name == other.name,
+              roles == other.roles,
+              roleAssignments == other.roleAssignments,
+              botApplications == other.botApplications,
+              Set(voiceRooms.keys) == Set(other.voiceRooms.keys),
+              Set(channels.keys) == Set(other.channels.keys) else {
+            return false
+        }
+        guard voiceRooms.allSatisfy({ id, room in
+            guard let candidate = other.voiceRooms[id] else { return false }
+            return room.name == candidate.name
+                && room.maxParticipants == candidate.maxParticipants
+                && room.isArchived == candidate.isArchived
+                && (allowingEpochVoiceCredentialRotation
+                    || (room.signalingKey == candidate.signalingKey
+                        && room.realtimeRoute == candidate.realtimeRoute))
+        }) else { return false }
+        return channels.allSatisfy { id, channel in
+            guard let candidate = other.channels[id] else { return false }
+            return channel.name == candidate.name
+                && channel.isArchived == candidate.isArchived
+                && channel.permissionOverrides == candidate.permissionOverrides
+        }
+    }
+
+    /// A Core-signed epoch transition and owner checkpoint may replace only
+    /// voice signaling secrets/routes while preserving durable room identity.
+    /// Old ephemeral call state cannot be carried into that new epoch.
+    mutating func adoptVerifiedEpochVoiceCredentials(from other: Self) {
+        voiceRooms = other.voiceRooms
+        voiceParticipants = [:]
+        callSignals = [:]
+        activeScreenShares = [:]
+    }
+
+    mutating func noteVerifiedV2Boundary() {
+        if verifiedV2EventCount < NoctCordEvent.maximumLogicalClock {
+            verifiedV2EventCount += 1
+        }
+    }
+
     /// Rejected events never contribute to the next local clock. Only the
     /// owner's configuration bootstrap may bridge an arbitrarily large gap
     /// for a new member that did not receive the preceding group history.
     public func nextLogicalClock() throws -> UInt64 {
-        let previous = lastOrder?.logicalClock ?? 0
+        let previous = max(lastOrder?.logicalClock ?? 0, verifiedV2EventCount)
         guard previous < NoctCordEvent.maximumLogicalClock else {
             throw NoctCordProjectionError.invalidEvent
         }
@@ -378,6 +592,9 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
             roles.removeValue(forKey: roleID)
             for member in roleAssignments.keys {
                 roleAssignments[member]?.remove(roleID)
+                if roleAssignments[member]?.isEmpty == true {
+                    roleAssignments.removeValue(forKey: member)
+                }
             }
             for channelID in channels.keys {
                 channels[channelID]?.permissionOverrides.removeValue(forKey: .role(roleID))
@@ -408,6 +625,9 @@ public struct NoctCordSpaceProjection: Equatable, Sendable {
             try requireManageable(role, actor: event.author)
             try requireManageable(member: member, actor: event.author)
             roleAssignments[member]?.remove(roleID)
+            if roleAssignments[member]?.isEmpty == true {
+                roleAssignments.removeValue(forKey: member)
+            }
 
         case .channelPermissionSet:
             try require(.manageChannels, for: event.author)

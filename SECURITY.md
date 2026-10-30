@@ -21,3 +21,11 @@ or ICE candidates. A compromised endpoint or operating system, traffic-analysis
 adversary, TURN operator, and unknown media-decoder flaw remain outside the
 guaranteed protection boundary. See `README.md` and `docs/media-and-calls.md`
 for current claims and limitations.
+
+Verified application policy depends on a Core build that persists authenticated
+group application receipts and owner checkpoint bindings. A community still
+needs all active clients upgraded and an owner-signed current-epoch snapshot;
+old binaries can continue their own legacy view. A role change is enforced by
+patched clients after receipt, while cryptographic exclusion requires removing
+the member's group credential. Checkpoint retention is bounded and may reject
+late old-interval content after its proof has aged out.

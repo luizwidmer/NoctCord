@@ -1,5 +1,6 @@
 import NoctCordCore
 import NoctweaveCore
+import CryptoKit
 import XCTest
 
 final class NoctCordCoreTests: XCTestCase {
@@ -18,6 +19,74 @@ final class NoctCordCoreTests: XCTestCase {
         let content = try NoctCordCodec.encode(event)
         XCTAssertEqual(content.type.canonicalName, "org.noctcord/event:1.0")
         XCTAssertEqual(try NoctCordCodec.decode(content), event)
+    }
+
+    func testSecureCheckpointBindsExactOuterCredentialAndConfiguration() throws {
+        let owner = handle(1)
+        let credential = GroupScopedCredentialHandleV2(
+            rawValue: Data(repeating: 0x44, count: 32).base64EncodedString()
+        )
+        let configuration = [
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(author: owner, clock: 2,
+                      operation: .createChannel(id: channelID, name: "general")),
+        ]
+        let event = makeEvent(
+            author: owner, clock: 3,
+            operation: .applyBootstrap(configuration)
+        )
+        let checkpoint = NoctCordPolicyCheckpointV2(
+            spaceID: spaceID,
+            owner: owner,
+            groupEpoch: 1,
+            groupTranscriptHash: Data(repeating: 0x30, count: 32),
+            previousCheckpointDigest: nil,
+            configurationDigest: Data(SHA256.hash(
+                data: try NoctweaveCoder.encode(configuration, sortedKeys: true)
+            )),
+            frontiers: [NoctCordCredentialFrontierV2(
+                epoch: 1,
+                transcriptHash: Data(repeating: 0x30, count: 32),
+                credential: credential,
+                nextCounter: 0,
+                prefixDigest: Data(repeating: 0x31, count: 32)
+            )]
+        )
+        let secure = NoctCordSecureEventV2(
+            event: event,
+            credential: credential,
+            checkpoint: checkpoint
+        )
+
+        XCTAssertTrue(secure.isStructurallyValid)
+        XCTAssertEqual(try secure.canonicalDigest().count, 32)
+        let wrapped = try NoctCordCodec.wrapSecure(secure)
+        XCTAssertEqual(wrapped.content.type.canonicalName, "org.noctcord/event:2.0")
+        XCTAssertEqual(try NoctCordCodec.unwrapSecure(wrapped), secure)
+        XCTAssertThrowsError(try NoctCordCodec.unwrap(wrapped))
+        let compatible = try NoctCordCodec.wrapSecure(
+            secure, usingLegacyCapability: true
+        )
+        XCTAssertEqual(compatible.content.type, NoctCordCodec.contentType)
+        XCTAssertEqual(compatible.content.parameters["schema"], "2")
+        XCTAssertThrowsError(try NoctCordCodec.decode(compatible.content))
+        XCTAssertEqual(try NoctCordCodec.unwrapSecure(compatible), secure)
+        XCTAssertThrowsError(try NoctCordCodec.unwrap(compatible))
+        XCTAssertThrowsError(try NoctCordCodec.decodeSecure(try NoctCordCodec.encode(event)))
+
+        let wrongCredential = GroupScopedCredentialHandleV2(
+            rawValue: Data(repeating: 0x45, count: 32).base64EncodedString()
+        )
+        let forgedOuter = GroupConversationEventV2(
+            id: event.id,
+            groupID: spaceID,
+            authorMemberHandle: owner,
+            authorCredentialHandle: wrongCredential,
+            createdAt: event.createdAt,
+            kind: .application,
+            content: wrapped.content
+        )
+        XCTAssertThrowsError(try NoctCordCodec.unwrapSecure(forgedOuter))
     }
 
     func testContentDecoderRejectsNonCanonicalAndAmbiguousWrappers() throws {
@@ -477,6 +546,60 @@ final class NoctCordCoreTests: XCTestCase {
         XCTAssertTrue(ordered.rejectedEvents.isEmpty)
         XCTAssertEqual(ordered.projection.messages[messageID]?.text, "hello")
         XCTAssertEqual(ordered.projection.messages[messageID]?.reactions["🌙"], [member])
+    }
+
+    func testCheckpointConfigurationRebuildsBoundedDurableState() throws {
+        let owner = handle(1)
+        let member = handle(2)
+        let botMember = handle(3)
+        let role = NoctCordRole(
+            id: UUID(), name: "Moderator", position: 10,
+            permissions: [.manageChannels]
+        )
+        let roomID = UUID()
+        let room = makeVoiceSpec(name: "lounge", byte: 0x46)
+        let bot = NoctCordBotApplication(
+            memberHandle: botMember, name: "Helper",
+            commands: [NoctCordBotCommand(name: "ping", summary: "Reply to ping")]
+        )
+        let source = project([
+            makeEvent(author: owner, clock: 1, operation: .createSpace(name: "Noct Cord")),
+            makeEvent(author: owner, clock: 2,
+                      operation: .createChannel(id: channelID, name: "general")),
+            makeEvent(author: owner, clock: 3, operation: .defineRole(role)),
+            makeEvent(author: owner, clock: 4,
+                      operation: .grantRole(id: role.id, to: member)),
+            makeEvent(author: owner, clock: 5,
+                      operation: .setChannelPermissions(
+                          channelID: channelID, roleID: nil,
+                          allow: [], deny: [.attachFiles]
+                      )),
+            makeEvent(author: owner, clock: 6,
+                      operation: .createVoiceRoom(id: roomID, spec: room)),
+            makeEvent(author: owner, clock: 7, operation: .installBot(bot)),
+            // Installing a bot and granting its member a role is valid; the
+            // snapshot must replay installation before the later grant.
+            makeEvent(author: owner, clock: 8,
+                      operation: .grantRole(id: role.id, to: botMember)),
+            makeEvent(author: owner, clock: 9,
+                      operation: .revokeRole(id: role.id, from: member)),
+        ], owner: owner, members: [owner, member, botMember])
+        XCTAssertTrue(source.rejectedEvents.isEmpty, "\(source.rejectedEvents)")
+
+        let snapshot = try source.projection.checkpointConfiguration(createdAt: timestamp)
+        let checkpoint = makeEvent(
+            author: owner, clock: 100,
+            operation: .applyBootstrap(snapshot)
+        )
+        let recovered = project([checkpoint], owner: owner,
+                                members: [owner, member, botMember])
+        XCTAssertTrue(recovered.rejectedEvents.isEmpty)
+        XCTAssertEqual(recovered.projection.name, source.projection.name)
+        XCTAssertEqual(recovered.projection.channels, source.projection.channels)
+        XCTAssertEqual(recovered.projection.roles, source.projection.roles)
+        XCTAssertEqual(recovered.projection.roleAssignments, source.projection.roleAssignments)
+        XCTAssertEqual(recovered.projection.voiceRooms, source.projection.voiceRooms)
+        XCTAssertEqual(recovered.projection.botApplications, source.projection.botApplications)
     }
 
     func testUnauthorizedChannelMutationIsRejectedWithoutBlockingMessages() {

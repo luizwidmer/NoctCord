@@ -39,7 +39,7 @@ Run commands from this repository.
 
 Requirements: Swift 6, macOS 14 or later for the desktop app, iOS 17 or later
 for the package's iOS surface, and the Swift package dependency
-`stasel/WebRTC` M152 (pinned revision). By default, Noct Cord resolves Noctweave from its
+`stasel/WebRTC` M156 (pinned revision). By default, Noct Cord resolves Noctweave from its
 public package URL. Start from a source checkout; these commands use the pinned public dependency:
 
 ```sh
@@ -142,10 +142,12 @@ and permission declarations, and supply the same relay configuration.
 - **Roles and channel access.** Ordered roles provide bounded community
   capabilities, while per-channel everyone/role overrides control viewing,
   sending, attachments, reactions, moderation, and application commands.
-  Clients preflight authorization before upload and deterministically project
-  received events. These application roles constrain conforming clients but
-  cannot revoke a still-admitted raw client's group writing authority; see
-  [the role boundary](docs/roles-channels-and-bots.md#permission-model).
+  Verified clients bind owner policy changes to Core-authenticated sender
+  counters, so backdated member clocks cannot bypass a received revocation.
+  Legacy history remains a separate read-only archive until owner-reviewed
+  migration. Existing members must upgrade and receive the owner rebind;
+  application roles still cannot remove a member's group writing key or hide
+  group-wide traffic. See [the policy boundary](docs/roles-channels-and-bots.md#permission-model).
 - **Encrypted applications and bots.** An installed app is a dedicated
   Noctweave group member with declared slash commands. Bot code runs in its
   own client process with replay-safe invocation handling; the relay never
@@ -162,7 +164,7 @@ and permission declarations, and supply the same relay configuration.
   8 MiB after sanitization; the relay module permits up to 32 MiB in total.
 - **Voice rooms.** A permitted member can join a room created by a member with
   channel-management permission. The native media layer uses raw WebRTC from
-  `stasel/WebRTC` M152 (pinned revision) and creates a peer mesh for audio and renegotiation.
+  `stasel/WebRTC` M156 (pinned revision) and creates a peer mesh for audio and renegotiation.
   The current client caps rooms at eight participants so uplink and CPU use do
   not grow without an explicit media-forwarding design.
 - **Authenticated custom signaling.** SDP, ICE candidates, join/leave state,
