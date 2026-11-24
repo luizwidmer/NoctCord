@@ -558,15 +558,24 @@ struct NoctCordConversationHeader: View {
                 HStack(spacing: 7) {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 11, weight: .medium))
-                    TextField("Search", text: $model.searchQuery)
+                    TextField("Search messages", text: $model.searchQuery)
                         .textFieldStyle(.plain)
                         .font(.system(size: 11))
+                        .accessibilityLabel("Search this channel")
+                    if !model.searchQuery.isEmpty {
+                        Button("Clear message search", systemImage: "xmark.circle.fill") {
+                            model.searchQuery = ""
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.plain)
+                    }
                 }
                 .foregroundStyle(NoctCordTheme.secondaryText)
                 .padding(.horizontal, 11)
                 .frame(width: compact ? 140 : 176, height: 36)
                 .background(NoctCordTheme.input, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(NoctCordTheme.border, lineWidth: 1) }
+                .help("Search message text or member names in this channel")
             }
 
             Group {
@@ -712,13 +721,20 @@ private struct HeaderIconButton: View {
 
 struct NoctCordMessageTimeline: View {
     @ObservedObject var model: NoctCordAppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let isSearching = !model.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let messages = model.selectedMessages
         ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 LazyVStack(alignment: .leading, spacing: 3) {
-                    channelIntroduction
-                    ForEach(model.selectedMessages) { message in
+                    if isSearching {
+                        searchSummary(matchCount: messages.count).id("message-search-summary")
+                    } else {
+                        channelIntroduction
+                    }
+                    ForEach(messages) { message in
                         MessageRow(
                             message: message,
                             isCurrentUser: message.authorID == model.selectedSpace?.currentMember
@@ -727,34 +743,36 @@ struct NoctCordMessageTimeline: View {
                         }
                         .id(message.id)
                     }
-                    ForEach(model.selectedAttachments) { attachment in
-                        AttachmentRow(
-                            attachment: attachment,
-                            cached: model.cachedAttachments[attachment.id]
-                        ) {
-                            if attachment.isAvailableLocally {
-                                model.selectedAttachmentID = attachment.id
-                            } else {
-                                model.downloadAttachment(attachment.id)
+                    if !isSearching {
+                        ForEach(model.selectedAttachments) { attachment in
+                            AttachmentRow(
+                                attachment: attachment,
+                                cached: model.cachedAttachments[attachment.id]
+                            ) {
+                                if attachment.isAvailableLocally {
+                                    model.selectedAttachmentID = attachment.id
+                                } else {
+                                    model.downloadAttachment(attachment.id)
+                                }
                             }
+                            .id(attachment.id)
                         }
-                        .id(attachment.id)
                     }
                 }
                 .padding(.horizontal, 24)
                 .padding(.top, 24)
                 .padding(.bottom, 18)
             }
-            .onChange(of: model.selectedMessages.count) { _, _ in
-                if let last = model.selectedMessages.last?.id {
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo(last, anchor: .bottom)
-                    }
+            .onChange(of: isSearching) { _, searching in
+                if searching {
+                    proxy.scrollTo("message-search-summary", anchor: .top)
                 }
             }
-            .onChange(of: model.selectedChannelID) { _, _ in
-                if let last = model.selectedMessages.last?.id {
-                    proxy.scrollTo(last, anchor: .bottom)
+            .onChange(of: isSearching ? nil : messages.last?.id, initial: true) { _, last in
+                if let last {
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                        proxy.scrollTo(last, anchor: .bottom)
+                    }
                 }
             }
         }
@@ -769,6 +787,22 @@ struct NoctCordMessageTimeline: View {
                 endPoint: .bottomTrailing
             )
         }
+    }
+
+    private func searchSummary(matchCount: Int) -> some View {
+        HStack {
+            Label(matchCount == 0 ? "No matching messages" : "Messages found: \(matchCount)", systemImage: "magnifyingglass")
+                .font(.subheadline.weight(.medium))
+                .accessibilityAddTraits(.isHeader)
+            Spacer()
+            Button("Clear Search") { model.searchQuery = "" }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .foregroundStyle(NoctCordTheme.secondaryText)
+        .padding(12)
+        .background(NoctCordTheme.surface, in: RoundedRectangle(cornerRadius: 12))
+        .padding(.bottom, 12)
     }
 
     private var channelIntroduction: some View {
